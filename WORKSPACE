@@ -159,19 +159,19 @@ load(
 
 # To point to a mirrored artifact, use:
 #
-go_download_sdk(
-    name = "go_sdk",
-    sdks = {
-        "darwin_amd64": ("go1.19.10.darwin-amd64.tar.gz", "48361d76271f9a725942bdc17012ae9fef72359f7b0aa303deb1098e05ef818c"),
-        "darwin_arm64": ("go1.19.10.darwin-arm64.tar.gz", "7cc8ab7e8e1225b57f44ec8fb26bce70ddea8e076dfdf118ed63fef0c9ff19fb"),
-        "freebsd_amd64": ("go1.19.10.freebsd-amd64.tar.gz", "0d22265662eaa9b8136223f8ab68f5c06c58c6a6311748fb810e830ebd17cbe2"),
-        "linux_amd64": ("go1.19.10.linux-amd64.tar.gz", "dfc8a696686d00065ba374209a3a7858926641e0fb55741dd89c357446d69a1e"),
-        "linux_arm64": ("go1.19.10.linux-arm64.tar.gz", "e36d6ebfce3f244e245a2969f83d26c8dff2bf8b72207822d9d66829cd93d067"),
-        "windows_amd64": ("go1.19.10.windows-amd64.tar.gz", "dab9df83e0768ff96eddd85a4def88db05ce5a8a0c439abcecd066888906c516"),
-    },
-    urls = ["https://storage.googleapis.com/public-bazel-artifacts/go/20230614-165357/{}"],
-    version = "1.19.10",
-)
+# go_download_sdk(
+#     name = "go_sdk",
+#     sdks = {
+#         "darwin_amd64": ("go1.19.10.darwin-amd64.tar.gz", "48361d76271f9a725942bdc17012ae9fef72359f7b0aa303deb1098e05ef818c"),
+#         "darwin_arm64": ("go1.19.10.darwin-arm64.tar.gz", "7cc8ab7e8e1225b57f44ec8fb26bce70ddea8e076dfdf118ed63fef0c9ff19fb"),
+#         "freebsd_amd64": ("go1.19.10.freebsd-amd64.tar.gz", "0d22265662eaa9b8136223f8ab68f5c06c58c6a6311748fb810e830ebd17cbe2"),
+#         "linux_amd64": ("go1.19.10.linux-amd64.tar.gz", "dfc8a696686d00065ba374209a3a7858926641e0fb55741dd89c357446d69a1e"),
+#         "linux_arm64": ("go1.19.10.linux-arm64.tar.gz", "e36d6ebfce3f244e245a2969f83d26c8dff2bf8b72207822d9d66829cd93d067"),
+#         "windows_amd64": ("go1.19.10.windows-amd64.tar.gz", "dab9df83e0768ff96eddd85a4def88db05ce5a8a0c439abcecd066888906c516"),
+#     },
+#     urls = ["https://storage.googleapis.com/public-bazel-artifacts/go/20230614-165357/{}"],
+#     version = "1.19.10",
+# )
 
 # To point to a local SDK path, use the following instead. We'll call the
 # directory into which you cloned the Go repository $GODIR[1]. You'll have to
@@ -179,10 +179,10 @@ go_download_sdk(
 #
 # [1]: https://go.dev/doc/contribute#testing
 #
-#   go_local_sdk(
-#       name = "go_sdk",
-#       path = "<path to $GODIR>",
-#   )
+go_local_sdk(
+    name = "go_sdk",
+    path = "/home/landerx/goroot",
+)
 
 # To use your whatever your local SDK is, use the following instead:
 #

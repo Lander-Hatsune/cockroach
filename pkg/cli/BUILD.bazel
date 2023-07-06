@@ -74,7 +74,9 @@ go_library(
     ],
     cgo = True,
     # keep
-    clinkopts = select({
+    clinkopts = [
+        "-L/home/landerx/gem5-multi-tier/util/m5/build/x86/out -lm5",
+    ] + select({
         "@io_bazel_rules_go//go/platform:android": [
             "-lrt -lm -lpthread",
         ],
@@ -89,6 +91,9 @@ go_library(
         ],
         "//conditions:default": [],
     }),
+    copts = [
+        "-I/home/landerx/gem5-multi-tier/include -DMY_NUM=3",
+    ],
     # keep
     cppopts = [
         "-DJEMALLOC_NO_DEMANGLE",

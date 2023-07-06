@@ -10,6 +10,16 @@
 
 package cli
 
+/*
+#cgo CFLAGS: -I/home/landerx/gem5-multi-tier/include -DMY_NUM=3
+#cgo LDFLAGS: -L/home/landerx/gem5-multi-tier/util/m5/build/x86/out -lm5
+#include <gem5/m5ops.h>
+int f(int x) {
+	return MY_NUM + x;
+}
+*/
+import "C"
+
 import (
 	"context"
 	"fmt"
@@ -19,6 +29,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
@@ -30,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+
 	// intentionally not all the workloads in pkg/ccl/workloadccl/allccl
 	_ "github.com/cockroachdb/cockroach/pkg/workload/bank"       // registers workloads
 	_ "github.com/cockroachdb/cockroach/pkg/workload/bulkingest" // registers workloads
@@ -47,10 +59,30 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func recordBegin(taskid uint64) {
+	// C.m5_work_begin(C.ulong(taskid), 0)
+	println("begin", taskid)
+}
+
+func recordEnd(taskid uint64) {
+	// C.m5_work_end(C.ulong(taskid), 0)
+	println("end", taskid)
+}
+
+func replay(taskid uint64) {
+	// C.m5_init_param(C.ulong(taskid), 0)
+	println("replay", taskid)
+}
+
 // Main is the entry point for the cli, with a single line calling it intended
 // to be the body of an action package main `main` func elsewhere. It is
 // abstracted for reuse by duplicated `main` funcs in different distributions.
 func Main() {
+
+	runtime.RecordBegin = recordBegin
+	runtime.RecordEnd = recordEnd
+	runtime.Replay = replay
+
 	// Seed the math/rand RNG from crypto/rand.
 	rand.Seed(randutil.NewPseudoSeed())
 
