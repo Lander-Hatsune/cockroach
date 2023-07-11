@@ -59,19 +59,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func recordBegin(taskid uint64) {
-	// C.m5_work_begin(C.ulong(taskid), 0)
-	println("begin", taskid)
+func recordBegin(goid, gopc, startpc, schedpc, schedret uint64) {
+	//C.m5_work_begin(C.ulong(taskid), 0)
+	println("begin", goid, startpc, schedpc)
 }
 
-func recordEnd(taskid uint64) {
+func recordEnd(goid, gopc, startpc, schedpc, schedret uint64) {
 	// C.m5_work_end(C.ulong(taskid), 0)
-	println("end", taskid)
+	println("end", goid, startpc, schedpc)
 }
 
-func replay(taskid uint64) {
+func replay(goid, gopc, startpc, schedpc, schedret uint64) {
 	// C.m5_init_param(C.ulong(taskid), 0)
-	println("replay", taskid)
+	println("replay", goid, startpc, schedpc)
 }
 
 // Main is the entry point for the cli, with a single line calling it intended

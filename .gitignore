@@ -63,3 +63,6 @@ pkg/ccl/backupccl/restore_mid_schema_change_generated_test.go
 
 # Temporary directories during gomock generate
 **/gomock_reflect_*
+tpcc-local*/
+build/
+.vscode/
