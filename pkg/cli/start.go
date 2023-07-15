@@ -18,10 +18,12 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
@@ -645,6 +647,60 @@ If problems persist, please see %s.`
 
 	srvStatus, serverShutdownReqC := createAndStartServerAsync(ctx,
 		tBegin, &serverCfg, stopper, startupSpan, newServerFn, startSingleNode, serverType)
+
+	recordAndReplay, err := strconv.ParseBool(os.Getenv("RECORD_AND_REPLAY"))
+	if err != nil {
+		recordAndReplay = false
+	}
+	traceTasks, err := strconv.ParseBool(os.Getenv("TRACE_TASKS"))
+	if err != nil {
+		traceTasks = false
+	}
+
+	runtime.RecordAndReplay = recordAndReplay
+	runtime.TraceTasks = traceTasks
+	fmt.Println("Record and replay:", recordAndReplay)
+	fmt.Println("Trace tasks:", traceTasks)
+
+	switchDelay, err := strconv.Atoi(os.Getenv("SWITCH_DELAY"))
+	if err != nil {
+		switchDelay = -1
+	}
+	exitDelay, err := strconv.Atoi(os.Getenv("EXIT_DELAY"))
+	if err != nil {
+		exitDelay = -1
+	}
+	fmt.Println("Switch delay(s):", switchDelay)
+	fmt.Println("Exit delay(ms):", exitDelay)
+
+	if switchDelay != -1 {
+		time.AfterFunc(time.Duration(switchDelay)*time.Second, func() {
+			cmd := exec.Command("m5", "exit")
+			_, err := cmd.Output()
+			if err != nil {
+				fmt.Println("m5 exit (cpu switch) failed")
+				return
+			}
+			fmt.Println("m5 exit (cpu switch)")
+
+			runtime.RecordAndReplay = true
+			fmt.Println("runtime.RecordAndReplay set")
+
+			if exitDelay != -1 {
+				time.AfterFunc(time.Duration(exitDelay)*time.Millisecond, func() {
+					cmd := exec.Command("m5", "exit")
+					_, err := cmd.Output()
+					if err != nil {
+						fmt.Println("m5 exit (simulation end) failed")
+						return
+					}
+					fmt.Println("m5 exit (simulation exit)")
+				})
+				fmt.Println("exit timer set, delay(ms):", exitDelay)
+			}
+		})
+		fmt.Println("switch timer set, delay(s):", switchDelay)
+	}
 
 	return waitForShutdown(
 		// NB: we delay the access to s, as it is assigned

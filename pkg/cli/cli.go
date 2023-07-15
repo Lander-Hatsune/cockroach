@@ -19,7 +19,6 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/build"
@@ -53,9 +52,6 @@ import (
 // to be the body of an action package main `main` func elsewhere. It is
 // abstracted for reuse by duplicated `main` funcs in different distributions.
 func Main() {
-
-	runtime.RecordAndReplay = false
-	runtime.TraceTasks = true
 
 	// Seed the math/rand RNG from crypto/rand.
 	rand.Seed(randutil.NewPseudoSeed())
