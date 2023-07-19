@@ -662,6 +662,10 @@ If problems persist, please see %s.`
 	fmt.Println("Record and replay:", recordAndReplay)
 	fmt.Println("Trace tasks:", traceTasks)
 
+	switchToRecordAndReplay, err := strconv.ParseBool(os.Getenv("SWITCH_RECORD_AND_REPLAY"))
+	if err != nil {
+		switchToRecordAndReplay = true
+	}
 	switchDelay, err := strconv.Atoi(os.Getenv("SWITCH_DELAY"))
 	if err != nil {
 		switchDelay = -1
@@ -670,6 +674,7 @@ If problems persist, please see %s.`
 	if err != nil {
 		exitDelay = -1
 	}
+	fmt.Println("Switch to record & replay:", switchToRecordAndReplay)
 	fmt.Println("Switch delay(s):", switchDelay)
 	fmt.Println("Exit delay(ms):", exitDelay)
 
@@ -683,8 +688,10 @@ If problems persist, please see %s.`
 			}
 			fmt.Println("m5 exit (cpu switch)")
 
-			runtime.RecordAndReplay = true
-			fmt.Println("runtime.RecordAndReplay set")
+			if switchToRecordAndReplay {
+				runtime.RecordAndReplay = true
+				fmt.Println("runtime.RecordAndReplay set")
+			}
 
 			if exitDelay != -1 {
 				time.AfterFunc(time.Duration(exitDelay)*time.Millisecond, func() {
