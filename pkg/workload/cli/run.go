@@ -557,6 +557,15 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		log.Warningf(ctx, "rpc client (workload) dial err: %v", err)
 	}
 
+	if *ramp == 0 {
+		log.Warningf(ctx, "rpc client (workload) call SwitchCPU")
+		reply := ""
+		err = rpcClient.Call("Switcher.SwitchCPU", 0, &reply)
+		if err != nil {
+			log.Warningf(ctx, "rpc client (workload) call err: %v", err)
+		}
+	}
+
 	for {
 		select {
 		case err := <-errCh:
