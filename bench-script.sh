@@ -6,9 +6,9 @@ CRDB_BIN=./cockroach
 IMPORT_WORKLOAD=false
 
 # switch cpu
-export SWITCH=false
+SWITCH=false
 # switch to record&replay mode after switching cpu
-export SWITCH_RECORD_AND_REPLAY=true
+SWITCH_RECORD_AND_REPLAY=false
 
 # tpcc parameters
 ## num of warehouses
@@ -20,23 +20,52 @@ RUN=2000
 ## seed
 SEED=814
 
+if [[ $IMPORT_WORKLOAD = true ]]; then
+    echo "=== delete tpcc-local* workload ==="
+    rm -r tpcc-local*
+
+    echo "=== node start ==="
+    taskset -c 0-1 \
+    $CRDB_BIN start \
+    --insecure \
+    --store=tpcc-local1 \
+    --listen-addr=localhost:26257 \
+    --http-addr=localhost:8080 \
+    --join=localhost:26257 \
+    --background
+
+    echo "=== node init ==="
+    $CRDB_BIN init \
+    --insecure \
+    --host=localhost:26257
+
+    nc -zv localhost 26257
+
+    echo "=== workload import ==="
+    $CRDB_BIN workload fixtures import tpcc \
+    --warehouses=$WAREHOUSES \
+    'postgresql://root@localhost:26257?sslmode=disable' \
+    --seed=$SEED
+
+    echo "=== kill multicore node ==="
+    pkill -9 cockroach
+fi
+
+
 # direct settings
 # export RECORD_AND_REPLAY=true
 # export TRACE_TASKS=true
 
-if [[ $IMPORT_WORKLOAD = true ]]; then
-    echo "=== delete tpcc-local* workload ==="
-    rm -r tpcc-local*
-fi
-
 echo "=== node start ==="
-taskset -c 0-1 \
+SWITCH=$SWITCH \
+RECORD_AND_REPLAY=$RECORD_AND_REPLAY \
+taskset -c 0 \
 $CRDB_BIN start \
 --insecure \
 --store=tpcc-local1 \
 --listen-addr=localhost:26257 \
 --http-addr=localhost:8080 \
---join=localhost:26257,localhost:26258,localhost:26259 \
+--join=localhost:26257 \
 --background
 
 echo "=== node init ==="
@@ -46,16 +75,8 @@ $CRDB_BIN init \
 
 nc -zv localhost 26257
 
-if [[ $IMPORT_WORKLOAD = true ]]; then
-    echo "=== workload import ==="
-    $CRDB_BIN workload fixtures import tpcc \
-    --warehouses=$WAREHOUSES \
-    'postgresql://root@localhost:26257?sslmode=disable' \
-    --seed=$SEED
-fi
-
 echo "=== workload run ==="
-taskset -c 2-3 \
+taskset -c 1 \
 $CRDB_BIN workload run tpcc \
 --warehouses=$WAREHOUSES \
 --ramp="$RAMP"s \
@@ -64,7 +85,7 @@ $CRDB_BIN workload run tpcc \
 --seed=$SEED
 
 echo "=== kill node ==="
-pkill *cockroach* -9
+pkill -9 cockroach
 wait
 
 
