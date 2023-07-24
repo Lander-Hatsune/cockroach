@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/rpc"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -550,6 +551,12 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 	}
 
 	everySecond := log.Every(*displayEvery)
+
+	rpcClient, err := rpc.DialHTTP("tcp", "localhost:1234")
+	if err != nil {
+		log.Warningf(ctx, "rpc client (workload) dial err: %v", err)
+	}
+
 	for {
 		select {
 		case err := <-errCh:
@@ -583,6 +590,13 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 				t.Cumulative.Reset()
 				t.Hist.Reset()
 			})
+
+			log.Warningf(ctx, "rpc client (workload) call SwitchCPU")
+			reply := ""
+			err = rpcClient.Call("Switcher.SwitchCPU", 0, &reply)
+			if err != nil {
+				log.Warningf(ctx, "rpc client (workload) call err: %v", err)
+			}
 
 		case <-done:
 			cancelWorkers()

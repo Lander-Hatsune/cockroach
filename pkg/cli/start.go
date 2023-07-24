@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"net/http"
+	"net/rpc"
 	"net/url"
 	"os"
 	"os/exec"
@@ -656,57 +658,34 @@ If problems persist, please see %s.`
 	if err != nil {
 		traceTasks = false
 	}
-
 	runtime.RecordAndReplay = recordAndReplay
 	runtime.TraceTasks = traceTasks
-	fmt.Println("Record and replay:", recordAndReplay)
-	fmt.Println("Trace tasks:", traceTasks)
+	log.Infof(ctx, "Record and replay?: %v", recordAndReplay)
+	log.Infof(ctx, "Trace tasks?: %v", traceTasks)
 
-	switchToRecordAndReplay, err := strconv.ParseBool(os.Getenv("SWITCH_RECORD_AND_REPLAY"))
+	switcher := new(Switcher)
+	switcher.toSwitch, err = strconv.ParseBool(os.Getenv("SWITCH"))
 	if err != nil {
-		switchToRecordAndReplay = true
+		switcher.toSwitch = false
 	}
-	switchDelay, err := strconv.Atoi(os.Getenv("SWITCH_DELAY"))
+	switcher.recordAndReplay, err = strconv.ParseBool(os.Getenv("SWITCH_RECORD_AND_REPLAY"))
 	if err != nil {
-		switchDelay = -1
+		switcher.recordAndReplay = true
 	}
-	exitDelay, err := strconv.Atoi(os.Getenv("EXIT_DELAY"))
+	log.Warningf(ctx, "Switch?: %v, record & replay?: %v", switcher.toSwitch, switcher.recordAndReplay)
+
+	err = rpc.Register(switcher)
 	if err != nil {
-		exitDelay = -1
+		log.Errorf(ctx, "rpc register: %v", err)
 	}
-	fmt.Println("Switch to record & replay:", switchToRecordAndReplay)
-	fmt.Println("Switch delay(s):", switchDelay)
-	fmt.Println("Exit delay(ms):", exitDelay)
-
-	if switchDelay != -1 {
-		time.AfterFunc(time.Duration(switchDelay)*time.Second, func() {
-			cmd := exec.Command("m5", "exit")
-			_, err := cmd.Output()
-			if err != nil {
-				fmt.Println("m5 exit (cpu switch) failed")
-				return
-			}
-			fmt.Println("m5 exit (cpu switch)")
-
-			if switchToRecordAndReplay {
-				runtime.RecordAndReplay = true
-				fmt.Println("runtime.RecordAndReplay set")
-			}
-
-			if exitDelay != -1 {
-				time.AfterFunc(time.Duration(exitDelay)*time.Millisecond, func() {
-					cmd := exec.Command("m5", "exit")
-					_, err := cmd.Output()
-					if err != nil {
-						fmt.Println("m5 exit (simulation end) failed")
-						return
-					}
-					fmt.Println("m5 exit (simulation exit)")
-				})
-				fmt.Println("exit timer set, delay(ms):", exitDelay)
-			}
-		})
-		fmt.Println("switch timer set, delay(s):", switchDelay)
+	rpc.HandleHTTP()
+	l, err := net.Listen("tcp", ":1234")
+	if err != nil {
+		log.Errorf(ctx, "rpc listen: %v", err)
+	}
+	err = http.Serve(l, nil)
+	if err != nil {
+		log.Errorf(ctx, "rpc serve: %v", err)
 	}
 
 	return waitForShutdown(
@@ -714,6 +693,31 @@ If problems persist, please see %s.`
 		// asynchronously in a goroutine above.
 		stopper, serverShutdownReqC, signalCh,
 		srvStatus)
+}
+
+type Switcher struct {
+	toSwitch        bool
+	recordAndReplay bool
+}
+
+func (swt *Switcher) SwitchCPU(arg1 int, reply *string) error {
+	if !swt.toSwitch {
+		fmt.Println("Node: SwitchCPU: SWITCH not set, ignore")
+		return nil
+	}
+	cmd := exec.Command("m5", "exit")
+	_, err := cmd.Output()
+	if err != nil {
+		fmt.Println("Node: SwitchCPU: m5 exit failed", err)
+		return errors.New("m5 exit failed")
+	}
+	fmt.Println("Node: SwitchCPU: m5 exit")
+
+	if swt.recordAndReplay {
+		runtime.RecordAndReplay = true
+		fmt.Println("Node: SwitchCPU: runtime.RecordAndReplay set")
+	}
+	return nil
 }
 
 const (
