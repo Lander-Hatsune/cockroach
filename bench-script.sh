@@ -6,9 +6,9 @@ CRDB_BIN=./cockroach
 IMPORT_WORKLOAD=false
 
 # switch cpu
-SWITCH=false
+export SWITCH=false
 # switch to record&replay mode after switching cpu
-SWITCH_RECORD_AND_REPLAY=true
+export SWITCH_RECORD_AND_REPLAY=true
 
 # tpcc parameters
 ## num of warehouses
