@@ -25,26 +25,26 @@ if [[ $IMPORT_WORKLOAD = true ]]; then
     rm -r tpcc-local*
 
     echo "=== node start ==="
-    taskset -c 0-1 \
     $CRDB_BIN start \
     --insecure \
     --store=tpcc-local1 \
-    --listen-addr=localhost:26257 \
-    --http-addr=localhost:8080 \
-    --join=localhost:26257 \
+    --listen-addr=127.0.0.1:26257 \
+    --http-addr=127.0.0.1:8080 \
+    --join=127.0.0.1:26257 \
     --background
 
     echo "=== node init ==="
     $CRDB_BIN init \
     --insecure \
-    --host=localhost:26257
+    --host=127.0.0.1:26257
 
-    nc -zv localhost 26257
+    nc -zv 127.0.0.1 26257
 
     echo "=== workload import ==="
-    $CRDB_BIN workload fixtures import tpcc \
+    $CRDB_BIN workload init tpcc \
     --warehouses=$WAREHOUSES \
-    'postgresql://root@localhost:26257?sslmode=disable' \
+    'postgresql://root@127.0.0.1:26257?sslmode=disable' \
+    --data-loader=IMPORT \
     --seed=$SEED
 
     echo "=== kill multicore node ==="
@@ -58,31 +58,38 @@ fi
 
 echo "=== node start ==="
 SWITCH=$SWITCH \
-RECORD_AND_REPLAY=$RECORD_AND_REPLAY \
-taskset -c 0 \
+SWITCH_RECORD_AND_REPLAY=$SWITCH_RECORD_AND_REPLAY \
+taskset -c 0-1 \
 $CRDB_BIN start \
 --insecure \
 --store=tpcc-local1 \
---listen-addr=localhost:26257 \
---http-addr=localhost:8080 \
---join=localhost:26257 \
+--listen-addr=127.0.0.1:26257 \
+--http-addr=127.0.0.1:8080 \
+--join=127.0.0.1:26257 \
 --background
 
 echo "=== node init ==="
 $CRDB_BIN init \
 --insecure \
---host=localhost:26257
+--host=127.0.0.1:26257
 
-nc -zv localhost 26257
+nc -zv 127.0.0.1 26257
 
 echo "=== workload run ==="
-taskset -c 1 \
+taskset -c 2 \
 $CRDB_BIN workload run tpcc \
 --warehouses=$WAREHOUSES \
 --ramp="$RAMP"s \
 --duration="$RUN"ms \
-'postgresql://root@localhost:26257?sslmode=disable' \
+'postgresql://root@127.0.0.1:26257?sslmode=disable' \
 --seed=$SEED
+
+nc -zv 127.0.0.1 26257
+
+echo "=== cockroach.log ==="
+cat tpcc-local1/logs/cockroach.log
+echo "=== cockroach-stderr.log ==="
+cat tpcc-local1/logs/cockroach-stderr.log
 
 echo "=== kill node ==="
 pkill -9 cockroach
