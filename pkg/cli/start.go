@@ -20,7 +20,6 @@ import (
 	"net/rpc"
 	"net/url"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -664,16 +663,6 @@ If problems persist, please see %s.`
 	log.Infof(ctx, "Trace tasks?: %v", traceTasks)
 
 	switcher := new(Switcher)
-	switcher.toSwitch, err = strconv.ParseBool(os.Getenv("SWITCH"))
-	if err != nil {
-		switcher.toSwitch = false
-	}
-	switcher.recordAndReplay, err = strconv.ParseBool(os.Getenv("SWITCH_RECORD_AND_REPLAY"))
-	if err != nil {
-		switcher.recordAndReplay = true
-	}
-	log.Warningf(ctx, "Switch?: %v, record & replay?: %v", switcher.toSwitch, switcher.recordAndReplay)
-
 	err = rpc.Register(switcher)
 	if err != nil {
 		log.Errorf(ctx, "rpc register: %v", err)
@@ -687,6 +676,7 @@ If problems persist, please see %s.`
 	if err != nil {
 		log.Errorf(ctx, "rpc serve: %v", err)
 	}
+	log.Warningf(ctx, "rpc server (node) ready")
 
 	return waitForShutdown(
 		// NB: we delay the access to s, as it is assigned
@@ -696,27 +686,11 @@ If problems persist, please see %s.`
 }
 
 type Switcher struct {
-	toSwitch        bool
-	recordAndReplay bool
 }
 
-func (swt *Switcher) SwitchCPU(arg1 int, reply *string) error {
-	if !swt.toSwitch {
-		fmt.Println("Node: SwitchCPU: SWITCH not set, ignore")
-		return nil
-	}
-	cmd := exec.Command("m5", "exit")
-	_, err := cmd.Output()
-	if err != nil {
-		fmt.Println("Node: SwitchCPU: m5 exit failed", err)
-		return errors.New("m5 exit failed")
-	}
-	fmt.Println("Node: SwitchCPU: m5 exit")
-
-	if swt.recordAndReplay {
-		runtime.RecordAndReplay = true
-		fmt.Println("Node: SwitchCPU: runtime.RecordAndReplay set")
-	}
+func (swt *Switcher) SwitchRecordAndReplay(arg1 int, reply *string) error {
+	runtime.RecordAndReplay = true
+	fmt.Println("Node: SwitchR&R: runtime.RecordAndReplay set")
 	return nil
 }
 

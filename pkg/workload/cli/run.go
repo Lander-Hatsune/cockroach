@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
@@ -552,18 +553,48 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 
 	everySecond := log.Every(*displayEvery)
 
+	toSwitch, err := strconv.ParseBool(os.Getenv("SWITCH"))
+	if err != nil {
+		toSwitch = false
+	}
+	switchRecordAndReplay, err := strconv.ParseBool(os.Getenv("SWITCH_RECORD_AND_REPLAY"))
+	if err != nil {
+		switchRecordAndReplay = true
+	}
+	log.Warningf(ctx, "Switch CPU?: %v, record & replay?: %v", toSwitch, switchRecordAndReplay)
+
 	rpcClient, err := rpc.DialHTTP("tcp", "localhost:1234")
 	if err != nil {
-		log.Warningf(ctx, "rpc client (workload) dial err: %v", err)
+		log.Errorf(ctx, "rpc client (workload) dial err: %v", err)
+	}
+
+	handleSwitch := func() {
+		if toSwitch {
+			log.Warningf(ctx, "workload call m5 exit")
+			cmd := exec.Command("m5", "exit")
+			err := cmd.Start()
+			time.Sleep(1 * time.Second) // m5 exit may elapse different time
+			if err != nil {
+				log.Errorf(ctx, "m5 exit failed")
+			} else {
+				log.Warningf(ctx, "m5 exit! (switch CPU)")
+			}
+
+			if switchRecordAndReplay {
+				log.Warningf(ctx, "rpc client (workload) call SwitchRecordAndReplay")
+				reply := ""
+				err = rpcClient.Call("Switcher.SwitchRecordAndReplay", 0, &reply)
+				if err != nil {
+					log.Errorf(ctx, "rpc client (workload) call err: %v", err)
+				} else {
+					log.Warningf(ctx, "rpc client (workload) call finished")
+				}
+			}
+		}
 	}
 
 	if *ramp == 0 {
-		log.Warningf(ctx, "rpc client (workload) call SwitchCPU")
-		reply := ""
-		err = rpcClient.Call("Switcher.SwitchCPU", 0, &reply)
-		if err != nil {
-			log.Warningf(ctx, "rpc client (workload) call err: %v", err)
-		}
+		handleSwitch()
 	}
 
 	for {
@@ -600,12 +631,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 				t.Hist.Reset()
 			})
 
-			log.Warningf(ctx, "rpc client (workload) call SwitchCPU")
-			reply := ""
-			err = rpcClient.Call("Switcher.SwitchCPU", 0, &reply)
-			if err != nil {
-				log.Warningf(ctx, "rpc client (workload) call err: %v", err)
-			}
+			handleSwitch()
 
 		case <-done:
 			cancelWorkers()
