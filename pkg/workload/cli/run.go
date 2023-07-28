@@ -572,8 +572,8 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		if toSwitch {
 			log.Warningf(ctx, "workload call m5 exit")
 			cmd := exec.Command("m5", "exit")
-			err := cmd.Start()
-			time.Sleep(1 * time.Second) // m5 exit may elapse different time
+			err := cmd.Run()
+			time.Sleep(500 * time.Millisecond) // m5 exit may elapse different time
 			if err != nil {
 				log.Errorf(ctx, "m5 exit failed")
 			} else {
