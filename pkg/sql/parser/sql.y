@@ -25,18 +25,16 @@ package parser
 
 import (
     "fmt"
+    "math"
     "strings"
 
     "go/constant"
 
     "github.com/cockroachdb/cockroach/pkg/geo/geopb"
-    "github.com/cockroachdb/cockroach/pkg/roachpb"
     "github.com/cockroachdb/cockroach/pkg/security/username"
-    "github.com/cockroachdb/cockroach/pkg/sql/lexbase"
     "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
     "github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
     "github.com/cockroachdb/cockroach/pkg/sql/privilege"
-    "github.com/cockroachdb/cockroach/pkg/sql/roleoption"
     "github.com/cockroachdb/cockroach/pkg/sql/scanner"
     "github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
     "github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treebin"
@@ -834,20 +832,20 @@ func (u *sqlSymUnion) cursorStmt() tree.CursorStmt {
 func (u *sqlSymUnion) asTenantClause() tree.TenantID {
     return u.val.(tree.TenantID)
 }
-func (u *sqlSymUnion) functionOptions() tree.FunctionOptions {
-    return u.val.(tree.FunctionOptions)
+func (u *sqlSymUnion) routineOptions() tree.RoutineOptions {
+    return u.val.(tree.RoutineOptions)
 }
-func (u *sqlSymUnion) functionOption() tree.FunctionOption {
-    return u.val.(tree.FunctionOption)
+func (u *sqlSymUnion) functionOption() tree.RoutineOption {
+    return u.val.(tree.RoutineOption)
 }
-func (u *sqlSymUnion) functionParams() tree.FuncParams {
-    return u.val.(tree.FuncParams)
+func (u *sqlSymUnion) routineParams() tree.RoutineParams {
+    return u.val.(tree.RoutineParams)
 }
-func (u *sqlSymUnion) functionParam() tree.FuncParam {
-    return u.val.(tree.FuncParam)
+func (u *sqlSymUnion) routineParam() tree.RoutineParam {
+    return u.val.(tree.RoutineParam)
 }
-func (u *sqlSymUnion) functionParamClass() tree.FuncParamClass {
-    return u.val.(tree.FuncParamClass)
+func (u *sqlSymUnion) routineParamClass() tree.RoutineParamClass {
+    return u.val.(tree.RoutineParamClass)
 }
 func (u *sqlSymUnion) stmts() tree.Statements {
     return u.val.(tree.Statements)
@@ -911,7 +909,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 
 %token <str> CACHE CALL CALLED CANCEL CANCELQUERY CAPABILITIES CAPABILITY CASCADE CASE CAST CBRT CHANGEFEED CHAR
 %token <str> CHARACTER CHARACTERISTICS CHECK CHECK_FILES CLOSE
-%token <str> CLUSTER COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
+%token <str> CLUSTER CLUSTERS COALESCE COLLATE COLLATION COLUMN COLUMNS COMMENT COMMENTS COMMIT
 %token <str> COMMITTED COMPACT COMPLETE COMPLETIONS CONCAT CONCURRENTLY CONFIGURATION CONFIGURATIONS CONFIGURE
 %token <str> CONFLICT CONNECTION CONNECTIONS CONSTRAINT CONSTRAINTS CONTAINS CONTROLCHANGEFEED CONTROLJOB
 %token <str> CONVERSION CONVERT COPY COST COVERING CREATE CREATEDB CREATELOGIN CREATEROLE
@@ -943,7 +941,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 
 %token <str> IDENTITY
 %token <str> IF IFERROR IFNULL IGNORE_FOREIGN_KEYS ILIKE IMMEDIATE IMMUTABLE IMPORT IN INCLUDE
-%token <str> INCLUDING INCLUDE_ALL_SECONDARY_TENANTS INCREMENT INCREMENTAL INCREMENTAL_LOCATION
+%token <str> INCLUDING INCLUDE_ALL_SECONDARY_TENANTS INCLUDE_ALL_VIRTUAL_CLUSTERS INCREMENT INCREMENTAL INCREMENTAL_LOCATION
 %token <str> INET INET_CONTAINED_BY_OR_EQUALS
 %token <str> INET_CONTAINS_OR_EQUALS INDEX INDEXES INHERITS INJECT INITIALLY
 %token <str> INDEX_BEFORE_PAREN INDEX_BEFORE_NAME_THEN_PAREN INDEX_AFTER_ORDER_BY_BEFORE_AT
@@ -965,7 +963,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %token <str> MULTIPOLYGON MULTIPOLYGONM MULTIPOLYGONZ MULTIPOLYGONZM
 
 %token <str> NAN NAME NAMES NATURAL NEVER NEW_DB_NAME NEW_KMS NEXT NO NOCANCELQUERY NOCONTROLCHANGEFEED
-%token <str> NOCONTROLJOB NOCREATEDB NOCREATELOGIN NOCREATEROLE NOLOGIN NOMODIFYCLUSTERSETTING
+%token <str> NOCONTROLJOB NOCREATEDB NOCREATELOGIN NOCREATEROLE NOLOGIN NOMODIFYCLUSTERSETTING NOREPLICATION
 %token <str> NOSQLLOGIN NO_INDEX_JOIN NO_ZIGZAG_JOIN NO_FULL_SCAN NONE NONVOTERS NORMAL NOT
 %token <str> NOTHING NOTHING_AFTER_RETURNING
 %token <str> NOTNULL
@@ -1007,6 +1005,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 
 %token <str> VALID VALIDATE VALUE VALUES VARBIT VARCHAR VARIADIC VERIFY_BACKUP_TABLE_DATA VIEW VARYING VIEWACTIVITY VIEWACTIVITYREDACTED VIEWDEBUG
 %token <str> VIEWCLUSTERMETADATA VIEWCLUSTERSETTING VIRTUAL VISIBLE INVISIBLE VISIBILITY VOLATILE VOTERS
+%token <str> VIRTUAL_CLUSTER_NAME VIRTUAL_CLUSTER
 
 %token <str> WHEN WHERE WINDOW WITH WITHIN WITHOUT WORK WRITE
 
@@ -1032,9 +1031,9 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 // - ON_LA is needed for ON UPDATE and ON DELETE expressions for foreign key
 // references.
 // - TENANT_ALL is used to differentiate `ALTER TENANT <id>` from
-// `ALTER TENANT ALL`.
+// `ALTER TENANT ALL`. Ditto `CLUSTER_ALL` and `CLUSTER ALL`.
 %token NOT_LA NULLS_LA WITH_LA AS_LA GENERATED_ALWAYS GENERATED_BY_DEFAULT RESET_ALL ROLE_ALL
-%token USER_ALL ON_LA TENANT_ALL SET_TRACING
+%token USER_ALL ON_LA TENANT_ALL CLUSTER_ALL SET_TRACING
 
 %union {
   id    int32
@@ -1081,22 +1080,22 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <tree.Statement> alter_table_locality_stmt
 %type <tree.Statement> alter_table_owner_stmt
 
-// ALTER TENANT
-%type <tree.Statement> alter_tenant_stmt
+// ALTER VIRTUAL CLUSTER
+%type <tree.Statement> alter_virtual_cluster_stmt
 
-// ALTER TENANT CAPABILITY
-%type <tree.Statement> tenant_capability tenant_capability_list
+// ALTER VIRTUAL CLUSTER CAPABILITY
+%type <tree.Statement> virtual_cluster_capability virtual_cluster_capability_list
 
-// ALTER TENANT CLUSTER SETTINGS
-%type <tree.Statement> alter_tenant_csetting_stmt
+// ALTER VIRTUAL CLUSTER SET CLUSTER SETTING
+%type <tree.Statement> alter_virtual_cluster_csetting_stmt
 
-// ALTER TENANT CAPABILITY
-%type <tree.Statement> alter_tenant_capability_stmt
+// ALTER VIRTUAL CLUSTER CAPABILITY
+%type <tree.Statement> alter_virtual_cluster_capability_stmt
 
-// Other ALTER TENANT statements.
-%type <tree.Statement> alter_tenant_replication_stmt
-%type <tree.Statement> alter_tenant_rename_stmt
-%type <tree.Statement> alter_tenant_service_stmt
+// Other ALTER VIRTUAL CLUSTER statements.
+%type <tree.Statement> alter_virtual_cluster_replication_stmt
+%type <tree.Statement> alter_virtual_cluster_rename_stmt
+%type <tree.Statement> alter_virtual_cluster_service_stmt
 
 // ALTER PARTITION
 %type <tree.Statement> alter_zone_partition_stmt
@@ -1187,12 +1186,13 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <tree.Statement> create_schema_stmt
 %type <tree.Statement> create_table_stmt
 %type <tree.Statement> create_table_as_stmt
-%type <tree.Statement> create_tenant_stmt
+%type <tree.Statement> create_virtual_cluster_stmt
 %type <tree.Statement> create_view_stmt
 %type <tree.Statement> create_sequence_stmt
 %type <tree.Statement> create_func_stmt
+%type <tree.Statement> create_proc_stmt
 
-%type <*tree.LikeTenantSpec> opt_like_tenant
+%type <*tree.LikeTenantSpec> opt_like_virtual_cluster
 
 %type <tree.Statement> create_stats_stmt
 %type <*tree.CreateStatsOptions> opt_create_stats_options
@@ -1215,7 +1215,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <tree.Statement> drop_view_stmt
 %type <tree.Statement> drop_sequence_stmt
 %type <tree.Statement> drop_func_stmt
-%type <tree.Statement> drop_tenant_stmt
+%type <tree.Statement> drop_virtual_cluster_stmt
 %type <bool>           opt_immediate
 
 %type <tree.Statement> analyze_stmt
@@ -1269,7 +1269,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <tree.ShowCreateFormatOption> opt_show_create_format_options
 %type <tree.Statement> show_create_schedules_stmt
 %type <tree.Statement> show_create_external_connections_stmt
-%type <tree.Statement> show_csettings_stmt show_local_or_tenant_csettings_stmt
+%type <tree.Statement> show_csettings_stmt show_local_or_virtual_cluster_csettings_stmt
 %type <tree.Statement> show_databases_stmt
 %type <tree.Statement> show_default_privileges_stmt
 %type <tree.Statement> show_enums_stmt
@@ -1296,7 +1296,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <tree.Statement> show_syntax_stmt
 %type <tree.Statement> show_last_query_stats_stmt
 %type <tree.Statement> show_tables_stmt
-%type <tree.Statement> show_tenant_stmt opt_show_tenant_options show_tenant_options
+%type <tree.Statement> show_virtual_cluster_stmt opt_show_virtual_cluster_options show_virtual_cluster_options
 %type <tree.Statement> show_trace_stmt
 %type <tree.Statement> show_transaction_stmt
 %type <tree.Statement> show_transactions_stmt
@@ -1338,7 +1338,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <[]tree.KVOption> kv_option_list opt_with_options var_set_list opt_with_schedule_options
 %type <*tree.BackupOptions> opt_with_backup_options backup_options backup_options_list
 %type <*tree.RestoreOptions> opt_with_restore_options restore_options restore_options_list
-%type <*tree.TenantReplicationOptions> opt_with_tenant_replication_options tenant_replication_options tenant_replication_options_list
+%type <*tree.TenantReplicationOptions> opt_with_replication_options replication_options replication_options_list
 %type <tree.ShowBackupDetails> show_backup_details
 %type <*tree.ShowJobOptions> show_job_options show_job_options_list
 %type <*tree.ShowBackupOptions> opt_with_show_backup_options show_backup_options show_backup_options_list show_backup_connection_options show_backup_connection_options_list
@@ -1491,7 +1491,7 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 %type <tree.Exprs> execute_param_clause
 %type <types.IntervalTypeMetadata> opt_interval_qualifier interval_qualifier interval_second
 %type <tree.Expr> overlay_placing
-%type <*tree.TenantSpec> tenant_spec
+%type <*tree.TenantSpec> virtual_cluster_spec virtual_cluster_spec_opt_all
 
 %type <bool> opt_unique opt_concurrently opt_cluster opt_without_index
 %type <bool> opt_index_access_method
@@ -1665,14 +1665,14 @@ func (u *sqlSymUnion) showCreateFormatOption() tree.ShowCreateFormatOption {
 
 // User defined function relevant components.
 %type <bool> opt_or_replace opt_return_table opt_return_set opt_no
-%type <str> param_name func_as
-%type <tree.FuncParams> opt_func_param_with_default_list func_param_with_default_list func_params func_params_list
-%type <tree.FuncParam> func_param_with_default func_param
-%type <tree.ResolvableTypeReference> func_return_type func_param_type
-%type <tree.FunctionOptions> opt_create_func_opt_list create_func_opt_list alter_func_opt_list
-%type <tree.FunctionOption> create_func_opt_item common_func_opt_item
-%type <tree.FuncParamClass> func_param_class
-%type <*tree.UnresolvedObjectName> func_create_name
+%type <str> param_name routine_as
+%type <tree.RoutineParams> opt_routine_param_with_default_list routine_param_with_default_list func_params func_params_list
+%type <tree.RoutineParam> routine_param_with_default routine_param
+%type <tree.ResolvableTypeReference> routine_return_type routine_param_type
+%type <tree.RoutineOptions> opt_create_routine_opt_list create_routine_opt_list alter_func_opt_list
+%type <tree.RoutineOption> create_routine_opt_item common_routine_opt_item
+%type <tree.RoutineParamClass> routine_param_class
+%type <*tree.UnresolvedObjectName> routine_create_name
 %type <tree.Statement> routine_return_stmt routine_body_stmt
 %type <tree.Statements> routine_body_stmt_list
 %type <*tree.RoutineBody> opt_routine_body
@@ -1802,7 +1802,7 @@ stmt_without_legacy_transaction:
 alter_stmt:
   alter_ddl_stmt      // help texts in sub-rule
 | alter_role_stmt     // EXTEND WITH HELP: ALTER ROLE
-| alter_tenant_stmt   /* SKIP DOC */
+| alter_virtual_cluster_stmt   /* SKIP DOC */
 | alter_unsupported_stmt
 | ALTER error         // SHOW HELP: ALTER
 
@@ -3174,7 +3174,7 @@ opt_clear_data:
 //    kms="[kms_provider]://[kms_host]/[master_key_identifier]?[parameters]" : encrypt backups using KMS
 //    detached: execute backup job asynchronously, without waiting for its completion
 //    incremental_location: specify a different path to store the incremental backup
-//    include_all_secondary_tenants: enable backups of all secondary tenants during a cluster backup in the system tenant
+//    include_all_virtual_clusters: enable backups of all virtual clusters during a cluster backup
 //
 // %SeeAlso: RESTORE, WEBDOCS/backup.html
 backup_stmt:
@@ -3300,14 +3300,19 @@ backup_options:
   {
     $$.val = &tree.BackupOptions{ExecutionLocality: $4.expr()}
   }
-| INCLUDE_ALL_SECONDARY_TENANTS
+| include_all_clusters
   {
+    /* SKIP DOC */
     $$.val = &tree.BackupOptions{IncludeAllSecondaryTenants: tree.MakeDBool(true)}
   }
-| INCLUDE_ALL_SECONDARY_TENANTS '=' a_expr
+| include_all_clusters '=' a_expr
   {
     $$.val = &tree.BackupOptions{IncludeAllSecondaryTenants: $3.expr()}
   }
+
+include_all_clusters:
+  INCLUDE_ALL_SECONDARY_TENANTS { /* SKIP DOC */ }
+| INCLUDE_ALL_VIRTUAL_CLUSTERS { }
 
 // %Help: CREATE SCHEDULE FOR BACKUP - backup data periodically
 // %Category: CCL
@@ -3620,7 +3625,7 @@ drop_external_connection_stmt:
 //    skip_localities_check: ignore difference of zone configuration between restore cluster and backup cluster
 //    debug_pause_on: describes the events that the job should pause itself on for debugging purposes.
 //    new_db_name: renames the restored database. only applies to database restores
-//    include_all_secondary_tenants: enable backups of all secondary tenants during a cluster backup in the system tenant
+//    include_all_virtual_clusters: enable backups of all virtual clusters during a cluster backup
 // %SeeAlso: BACKUP, WEBDOCS/restore.html
 restore_stmt:
   RESTORE FROM list_of_string_or_placeholder_opt_list opt_as_of_clause opt_with_restore_options
@@ -3780,11 +3785,11 @@ restore_options:
   {
     $$.val = &tree.RestoreOptions{NewDBName: $3.expr()}
   }
-| INCLUDE_ALL_SECONDARY_TENANTS
+| include_all_clusters
   {
     $$.val = &tree.RestoreOptions{IncludeAllSecondaryTenants: tree.MakeDBool(true)}
   }
-| INCLUDE_ALL_SECONDARY_TENANTS '=' a_expr
+| include_all_clusters '=' a_expr
   {
     $$.val = &tree.RestoreOptions{IncludeAllSecondaryTenants: $3.expr()}
   }
@@ -3792,11 +3797,11 @@ restore_options:
 	{
 		$$.val = &tree.RestoreOptions{IncrementalStorage: $3.stringOrPlaceholderOptList()}
 	}
-| TENANT_NAME '=' string_or_placeholder
+| virtual_cluster_name '=' string_or_placeholder
   {
     $$.val = &tree.RestoreOptions{AsTenant: $3.expr()}
   }
-| TENANT '=' string_or_placeholder
+| virtual_cluster_opt '=' string_or_placeholder
   {
     $$.val = &tree.RestoreOptions{ForceTenantID: $3.expr()}
   }
@@ -3812,6 +3817,22 @@ restore_options:
   {
     $$.val = &tree.RestoreOptions{UnsafeRestoreIncompatibleVersion: true}
   }
+| EXECUTION LOCALITY '=' string_or_placeholder
+  {
+    $$.val = &tree.RestoreOptions{ExecutionLocality: $4.expr()}
+  }
+| EXPERIMENTAL DEFERRED COPY
+  {
+    $$.val = &tree.RestoreOptions{ExperimentalOnline: true}
+  }
+
+virtual_cluster_opt:
+  TENANT  { /* SKIP DOC */ }
+| VIRTUAL_CLUSTER { }
+
+virtual_cluster_name:
+  TENANT_NAME { /* SKIP DOC */ }
+| VIRTUAL_CLUSTER_NAME { }
 
 import_format:
   name
@@ -4397,18 +4418,20 @@ create_stmt:
 | create_changefeed_stmt // EXTEND WITH HELP: CREATE CHANGEFEED
 | create_extension_stmt  // EXTEND WITH HELP: CREATE EXTENSION
 | create_external_connection_stmt // EXTEND WITH HELP: CREATE EXTERNAL CONNECTION
-| create_tenant_stmt     // EXTEND WITH HELP: CREATE TENANT
+| create_virtual_cluster_stmt     // EXTEND WITH HELP: CREATE VIRTUAL CLUSTER
 | create_schedule_stmt   // help texts in sub-rule
 | create_unsupported     {}
 | CREATE error           // SHOW HELP: CREATE
 
-// %Help: CREATE TENANT - create new tenant
+// %Help: CREATE VIRTUAL CLUSTER - create a new virtual cluster
 // %Category: Experimental
 // %Text:
-// CREATE TENANT [ IF NOT EXISTS ] name [ LIKE <tenant_spec> ]
-// CREATE TENANT [ IF NOT EXISTS ] name [ LIKE <tenant_spec> ] FROM REPLICATION OF <tenant_spec> ON <location> [ WITH OPTIONS ... ]
-create_tenant_stmt:
-  CREATE TENANT d_expr opt_like_tenant
+// CREATE VIRTUAL CLUSTER [ IF NOT EXISTS ] name [ LIKE <virtual_cluster_spec> ] [ <replication> ]
+//
+// Replication option:
+//    FROM REPLICATION OF <virtual_cluster_spec> ON <location> [ WITH OPTIONS ... ]
+create_virtual_cluster_stmt:
+  CREATE virtual_cluster d_expr opt_like_virtual_cluster
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenant{
@@ -4416,7 +4439,7 @@ create_tenant_stmt:
       Like: $4.likeTenantSpec(),
     }
   }
-| CREATE TENANT IF NOT EXISTS d_expr opt_like_tenant
+| CREATE virtual_cluster IF NOT EXISTS d_expr opt_like_virtual_cluster
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenant{
@@ -4425,7 +4448,7 @@ create_tenant_stmt:
       Like: $7.likeTenantSpec(),
     }
   }
-| CREATE TENANT d_expr opt_like_tenant FROM REPLICATION OF d_expr ON d_expr opt_with_tenant_replication_options
+| CREATE virtual_cluster d_expr opt_like_virtual_cluster FROM REPLICATION OF d_expr ON d_expr opt_with_replication_options
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenantFromReplication{
@@ -4436,7 +4459,7 @@ create_tenant_stmt:
       Like: $4.likeTenantSpec(),
     }
   }
-| CREATE TENANT IF NOT EXISTS d_expr opt_like_tenant FROM REPLICATION OF d_expr ON d_expr opt_with_tenant_replication_options
+| CREATE virtual_cluster IF NOT EXISTS d_expr opt_like_virtual_cluster FROM REPLICATION OF d_expr ON d_expr opt_with_replication_options
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenantFromReplication{
@@ -4448,28 +4471,32 @@ create_tenant_stmt:
       Like: $7.likeTenantSpec(),
     }
   }
-| CREATE TENANT error // SHOW HELP: CREATE TENANT
+| CREATE virtual_cluster error // SHOW HELP: CREATE VIRTUAL CLUSTER
 
-// opt_like_tenant defines a LIKE clause for CREATE TENANT.
+virtual_cluster:
+  TENANT { /* SKIP DOC */ }
+| VIRTUAL CLUSTER
+
+// opt_like_virtual_cluster defines a LIKE clause for CREATE VIRTUAL CLUSTER.
 // Eventually this can grow to support INCLUDING/EXCLUDING options
 // like in CREATE TABLE.
-opt_like_tenant:
+opt_like_virtual_cluster:
   /* EMPTY */
   {
      $$.val = &tree.LikeTenantSpec{}
   }
-| LIKE tenant_spec
+| LIKE virtual_cluster_spec
   {
       $$.val = &tree.LikeTenantSpec{OtherTenant: $2.tenantSpec()}
   }
 
 // Optional tenant replication options.
-opt_with_tenant_replication_options:
-  WITH tenant_replication_options_list
+opt_with_replication_options:
+  WITH replication_options_list
   {
     $$.val = $2.tenantReplicationOptions()
   }
-| WITH OPTIONS '(' tenant_replication_options_list ')'
+| WITH OPTIONS '(' replication_options_list ')'
   {
     $$.val = $4.tenantReplicationOptions()
   }
@@ -4478,13 +4505,13 @@ opt_with_tenant_replication_options:
     $$.val = &tree.TenantReplicationOptions{}
   }
 
-tenant_replication_options_list:
+replication_options_list:
   // Require at least one option
-  tenant_replication_options
+  replication_options
   {
     $$.val = $1.tenantReplicationOptions()
   }
-| tenant_replication_options_list ',' tenant_replication_options
+| replication_options_list ',' replication_options
   {
     if err := $1.tenantReplicationOptions().CombineWith($3.tenantReplicationOptions()); err != nil {
       return setErr(sqllex, err)
@@ -4492,7 +4519,7 @@ tenant_replication_options_list:
   }
 
 // List of valid tenant replication options.
-tenant_replication_options:
+replication_options:
   RETENTION '=' d_expr
   {
     $$.val = &tree.TenantReplicationOptions{Retention: $3.expr()}
@@ -4542,25 +4569,50 @@ create_extension_stmt:
 //  } ...
 // %SeeAlso: WEBDOCS/create-function.html
 create_func_stmt:
-  CREATE opt_or_replace FUNCTION func_create_name '(' opt_func_param_with_default_list ')'
-  RETURNS opt_return_table opt_return_set func_return_type
-  opt_create_func_opt_list opt_routine_body
+  CREATE opt_or_replace FUNCTION routine_create_name '(' opt_routine_param_with_default_list ')'
+  RETURNS opt_return_table opt_return_set routine_return_type
+  opt_create_routine_opt_list opt_routine_body
   {
     name := $4.unresolvedObjectName().ToFunctionName()
-    $$.val = &tree.CreateFunction{
+    $$.val = &tree.CreateRoutine{
       IsProcedure: false,
       Replace: $2.bool(),
-      FuncName: name,
-      Params: $6.functionParams(),
-      ReturnType: tree.FuncReturnType{
+      Name: name,
+      Params: $6.routineParams(),
+      ReturnType: tree.RoutineReturnType{
         Type: $11.typeReference(),
         IsSet: $10.bool(),
       },
-      Options: $12.functionOptions(),
+      Options: $12.routineOptions(),
       RoutineBody: $13.routineBody(),
     }
   }
 | CREATE opt_or_replace FUNCTION error // SHOW HELP: CREATE FUNCTION
+
+// %Help: CREATE PROCEDURE - define a new procedure
+// %Category: DDL
+// %Text:
+// CREATE [ OR REPLACE ] PROCEDURE
+//    name ( [ [ argmode ] [ argname ] argtype [, ...] ] )
+//  { LANGUAGE lang_name
+//    | AS 'definition'
+//  } ...
+// %SeeAlso: WEBDOCS/create-procedure.html
+create_proc_stmt:
+  CREATE opt_or_replace PROCEDURE routine_create_name '(' opt_routine_param_with_default_list ')'
+  opt_create_routine_opt_list opt_routine_body
+  {
+    name := $4.unresolvedObjectName().ToFunctionName()
+    $$.val = &tree.CreateRoutine{
+      IsProcedure: true,
+      Replace: $2.bool(),
+      Name: name,
+      Params: $6.routineParams(),
+      Options: $8.routineOptions(),
+      RoutineBody: $9.routineBody(),
+    }
+  }
+| CREATE opt_or_replace PROCEDURE error // SHOW HELP: CREATE PROCEDURE
 
 opt_or_replace:
   OR REPLACE { $$.val = true }
@@ -4574,107 +4626,107 @@ opt_return_set:
   SETOF { $$.val = true}
 | /* EMPTY */ { $$.val = false }
 
-func_create_name:
+routine_create_name:
   db_object_name
 
-opt_func_param_with_default_list:
-  func_param_with_default_list { $$.val = $1.functionParams() }
-| /* Empty */ { $$.val = tree.FuncParams{} }
+opt_routine_param_with_default_list:
+  routine_param_with_default_list { $$.val = $1.routineParams() }
+| /* Empty */ { $$.val = tree.RoutineParams{} }
 
-func_param_with_default_list:
-  func_param_with_default { $$.val = tree.FuncParams{$1.functionParam()} }
-| func_param_with_default_list ',' func_param_with_default
+routine_param_with_default_list:
+  routine_param_with_default { $$.val = tree.RoutineParams{$1.routineParam()} }
+| routine_param_with_default_list ',' routine_param_with_default
   {
-    $$.val = append($1.functionParams(), $3.functionParam())
+    $$.val = append($1.routineParams(), $3.routineParam())
   }
 
-func_param_with_default:
-  func_param
-| func_param DEFAULT a_expr
+routine_param_with_default:
+  routine_param
+| routine_param DEFAULT a_expr
   {
-    arg := $1.functionParam()
+    arg := $1.routineParam()
     arg.DefaultVal = $3.expr()
     $$.val = arg
   }
-| func_param '=' a_expr
+| routine_param '=' a_expr
   {
-    arg := $1.functionParam()
+    arg := $1.routineParam()
     arg.DefaultVal = $3.expr()
     $$.val = arg
   }
 
-func_param:
-  func_param_class param_name func_param_type
+routine_param:
+  routine_param_class param_name routine_param_type
   {
-    $$.val = tree.FuncParam{
+    $$.val = tree.RoutineParam{
       Name: tree.Name($2),
       Type: $3.typeReference(),
-      Class: $1.functionParamClass(),
+      Class: $1.routineParamClass(),
     }
   }
-| param_name func_param_class func_param_type
+| param_name routine_param_class routine_param_type
   {
-    $$.val = tree.FuncParam{
+    $$.val = tree.RoutineParam{
       Name: tree.Name($1),
       Type: $3.typeReference(),
-      Class: $2.functionParamClass(),
+      Class: $2.routineParamClass(),
     }
   }
-| param_name func_param_type
+| param_name routine_param_type
   {
-    $$.val = tree.FuncParam{
+    $$.val = tree.RoutineParam{
       Name: tree.Name($1),
       Type: $2.typeReference(),
-      Class: tree.FunctionParamIn,
+      Class: tree.RoutineParamIn,
     }
   }
-| func_param_class func_param_type
+| routine_param_class routine_param_type
   {
-    $$.val = tree.FuncParam{
+    $$.val = tree.RoutineParam{
       Type: $2.typeReference(),
-      Class: $1.functionParamClass(),
+      Class: $1.routineParamClass(),
     }
   }
-| func_param_type
+| routine_param_type
   {
-    $$.val = tree.FuncParam{
+    $$.val = tree.RoutineParam{
       Type: $1.typeReference(),
-      Class: tree.FunctionParamIn,
+      Class: tree.RoutineParamIn,
     }
   }
 
-func_param_class:
-  IN { $$.val = tree.FunctionParamIn }
+routine_param_class:
+  IN { $$.val = tree.RoutineParamIn }
 | OUT { return unimplementedWithIssueDetail(sqllex, 100405, "create function with 'OUT' argument class") }
 | INOUT { return unimplementedWithIssueDetail(sqllex, 100405, "create function with 'INOUT' argument class") }
 | IN OUT { return unimplementedWithIssueDetail(sqllex, 100405, "create function with 'IN OUT' argument class") }
 | VARIADIC { return unimplementedWithIssueDetail(sqllex, 88947, "variadic user-defined functions") }
 
-func_param_type:
+routine_param_type:
   typename
 
-func_return_type:
-  func_param_type
+routine_return_type:
+  routine_param_type
 
-opt_create_func_opt_list:
-  create_func_opt_list { $$.val = $1.functionOptions() }
-| /* EMPTY */ { $$.val = tree.FunctionOptions{} }
+opt_create_routine_opt_list:
+  create_routine_opt_list { $$.val = $1.routineOptions() }
+| /* EMPTY */ { $$.val = tree.RoutineOptions{} }
 
-create_func_opt_list:
-  create_func_opt_item { $$.val = tree.FunctionOptions{$1.functionOption()} }
-| create_func_opt_list create_func_opt_item
+create_routine_opt_list:
+  create_routine_opt_item { $$.val = tree.RoutineOptions{$1.functionOption()} }
+| create_routine_opt_list create_routine_opt_item
   {
-    $$.val = append($1.functionOptions(), $2.functionOption())
+    $$.val = append($1.routineOptions(), $2.functionOption())
   }
 
-create_func_opt_item:
-  AS func_as opt_link_sym
+create_routine_opt_item:
+  AS routine_as opt_link_sym
   {
-    $$.val = tree.FunctionBodyStr($2)
+    $$.val = tree.RoutineBodyStr($2)
   }
 | LANGUAGE non_reserved_word_or_sconst
   {
-    lang, err := tree.AsFunctionLanguage($2)
+    lang, err := tree.AsRoutineLanguage($2)
     if err != nil {
       return setErr(sqllex, err)
     }
@@ -4682,35 +4734,35 @@ create_func_opt_item:
   }
 | TRANSFORM { return unimplemented(sqllex, "create transform function") }
 | WINDOW { return unimplemented(sqllex, "create window function") }
-| common_func_opt_item
+| common_routine_opt_item
   {
     $$.val = $1.functionOption()
   }
 
-common_func_opt_item:
+common_routine_opt_item:
   CALLED ON NULL INPUT
   {
-    $$.val = tree.FunctionCalledOnNullInput
+    $$.val = tree.RoutineCalledOnNullInput
   }
 | RETURNS NULL ON NULL INPUT
   {
-    $$.val = tree.FunctionReturnsNullOnNullInput
+    $$.val = tree.RoutineReturnsNullOnNullInput
   }
 | STRICT
   {
-    $$.val = tree.FunctionStrict
+    $$.val = tree.RoutineStrict
   }
 | IMMUTABLE
   {
-    $$.val = tree.FunctionImmutable
+    $$.val = tree.RoutineImmutable
   }
 | STABLE
   {
-    $$.val = tree.FunctionStable
+    $$.val = tree.RoutineStable
   }
 | VOLATILE
   {
-    $$.val = tree.FunctionVolatile
+    $$.val = tree.RoutineVolatile
   }
 | EXTERNAL SECURITY DEFINER
   {
@@ -4730,32 +4782,32 @@ common_func_opt_item:
   }
 | LEAKPROOF
   {
-    $$.val = tree.FunctionLeakproof(true)
+    $$.val = tree.RoutineLeakproof(true)
   }
 | NOT LEAKPROOF
   {
-    $$.val = tree.FunctionLeakproof(false)
+    $$.val = tree.RoutineLeakproof(false)
   }
 | COST numeric_only
   {
-    return unimplemented(sqllex, "create function...cost")
+    return unimplemented(sqllex, "create function/procedure ... cost")
   }
 | ROWS numeric_only
   {
-    return unimplemented(sqllex, "create function...rows")
+    return unimplemented(sqllex, "create function/procedure ... rows")
   }
 | SUPPORT name
   {
-    return unimplemented(sqllex, "create function...support")
+    return unimplemented(sqllex, "create function/procedure ... support")
   }
 
 // In theory we should parse the a whole set/reset statement here. But it's fine
 // to just return fast on SET/RESET keyword for now since it's not supported
 // yet.
-| SET { return unimplemented(sqllex, "create function...set") }
-| PARALLEL { return unimplemented(sqllex, "create function...parallel") }
+| SET { return unimplemented(sqllex, "create function/procedure ... set") }
+| PARALLEL { return unimplemented(sqllex, "create function/procedure ... parallel") }
 
-func_as:
+routine_as:
   SCONST
 
 routine_return_stmt:
@@ -4845,7 +4897,7 @@ function_with_paramtypes:
   {
     $$.val = tree.FuncObj{
       FuncName: $1.unresolvedObjectName().ToFunctionName(),
-      Params: $2.functionParams(),
+      Params: $2.routineParams(),
     }
   }
   | db_object_name
@@ -4858,21 +4910,21 @@ function_with_paramtypes:
 func_params:
   '(' func_params_list ')'
   {
-    $$.val = $2.functionParams()
+    $$.val = $2.routineParams()
   }
   | '(' ')'
   {
-    $$.val = tree.FuncParams{}
+    $$.val = tree.RoutineParams{}
   }
 
 func_params_list:
-  func_param
+  routine_param
   {
-    $$.val = tree.FuncParams{$1.functionParam()}
+    $$.val = tree.RoutineParams{$1.routineParam()}
   }
-  | func_params_list ',' func_param
+  | func_params_list ',' routine_param
   {
-    $$.val = append($1.functionParams(), $3.functionParam())
+    $$.val = append($1.routineParams(), $3.routineParam())
   }
 
 alter_func_options_stmt:
@@ -4880,18 +4932,18 @@ alter_func_options_stmt:
   {
     $$.val = &tree.AlterFunctionOptions{
       Function: $3.functionObj(),
-      Options: $4.functionOptions(),
+      Options: $4.routineOptions(),
     }
   }
 
 alter_func_opt_list:
-  common_func_opt_item
+  common_routine_opt_item
   {
-    $$.val = tree.FunctionOptions{$1.functionOption()}
+    $$.val = tree.RoutineOptions{$1.functionOption()}
   }
-| alter_func_opt_list common_func_opt_item
+| alter_func_opt_list common_routine_opt_item
   {
-    $$.val = append($1.functionOptions(), $2.functionOption())
+    $$.val = append($1.routineOptions(), $2.functionOption())
   }
 
 opt_restrict:
@@ -4956,7 +5008,6 @@ create_unsupported:
 | CREATE FOREIGN DATA error { return unimplemented(sqllex, "create fdw") }
 | CREATE opt_or_replace opt_trusted opt_procedural LANGUAGE name error { return unimplementedWithIssueDetail(sqllex, 17511, "create language " + $6) }
 | CREATE OPERATOR error { return unimplementedWithIssue(sqllex, 65017) }
-| CREATE opt_or_replace PROCEDURE error { return unimplementedWithIssueDetail(sqllex, 17511, "create procedure") }
 | CREATE PUBLICATION error { return unimplemented(sqllex, "create publication") }
 | CREATE opt_or_replace RULE error { return unimplemented(sqllex, "create rule") }
 | CREATE SERVER error { return unimplemented(sqllex, "create server") }
@@ -5005,6 +5056,7 @@ create_ddl_stmt:
 | create_view_stmt     // EXTEND WITH HELP: CREATE VIEW
 | create_sequence_stmt // EXTEND WITH HELP: CREATE SEQUENCE
 | create_func_stmt     // EXTEND WITH HELP: CREATE FUNCTION
+| create_proc_stmt     // EXTEND WITH HELP: CREATE PROCEDURE
 
 // %Help: CREATE STATISTICS - create a new table statistic
 // %Category: Misc
@@ -5377,7 +5429,7 @@ drop_stmt:
 | drop_role_stmt                // EXTEND WITH HELP: DROP ROLE
 | drop_schedule_stmt            // EXTEND WITH HELP: DROP SCHEDULES
 | drop_external_connection_stmt // EXTEND WITH HELP: DROP EXTERNAL CONNECTION
-| drop_tenant_stmt              // EXTEND WITH HELP: DROP TENANT
+| drop_virtual_cluster_stmt     // EXTEND WITH HELP: DROP VIRTUAL CLUSTER
 | drop_unsupported   {}
 | DROP error                    // SHOW HELP: DROP
 
@@ -5524,27 +5576,29 @@ drop_type_stmt:
   }
 | DROP TYPE error // SHOW HELP: DROP TYPE
 
-// %Help: DROP TENANT - remove a tenant
+// %Help: DROP VIRTUAL CLUSTER - remove a virtual cluster
 // %Category: Experimental
-// %Text: DROP TENANT [IF EXISTS] <tenant_spec> [IMMEDIATE]
-drop_tenant_stmt:
-  DROP TENANT tenant_spec opt_immediate
+// %Text: DROP VIRTUAL CLUSTER [IF EXISTS] <virtual_cluster_spec> [IMMEDIATE]
+drop_virtual_cluster_stmt:
+  DROP virtual_cluster virtual_cluster_spec opt_immediate
   {
+   /* SKIP DOC */
    $$.val = &tree.DropTenant{
       TenantSpec: $3.tenantSpec(),
       IfExists: false,
       Immediate: $4.bool(),
     }
   }
-| DROP TENANT IF EXISTS tenant_spec opt_immediate
+| DROP virtual_cluster IF EXISTS virtual_cluster_spec opt_immediate
   {
+    /* SKIP DOC */
     $$.val = &tree.DropTenant{
       TenantSpec: $5.tenantSpec(),
       IfExists: true,
       Immediate: $6.bool(),
     }
   }
-| DROP TENANT error // SHOW HELP: DROP TENANT
+| DROP virtual_cluster error // SHOW HELP: DROP VIRTUAL CLUSTER
 
 opt_immediate:
   /* EMPTY */
@@ -5901,63 +5955,88 @@ backup_kms:
     }
 	}
 
-// %Help: SHOW TENANT - display tenant information
+// %Help: SHOW VIRTUAL CLUSTER - display metadata about virtual clusters
 // %Category: Experimental
 // %Text:
-// SHOW TENANT { <tenant_spec> | ALL } [ WITH <options> ]
-// SHOW TENANTS                        [ WITH <options> ]
+// SHOW VIRTUAL CLUSTER { <virtual_cluster_spec> | ALL } [ WITH <options> ]
+// SHOW VIRTUAL CLUSTERS                                 [ WITH <options> ]
 //
 // Options:
 //     REPLICATION STATUS
 //     CAPABILITIES
-show_tenant_stmt:
-  SHOW TENANTS opt_show_tenant_options
+show_virtual_cluster_stmt:
+  SHOW virtual_cluster_spec_opt_all opt_show_virtual_cluster_options
   {
-   $$.val = &tree.ShowTenant{
-     TenantSpec: &tree.TenantSpec{All: true},
-     ShowTenantOptions: $3.showTenantOpts(),
-   }
+    /* SKIP DOC */
+    $$.val = &tree.ShowTenant{
+      TenantSpec: $2.tenantSpec(),
+      ShowTenantOptions: $3.showTenantOpts(),
+    }
   }
-| SHOW TENANT_ALL ALL opt_show_tenant_options
-  {
-   $$.val = &tree.ShowTenant{
-     TenantSpec: &tree.TenantSpec{All: true},
-     ShowTenantOptions: $4.showTenantOpts(),
-   }
-  }
-| SHOW TENANT tenant_spec opt_show_tenant_options
-  {
-   $$.val = &tree.ShowTenant{
-     TenantSpec: $3.tenantSpec(),
-     ShowTenantOptions: $4.showTenantOpts(),
+| SHOW virtual_cluster error // SHOW HELP: SHOW VIRTUAL CLUSTER
 
-   }
+virtual_cluster_spec_opt_all:
+  TENANT_ALL ALL
+  {
+    /* SKIP DOC */
+    $$.val = &tree.TenantSpec{All: true}
   }
-| SHOW TENANT error // SHOW HELP: SHOW TENANT
+| TENANTS
+  {
+    /* SKIP DOC */
+    $$.val = &tree.TenantSpec{All: true}
+  }
+| TENANT virtual_cluster_spec
+  {
+    /* SKIP DOC */
+    $$.val = $2.tenantSpec()
+  }
+| VIRTUAL CLUSTER_ALL ALL
+  {
+    $$.val = &tree.TenantSpec{All: true}
+  }
+| VIRTUAL CLUSTERS
+  {
+    $$.val = &tree.TenantSpec{All: true}
+  }
+| VIRTUAL CLUSTER virtual_cluster_spec
+  {
+    $$.val = $3.tenantSpec()
+  }
 
-opt_show_tenant_options:
+opt_show_virtual_cluster_options:
   /* EMPTY */
-  { $$.val = tree.ShowTenantOptions{} }
-| WITH show_tenant_options
-  { $$.val = $2.showTenantOpts() }
+  {
+    /* SKIP DOC */
+    $$.val = tree.ShowTenantOptions{}
+  }
+| WITH show_virtual_cluster_options
+  {
+    /* SKIP DOC */
+    $$.val = $2.showTenantOpts()
+  }
 
-show_tenant_options:
+show_virtual_cluster_options:
   REPLICATION STATUS
   {
+    /* SKIP DOC */
     $$.val = tree.ShowTenantOptions{WithReplication: true}
   }
 | CAPABILITIES
   {
+    /* SKIP DOC */
     $$.val = tree.ShowTenantOptions{WithCapabilities: true}
   }
-| show_tenant_options ',' REPLICATION STATUS
+| show_virtual_cluster_options ',' REPLICATION STATUS
   {
+    /* SKIP DOC */
     o := $1.showTenantOpts()
     o.WithReplication = true
     $$.val = o
   }
-| show_tenant_options ',' CAPABILITIES
+| show_virtual_cluster_options ',' CAPABILITIES
   {
+    /* SKIP DOC */
     o := $1.showTenantOpts()
     o.WithCapabilities = true
     $$.val = o
@@ -6519,29 +6598,32 @@ set_csetting_stmt:
 | SET CLUSTER error // SHOW HELP: SET CLUSTER SETTING
 
 
-// %Help: ALTER TENANT - alter tenant configuration
+// %Help: ALTER VIRTUAL CLUSTER - alter configuration of virtual clusters
 // %Category: Group
-// %Text: ALTER TENANT REPLICATION, ALTER TENANT CLUSTER SETTING, ALTER TENANT CAPABILITY, ALTER TENANT RENAME, ALTER TENANT SERVICE
-alter_tenant_stmt:
-  alter_tenant_replication_stmt // EXTEND WITH HELP: ALTER TENANT REPLICATION
-| alter_tenant_csetting_stmt    // EXTEND WITH HELP: ALTER TENANT CLUSTER SETTING
-| alter_tenant_capability_stmt  // EXTEND WITH HELP: ALTER TENANT CAPABILITY
-| alter_tenant_rename_stmt      // EXTEND WITH HELP: ALTER TENANT RENAME
-| alter_tenant_service_stmt     // EXTEND WITH HELP: ALTER TENANT SERVICE
-| ALTER TENANT error            // SHOW HELP: ALTER TENANT
+// %Text:
+// ALTER VIRTUAL CLUSTER REPLICATION, ALTER VIRTUAL CLUSTER SETTING,
+// ALTER VIRTUAL CLUSTER CAPABILITY, ALTER VIRTUAL CLUSTER RENAME,
+// ALTER VIRTUAL CLUSTER SERVICE
+alter_virtual_cluster_stmt:
+  alter_virtual_cluster_replication_stmt // EXTEND WITH HELP: ALTER VIRTUAL CLUSTER REPLICATION
+| alter_virtual_cluster_csetting_stmt    // EXTEND WITH HELP: ALTER VIRTUAL CLUSTER SETTING
+| alter_virtual_cluster_capability_stmt  // EXTEND WITH HELP: ALTER VIRTUAL CLUSTER CAPABILITY
+| alter_virtual_cluster_rename_stmt      // EXTEND WITH HELP: ALTER VIRTUAL CLUSTER RENAME
+| alter_virtual_cluster_service_stmt     // EXTEND WITH HELP: ALTER VIRTUAL CLUSTER SERVICE
+| ALTER virtual_cluster error   // SHOW HELP: ALTER VIRTUAL CLUSTER
 
-tenant_spec:
+virtual_cluster_spec:
   d_expr
   { $$.val = &tree.TenantSpec{IsName: true, Expr: $1.expr()} }
 | '[' a_expr ']'
   { $$.val = &tree.TenantSpec{IsName: false, Expr: $2.expr()} }
 
-// %Help: ALTER TENANT RENAME - rename a tenant
+// %Help: ALTER VIRTUAL CLUSTER RENAME - rename a virtual cluster
 // %Category: Experimental
 // %Text:
-// ALTER TENANT <tenant_spec> RENAME TO <name>
-alter_tenant_rename_stmt:
-  ALTER TENANT tenant_spec RENAME TO d_expr
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> RENAME TO <name>
+alter_virtual_cluster_rename_stmt:
+  ALTER virtual_cluster virtual_cluster_spec RENAME TO d_expr
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantRename{
@@ -6550,14 +6632,14 @@ alter_tenant_rename_stmt:
     }
   }
 
-// %Help: ALTER TENANT SERVICE - alter tenant service mode
+// %Help: ALTER VIRTUAL CLUSTER SERVICE - alter service mode of a virtual cluster
 // %Category: Experimental
 // %Text:
-// ALTER TENANT <tenant_spec> START SERVICE EXTERNAL
-// ALTER TENANT <tenant_spec> START SERVICE SHARED
-// ALTER TENANT <tenant_spec> STOP SERVICE
-alter_tenant_service_stmt:
-  ALTER TENANT tenant_spec START SERVICE EXTERNAL
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> START SERVICE EXTERNAL
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> START SERVICE SHARED
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> STOP SERVICE
+alter_virtual_cluster_service_stmt:
+  ALTER virtual_cluster virtual_cluster_spec START SERVICE EXTERNAL
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantService{
@@ -6565,7 +6647,7 @@ alter_tenant_service_stmt:
       Command: tree.TenantStartServiceExternal,
     }
   }
-| ALTER TENANT tenant_spec START SERVICE SHARED
+| ALTER virtual_cluster virtual_cluster_spec START SERVICE SHARED
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantService{
@@ -6573,7 +6655,7 @@ alter_tenant_service_stmt:
       Command: tree.TenantStartServiceShared,
     }
   }
-| ALTER TENANT tenant_spec STOP SERVICE
+| ALTER virtual_cluster virtual_cluster_spec STOP SERVICE
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantService{
@@ -6581,20 +6663,20 @@ alter_tenant_service_stmt:
       Command: tree.TenantStopService,
     }
   }
-| ALTER TENANT tenant_spec START error // SHOW HELP: ALTER TENANT SERVICE
-| ALTER TENANT tenant_spec STOP error // SHOW HELP: ALTER TENANT SERVICE
+| ALTER virtual_cluster virtual_cluster_spec START error // SHOW HELP: ALTER VIRTUAL CLUSTER SERVICE
+| ALTER virtual_cluster virtual_cluster_spec STOP error // SHOW HELP: ALTER VIRTUAL CLUSTER SERVICE
 
 
-// %Help: ALTER TENANT REPLICATION - alter tenant replication stream
+// %Help: ALTER VIRTUAL CLUSTER REPLICATION - alter replication stream between virtual clusters
 // %Category: Experimental
 // %Text:
-// ALTER TENANT <tenant_spec> PAUSE REPLICATION
-// ALTER TENANT <tenant_spec> RESUME REPLICATION
-// ALTER TENANT <tenant_spec> COMPLETE REPLICATION TO LATEST
-// ALTER TENANT <tenant_spec> COMPLETE REPLICATION TO SYSTEM TIME 'time'
-// ALTER TENANT <tenant_spec> SET REPLICATION opt=value,...
-alter_tenant_replication_stmt:
-  ALTER TENANT tenant_spec PAUSE REPLICATION
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> PAUSE REPLICATION
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> RESUME REPLICATION
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> COMPLETE REPLICATION TO LATEST
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> COMPLETE REPLICATION TO SYSTEM TIME 'time'
+// ALTER VIRTUAL CLUSTER <virtual_cluster_spec> SET REPLICATION opt=value,...
+alter_virtual_cluster_replication_stmt:
+  ALTER virtual_cluster virtual_cluster_spec PAUSE REPLICATION
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantReplication{
@@ -6602,7 +6684,7 @@ alter_tenant_replication_stmt:
       Command: tree.PauseJob,
     }
   }
-| ALTER TENANT tenant_spec RESUME REPLICATION
+| ALTER virtual_cluster virtual_cluster_spec RESUME REPLICATION
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantReplication{
@@ -6610,7 +6692,7 @@ alter_tenant_replication_stmt:
       Command: tree.ResumeJob,
     }
   }
-| ALTER TENANT tenant_spec COMPLETE REPLICATION TO SYSTEM TIME a_expr
+| ALTER virtual_cluster virtual_cluster_spec COMPLETE REPLICATION TO SYSTEM TIME a_expr
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantReplication{
@@ -6620,7 +6702,7 @@ alter_tenant_replication_stmt:
       },
     }
   }
-| ALTER TENANT tenant_spec COMPLETE REPLICATION TO LATEST
+| ALTER virtual_cluster virtual_cluster_spec COMPLETE REPLICATION TO LATEST
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantReplication{
@@ -6630,7 +6712,7 @@ alter_tenant_replication_stmt:
       },
     }
   }
-| ALTER TENANT tenant_spec SET REPLICATION tenant_replication_options_list
+| ALTER virtual_cluster virtual_cluster_spec SET REPLICATION replication_options_list
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantReplication{
@@ -6640,14 +6722,14 @@ alter_tenant_replication_stmt:
   }
 
 
-// %Help: ALTER TENANT CLUSTER SETTING - alter tenant cluster settings
+// %Help: ALTER VIRTUAL CLUSTER SETTING - alter cluster setting overrides for virtual clusters
 // %Category: Group
 // %Text:
-// ALTER TENANT { <tenant_spec> | ALL } SET CLUSTER SETTING <var> { TO | = } <value>
-// ALTER TENANT { <tenant_spec> | ALL } RESET CLUSTER SETTING <var>
+// ALTER VIRTUAL CLUSTER { <virtual_cluster_spec> | ALL } SET CLUSTER SETTING <var> { TO | = } <value>
+// ALTER VIRTUAL CLUSTER { <virtual_cluster_spec> | ALL } RESET CLUSTER SETTING <var>
 // %SeeAlso: SET CLUSTER SETTING
-alter_tenant_csetting_stmt:
-  ALTER TENANT tenant_spec set_or_reset_csetting_stmt
+alter_virtual_cluster_csetting_stmt:
+  ALTER virtual_cluster virtual_cluster_spec set_or_reset_csetting_stmt
   {
     /* SKIP DOC */
     csettingStmt := $4.stmt().(*tree.SetClusterSetting)
@@ -6665,7 +6747,17 @@ alter_tenant_csetting_stmt:
       TenantSpec: &tree.TenantSpec{All: true},
     }
   }
-| ALTER TENANT_ALL ALL error // SHOW HELP: ALTER TENANT CLUSTER SETTING
+| ALTER VIRTUAL CLUSTER_ALL ALL set_or_reset_csetting_stmt
+  {
+    /* SKIP DOC */
+    csettingStmt := $5.stmt().(*tree.SetClusterSetting)
+    $$.val = &tree.AlterTenantSetClusterSetting{
+      SetClusterSetting: *csettingStmt,
+      TenantSpec: &tree.TenantSpec{All: true},
+    }
+  }
+| ALTER VIRTUAL CLUSTER_ALL ALL error // SHOW HELP: ALTER VIRTUAL CLUSTER SETTING
+| ALTER TENANT_ALL ALL error // SHOW HELP: ALTER VIRTUAL CLUSTER SETTING
 
 set_or_reset_csetting_stmt:
   reset_csetting_stmt
@@ -6675,13 +6767,13 @@ to_or_eq:
   '='
 | TO
 
-// %Help: ALTER TENANT CAPABILITY - alter tenant capability
+// %Help: ALTER VIRTUAL CLUSTER CAPABILITY - alter system capability of virtual cluster
 // %Category: Group
 // %Text:
-// ALTER TENANT <tenant_id> GRANT CAPABILITY <var> { TO | = } <value>
-// ALTER TENANT <tenant_id> REVOKE CAPABILITY <var>
-alter_tenant_capability_stmt:
-  ALTER TENANT tenant_spec GRANT CAPABILITY tenant_capability_list
+// ALTER VIRTUAL CLUSTER <tenant_id> GRANT CAPABILITY <var> { TO | = } <value>
+// ALTER VIRTUAL CLUSTER <tenant_id> REVOKE CAPABILITY <var>
+alter_virtual_cluster_capability_stmt:
+  ALTER virtual_cluster virtual_cluster_spec GRANT CAPABILITY virtual_cluster_capability_list
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantCapability{
@@ -6689,7 +6781,7 @@ alter_tenant_capability_stmt:
       Capabilities: $6.tenantCapabilities(),
     }
   }
-| ALTER TENANT tenant_spec GRANT ALL CAPABILITIES
+| ALTER virtual_cluster virtual_cluster_spec GRANT ALL CAPABILITIES
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantCapability{
@@ -6697,7 +6789,7 @@ alter_tenant_capability_stmt:
       AllCapabilities: true,
     }
   }
-| ALTER TENANT tenant_spec REVOKE CAPABILITY tenant_capability_list
+| ALTER virtual_cluster virtual_cluster_spec REVOKE CAPABILITY virtual_cluster_capability_list
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantCapability{
@@ -6706,7 +6798,7 @@ alter_tenant_capability_stmt:
       IsRevoke: true,
     }
   }
-| ALTER TENANT tenant_spec REVOKE ALL CAPABILITIES
+| ALTER virtual_cluster virtual_cluster_spec REVOKE ALL CAPABILITIES
   {
     /* SKIP DOC */
     $$.val = &tree.AlterTenantCapability{
@@ -6715,31 +6807,35 @@ alter_tenant_capability_stmt:
       IsRevoke: true,
     }
   }
-| ALTER TENANT tenant_spec GRANT error // SHOW HELP: ALTER TENANT CAPABILITY
-| ALTER TENANT tenant_spec REVOKE error // SHOW HELP: ALTER TENANT CAPABILITY
+| ALTER virtual_cluster virtual_cluster_spec GRANT error // SHOW HELP: ALTER VIRTUAL CLUSTER CAPABILITY
+| ALTER virtual_cluster virtual_cluster_spec REVOKE error // SHOW HELP: ALTER VIRTUAL CLUSTER CAPABILITY
 
-tenant_capability:
+virtual_cluster_capability:
   var_name
   {
-      $$.val = tree.TenantCapability{
-        Name: strings.Join($1.strs(), "."),
-      }
+    /* SKIP DOC */
+    $$.val = tree.TenantCapability{
+      Name: strings.Join($1.strs(), "."),
+    }
   }
 | var_name to_or_eq var_value
   {
+    /* SKIP DOC */
     $$.val = tree.TenantCapability{
       Name: strings.Join($1.strs(), "."),
       Value: $3.expr(),
     }
   }
 
-tenant_capability_list:
-  tenant_capability
+virtual_cluster_capability_list:
+  virtual_cluster_capability
   {
+    /* SKIP DOC */
     $$.val = []tree.TenantCapability{$1.tenantCapability()}
   }
-|  tenant_capability_list ',' tenant_capability
+| virtual_cluster_capability_list ',' virtual_cluster_capability
   {
+    /* SKIP DOC */
     $$.val = append($1.tenantCapabilities(), $3.tenantCapability())
   }
 
@@ -6748,7 +6844,7 @@ set_exprs_internal:
      It cannot be used by clients. */
   SET ROW '(' expr_list ')'
   {
-    $$.val = &tree.SetVar{Values: $4.exprs()}
+    $$.val = &tree.SetVar{Values: $4.exprs(), SetRow: true}
   }
 
 // %Help: SET SESSION - change a session variable
@@ -7036,7 +7132,7 @@ show_stmt:
 | show_create_stmt           // EXTEND WITH HELP: SHOW CREATE
 | show_create_schedules_stmt // EXTEND WITH HELP: SHOW CREATE SCHEDULES
 | show_create_external_connections_stmt // EXTEND WITH HELP: SHOW CREATE EXTERNAL CONNECTIONS
-| show_local_or_tenant_csettings_stmt // EXTEND WITH HELP: SHOW CLUSTER SETTING
+| show_local_or_virtual_cluster_csettings_stmt // EXTEND WITH HELP: SHOW CLUSTER SETTING
 | show_databases_stmt        // EXTEND WITH HELP: SHOW DATABASES
 | show_enums_stmt            // EXTEND WITH HELP: SHOW ENUMS
 | show_types_stmt            // EXTEND WITH HELP: SHOW TYPES
@@ -7063,7 +7159,7 @@ show_stmt:
 | show_stats_stmt            // EXTEND WITH HELP: SHOW STATISTICS
 | show_syntax_stmt           // EXTEND WITH HELP: SHOW SYNTAX
 | show_tables_stmt           // EXTEND WITH HELP: SHOW TABLES
-| show_tenant_stmt           // EXTEND WITH HELP: SHOW TENANT
+| show_virtual_cluster_stmt  // EXTEND WITH HELP: SHOW VIRTUAL CLUSTER
 | show_trace_stmt            // EXTEND WITH HELP: SHOW TRACE
 | show_transaction_stmt      // EXTEND WITH HELP: SHOW TRANSACTION
 | show_transactions_stmt     // EXTEND WITH HELP: SHOW TRANSACTIONS
@@ -7565,6 +7661,10 @@ show_backup_options:
  {
  $$.val = &tree.ShowBackupOptions{CheckFiles: true}
  }
+ | SKIP SIZE
+ {
+ $$.val = &tree.ShowBackupOptions{SkipSize: true}
+ }
  | DEBUG_IDS
  {
  $$.val = &tree.ShowBackupOptions{DebugIDs: true}
@@ -7624,8 +7724,8 @@ show_backup_connection_options:
 // %Help: SHOW CLUSTER SETTING - display cluster settings
 // %Category: Cfg
 // %Text:
-// SHOW CLUSTER SETTING <var> [ FOR TENANT <tenant_spec> ]
-// SHOW [ PUBLIC | ALL ] CLUSTER SETTINGS [ FOR TENANT <tenant_spec> ]
+// SHOW CLUSTER SETTING <var> [ FOR VIRTUAL CLUSTER <virtual_cluster_spec> ]
+// SHOW [ PUBLIC | ALL ] CLUSTER SETTINGS [ FOR VIRTUAL CLUSTER <virtual_cluster_spec> ]
 // %SeeAlso: WEBDOCS/cluster-settings.html
 show_csettings_stmt:
   SHOW CLUSTER SETTING var_name
@@ -7652,11 +7752,15 @@ show_csettings_stmt:
   }
 | SHOW PUBLIC CLUSTER error // SHOW HELP: SHOW CLUSTER SETTING
 
-show_local_or_tenant_csettings_stmt:
+show_local_or_virtual_cluster_csettings_stmt:
   show_csettings_stmt
-  { $$.val = $1.stmt() }
-| show_csettings_stmt FOR TENANT tenant_spec
   {
+    /* SKIP DOC */
+    $$.val = $1.stmt()
+  }
+| show_csettings_stmt FOR virtual_cluster virtual_cluster_spec
+  {
+    /* SKIP DOC */
     switch t := $1.stmt().(type) {
     case *tree.ShowClusterSetting:
        $$.val = &tree.ShowTenantClusterSetting{
@@ -7670,7 +7774,7 @@ show_local_or_tenant_csettings_stmt:
        }
     }
   }
-| show_csettings_stmt FOR TENANT error // SHOW HELP: SHOW CLUSTER SETTING
+| show_csettings_stmt FOR virtual_cluster error // SHOW HELP: SHOW CLUSTER SETTING
 
 // %Help: SHOW COLUMNS - list columns in relation
 // %Category: DDL
@@ -8956,16 +9060,18 @@ backup_targets:
   }
 // TODO(knz): This should learn how to parse more complex expressions
 // and placeholders.
-| TENANT iconst64
+| virtual_cluster iconst64
   {
+    /* SKIP DOC */
     tenID := uint64($2.int64())
     if tenID == 0 {
       return setErr(sqllex, errors.New("invalid tenant ID"))
     }
     $$.val = tree.BackupTargetList{TenantID: tree.TenantID{Specified: true, ID: tenID}}
   }
-| TENANT IDENT
+| virtual_cluster IDENT
   {
+    /* SKIP DOC */
     // TODO(knz): This rule can go away once the main clause above supports
     // arbitrary expressions.
     if $2 != "_" {
@@ -10600,6 +10706,14 @@ role_option:
   }
 | password_clause
 | valid_until_clause
+| REPLICATION
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
+| NOREPLICATION
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
 
 role_options:
   role_option
@@ -16440,6 +16554,7 @@ unreserved_keyword:
 | CHECK_FILES
 | CLOSE
 | CLUSTER
+| CLUSTERS
 | COLUMNS
 | COMMENT
 | COMMENTS
@@ -16555,6 +16670,7 @@ unreserved_keyword:
 | INCLUDE
 | INCLUDING
 | INCLUDE_ALL_SECONDARY_TENANTS
+| INCLUDE_ALL_VIRTUAL_CLUSTERS
 | INCREMENT
 | INCREMENTAL
 | INCREMENTAL_LOCATION
@@ -16641,6 +16757,7 @@ unreserved_keyword:
 | NOLOGIN
 | NOMODIFYCLUSTERSETTING
 | NONVOTERS
+| NOREPLICATION
 | NOSQLLOGIN
 | NOVIEWACTIVITY
 | NOVIEWACTIVITYREDACTED
@@ -16843,6 +16960,8 @@ unreserved_keyword:
 | VIEWCLUSTERMETADATA
 | VIEWCLUSTERSETTING
 | VIEWDEBUG
+| VIRTUAL_CLUSTER_NAME
+| VIRTUAL_CLUSTER
 | VISIBLE
 | VISIBILITY
 | VOLATILE
@@ -16916,6 +17035,7 @@ bare_label_keywords:
 | CHECK_FILES
 | CLOSE
 | CLUSTER
+| CLUSTERS
 | COALESCE
 | COLLATION
 | COLUMN
@@ -17067,6 +17187,7 @@ bare_label_keywords:
 | IN
 | INCLUDE
 | INCLUDE_ALL_SECONDARY_TENANTS
+| INCLUDE_ALL_VIRTUAL_CLUSTERS
 | INCLUDING
 | INCREMENT
 | INCREMENTAL
@@ -17170,6 +17291,7 @@ bare_label_keywords:
 | NONE
 | NONVOTERS
 | NORMAL
+| NOREPLICATION
 | NOSQLLOGIN
 | NOT
 | NOTHING
@@ -17417,6 +17539,8 @@ bare_label_keywords:
 | VIEWCLUSTERSETTING
 | VIEWDEBUG
 | VIRTUAL
+| VIRTUAL_CLUSTER_NAME
+| VIRTUAL_CLUSTER
 | VISIBLE
 | VISIBILITY
 | VOLATILE

@@ -14,6 +14,7 @@ import (
 	"context"
 	"reflect"
 	"runtime/pprof"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -34,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
@@ -143,8 +145,8 @@ func (r *Replica) SendWithWriteBytes(
 	// accounting.
 	r.recordBatchRequestLoad(ctx, ba)
 
-	// If the internal Raft group is not initialized, create it and wake the leader.
-	r.maybeInitializeRaftGroup(ctx)
+	// If the internal Raft group is quiesced, wake it and the leader.
+	r.maybeUnquiesce(true /* wakeLeader */, true /* mayCampaign */)
 
 	isReadOnly := ba.IsReadOnly()
 	if err := r.checkBatchRequest(ba, isReadOnly); err != nil {
@@ -1259,22 +1261,59 @@ func (r *Replica) collectSpans(
 // either after a write request has achieved consensus and been applied to Raft
 // or after a read-only request has finished evaluation.
 type endCmds struct {
-	repl *Replica
-	g    *concurrency.Guard
-	st   kvserverpb.LeaseStatus // empty for follower reads
+	repl             *Replica
+	g                *concurrency.Guard
+	st               kvserverpb.LeaseStatus // empty for follower reads
+	replicatingSince time.Time
+}
+
+// makeUnreplicatedEndCmds sets up an endCmds to track an unreplicated,
+// that is, read-only, command.
+func makeUnreplicatedEndCmds(
+	repl *Replica, g *concurrency.Guard, st kvserverpb.LeaseStatus,
+) endCmds {
+	return makeReplicatedEndCmds(repl, g, st, time.Time{})
+}
+
+// makeReplicatedEndCmds initializes an endCmds representing a command that
+// needs to undergo replication. This is not used for read-only commands
+// (including read-write commands that end up not queueing any mutations to the
+// state machine).
+func makeReplicatedEndCmds(
+	repl *Replica, g *concurrency.Guard, st kvserverpb.LeaseStatus, replicatingSince time.Time,
+) endCmds {
+	return endCmds{repl: repl, g: g, st: st, replicatingSince: replicatingSince}
+}
+
+func makeEmptyEndCmds() endCmds {
+	return endCmds{}
 }
 
 // move moves the endCmds into the return value, clearing and making a call to
 // done on the receiver a no-op.
 func (ec *endCmds) move() endCmds {
 	res := *ec
-	*ec = endCmds{}
+	*ec = makeEmptyEndCmds()
 	return res
 }
 
+// poison marks the Guard held by the endCmds as poisoned, which
+// induces fail-fast behavior for requests waiting for our latches.
+// This method must only be called for commands in the Replica.mu.proposals
+// map and the Replica mutex must be held throughout.
 func (ec *endCmds) poison() {
 	if ec.repl == nil {
-		// Already cleared.
+		// Already cleared. This path may no longer be hit thanks to a re-work
+		// of reproposals[1]. The caller to poison holds the replica mutex and
+		// the command is in r.mu.proposals, meaning the command hasn't been
+		// signaled by log application yet, i.e. latches must not have been
+		// released (even if refreshProposalsLocked has already signaled the
+		// client with an ambiguous result).
+		//
+		// [1]: https://github.com/cockroachdb/cockroach/pull/106750
+		//
+		// TODO(repl): verify that and put an assertion here. This is similar to
+		// the TODO on ProposalData.endCmds.
 		return
 	}
 	ec.repl.concMgr.PoisonReq(ec.g)
@@ -1291,7 +1330,8 @@ func (ec *endCmds) done(
 	ctx context.Context, ba *kvpb.BatchRequest, br *kvpb.BatchResponse, pErr *kvpb.Error,
 ) {
 	if ec.repl == nil {
-		// The endCmds were cleared.
+		// The endCmds were cleared. This may no longer be necessary, see the comment on
+		// ProposalData.endCmds.
 		return
 	}
 	defer ec.move() // clear
@@ -1304,9 +1344,18 @@ func (ec *endCmds) done(
 		ec.repl.updateTimestampCache(ctx, &ec.st, ba, br, pErr)
 	}
 
-	// Release the latches acquired by the request and exit lock wait-queues.
-	// Must be done AFTER the timestamp cache is updated. ec.g is only set when
-	// the Raft proposal has assumed responsibility for the request.
+	if ts := ec.replicatingSince; !ts.IsZero() {
+		ec.repl.store.metrics.RaftReplicationLatency.RecordValue(timeutil.Since(ts).Nanoseconds())
+	}
+
+	// Release the latches acquired by the request and exit lock wait-queues. Must
+	// be done AFTER the timestamp cache is updated. ec.g is set both for reads
+	// and for writes. For writes, it is set only when the Raft proposal has
+	// assumed responsibility for the request.
+	//
+	// TODO(replication): at the time of writing, there is no code path in which
+	// this method is called and the Guard is not set. Consider removing this
+	// check and upgrading the previous observation to an invariant.
 	if ec.g != nil {
 		ec.repl.concMgr.FinishReq(ec.g)
 	}

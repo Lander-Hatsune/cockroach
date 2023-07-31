@@ -744,8 +744,8 @@ var errTransactionInProgress = errors.New("there is already a transaction in pro
 const sqlTxnName string = "sql txn"
 const metricsSampleInterval = 10 * time.Second
 
-// enableDropTenant (or rather, its inverted boolean value) defines
-// the default value for the session var "disable_drop_tenant".
+// enableDropVirtualCluster (or rather, its inverted boolean value) defines
+// the default value for the session var "disable_drop_virtual_cluster".
 //
 // Note:
 //   - We use a cluster setting here instead of a default role option
@@ -756,10 +756,10 @@ const metricsSampleInterval = 10 * time.Second
 //   - The session var is named "disable_" because we want the Go
 //     default value (false) to mean that tenant deletion is enabled.
 //     This is needed for backward-compatibility with Cockroach Cloud.
-var enableDropTenant = settings.RegisterBoolSetting(
+var enableDropVirtualCluster = settings.RegisterBoolSetting(
 	settings.SystemOnly,
-	"sql.drop_tenant.enabled",
-	"default value (inverted) for the disable_drop_tenant session setting",
+	"sql.drop_virtual_cluster.enabled",
+	"default value (inverted) for the disable_virtual_cluster session setting",
 	true,
 )
 
@@ -1373,6 +1373,10 @@ type ExecutorConfig struct {
 	// compaction concurrency.
 	CompactionConcurrencyFunc eval.SetCompactionConcurrencyFunc
 
+	// GetTableMetricsFunc is used to gather information about sstables that
+	// overlap with a key range for a specified node and store.
+	GetTableMetricsFunc eval.GetTableMetricsFunc
+
 	// TraceCollector is used to contact all live nodes in the cluster, and
 	// collect trace spans from their inflight node registries.
 	TraceCollector *collector.TraceCollector
@@ -1782,6 +1786,8 @@ type StreamingTestingKnobs struct {
 	CutoverProgressShouldUpdate func() bool
 
 	DistSQLRetryPolicy *retry.Options
+
+	AfterRetryIteration func(err error)
 }
 
 var _ base.ModuleTestingKnobs = &StreamingTestingKnobs{}
@@ -3222,8 +3228,8 @@ func (m *sessionDataMutator) SetSafeUpdates(val bool) {
 	m.data.SafeUpdates = val
 }
 
-func (m *sessionDataMutator) SetDisableDropTenant(val bool) {
-	m.data.DisableDropTenant = val
+func (m *sessionDataMutator) SetDisableDropVirtualCluster(val bool) {
+	m.data.DisableDropVirtualCluster = val
 }
 
 func (m *sessionDataMutator) SetCheckFunctionBodies(val bool) {
@@ -3600,6 +3606,18 @@ func (m *sessionDataMutator) SetUnboundedParallelScans(val bool) {
 
 func (m *sessionDataMutator) SetReplicationMode(val sessiondatapb.ReplicationMode) {
 	m.data.ReplicationMode = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseImprovedJoinElimination(val bool) {
+	m.data.OptimizerUseImprovedJoinElimination = val
+}
+
+func (m *sessionDataMutator) SetImplicitFKLockingForSerializable(val bool) {
+	m.data.ImplicitFKLockingForSerializable = val
+}
+
+func (m *sessionDataMutator) SetDurableLockingForSerializable(val bool) {
+	m.data.DurableLockingForSerializable = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

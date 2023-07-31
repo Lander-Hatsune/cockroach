@@ -440,10 +440,6 @@ func makeRandEncodedKeys() [][]byte {
 			// 20% of keys have a logical component.
 			k.Timestamp.Logical = rng.Int31n(4) + 1
 		}
-		if rng.Int31n(1000) == 0 && !k.Timestamp.IsEmpty() {
-			// 0.1% of keys have a synthetic component.
-			k.Timestamp.Synthetic = true
-		}
 		keys[i] = EncodeMVCCKey(k)
 	}
 	return keys
@@ -474,7 +470,7 @@ func fillInData(ctx context.Context, engine Engine, data []testValue) error {
 	batch := engine.NewBatch()
 	defer batch.Close()
 	for _, val := range data {
-		if err := MVCCPut(ctx, batch, nil, val.key, val.timestamp, hlc.ClockTimestamp{}, val.value, val.txn); err != nil {
+		if err := MVCCPut(ctx, batch, val.key, val.timestamp, val.value, MVCCWriteOptions{Txn: val.txn}); err != nil {
 			return err
 		}
 	}
@@ -801,7 +797,7 @@ func TestPebbleMVCCTimeIntervalWithClears(t *testing.T) {
 	require.NoError(t, eng.Flush())
 
 	// Clear a@5 and [c-d)@7 in a separate SST.
-	require.NoError(t, eng.ClearMVCC(pointKey("a", 5)))
+	require.NoError(t, eng.ClearMVCC(pointKey("a", 5), ClearOptions{}))
 	require.NoError(t, eng.ClearMVCCRangeKey(rangeKey("c", "d", 7)))
 	require.NoError(t, eng.Flush())
 
@@ -1378,7 +1374,7 @@ func TestApproximateDiskBytes(t *testing.T) {
 	require.NoError(t, p.Flush())
 
 	approxBytes := func(span roachpb.Span) uint64 {
-		v, err := p.ApproximateDiskBytes(span.Key, span.EndKey)
+		v, _, _, err := p.ApproximateDiskBytes(span.Key, span.EndKey)
 		require.NoError(t, err)
 		t.Logf("%s (%x-%x): %d bytes", span, span.Key, span.EndKey, v)
 		return v

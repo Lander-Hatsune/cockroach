@@ -1234,6 +1234,7 @@ func TestRemoteOffsetUnhealthy(t *testing.T) {
 func TestGRPCKeepaliveFailureFailsInflightRPCs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	skip.UnderShort(t, "Takes too long given https://github.com/grpc/grpc-go/pull/2642")
+	skip.UnderStress(t, "Under high parallelism (>100) on the host node, this test reuses ports and fails")
 
 	sc := log.Scope(t)
 	defer sc.Close(t)
@@ -2497,4 +2498,109 @@ func checkMetrics(m *Metrics, healthy, unhealthy, inactive int64, checkDurations
 	}
 
 	return nil
+}
+
+// TestInitialHeartbeatFailedError tests that InitialHeartbeatFailedError is
+// returned for various scenarios. This is important for
+// grpcutil.RequestDidNotStart to properly detect unambiguous failures.
+func TestInitialHeartbeatFailedError(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	const maxOffset = 0
+	const nodeID = 1
+
+	hbErrType := (*netutil.InitialHeartbeatFailedError)(nil)
+	requireHeartbeatError := func(t *testing.T, err error) {
+		t.Helper()
+		require.Error(t, err)
+		require.True(t, errors.HasType(err, hbErrType), "got %T: %s", err, err)
+	}
+
+	ctx := context.Background()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	clock := timeutil.NewManualTime(timeutil.Unix(0, 20))
+	serverCtx := newTestContext(uuid.MakeV4(), clock, maxOffset, stopper)
+	serverCtx.NodeID.Set(ctx, nodeID)
+	clientCtx := newTestContext(serverCtx.StorageClusterID.Get(), clock, maxOffset, stopper)
+	clientCtx.AddTestingDialOpts(grpc.WithConnectParams(grpc.ConnectParams{
+		MinConnectTimeout: time.Second,
+	}))
+
+	// Set up a ping handler that can error out.
+	var failPing, hangPing atomic.Bool
+	onHandlePing := func(ctx context.Context, req *PingRequest, resp *PingResponse) error {
+		if failPing.Load() {
+			return errors.New("error")
+		}
+		for hangPing.Load() {
+			time.Sleep(100 * time.Millisecond)
+		}
+		return nil
+	}
+
+	// Rejected connection errors with InitialHeartbeatFailedError.
+	remoteAddr := "127.0.0.99:64072"
+	_, err := clientCtx.GRPCDialNode(remoteAddr, nodeID, SystemClass).Connect(ctx)
+	requireHeartbeatError(t, err)
+
+	// Hung listener errors with InitialHeartbeatFailedError.
+	hungLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() {
+		_ = hungLn.Close()
+	}()
+	remoteAddr = hungLn.Addr().String()
+
+	_, err = clientCtx.GRPCDialNode(remoteAddr, nodeID, SystemClass).Connect(ctx)
+	requireHeartbeatError(t, err)
+
+	// Start server listener. We set the ping handler to fail initially, to make
+	// sure no other actor creates an RPC connection.
+	failPing.Store(true)
+	s := newTestServer(t, serverCtx)
+	RegisterHeartbeatServer(s, &HeartbeatService{
+		clock:              clock,
+		remoteClockMonitor: serverCtx.RemoteClocks,
+		clusterID:          serverCtx.StorageClusterID,
+		nodeID:             serverCtx.NodeID,
+		version:            serverCtx.Settings.Version,
+		onHandlePing:       onHandlePing,
+	})
+
+	ln, err := netutil.ListenAndServeGRPC(serverCtx.Stopper, s, util.TestAddr)
+	require.NoError(t, err)
+	remoteAddr = ln.Addr().String()
+
+	// Before connecting, health does not return an InitialHeartbeatFailedError,
+	// it returns ErrNotHeartbeated.
+	err = clientCtx.GRPCDialNode(remoteAddr, nodeID, SystemClass).Health()
+	require.Error(t, err)
+	require.True(t, errors.HasType(err, ErrNotHeartbeated))
+	require.False(t, errors.HasType(err, hbErrType))
+
+	// Ping errors result in InitialHeartbeatFailedError.
+	failPing.Store(true)
+	_, err = clientCtx.GRPCDialNode(remoteAddr, nodeID, SystemClass).Connect(ctx)
+	requireHeartbeatError(t, err)
+
+	// Stalled pings result in InitialHeartbeatFailedError. We're careful to
+	// enable the hang before disabling the error, to make sure no other
+	// actor establishes a connection in the meanwhile.
+	hangPing.Store(true)
+	failPing.Store(false)
+	_, err = clientCtx.GRPCDialNode(remoteAddr, nodeID, SystemClass).Connect(ctx)
+	requireHeartbeatError(t, err)
+	hangPing.Store(false)
+
+	// RPC circuit breakers will now be tripped. They should result in
+	// InitialHeartbeatFailedError until we finally recover.
+	testutils.SucceedsSoon(t, func() error {
+		_, err := clientCtx.GRPCDialNode(remoteAddr, nodeID, SystemClass).Connect(ctx)
+		if err != nil {
+			requireHeartbeatError(t, err)
+		}
+		return err
+	})
 }

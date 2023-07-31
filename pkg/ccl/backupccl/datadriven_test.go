@@ -145,8 +145,6 @@ type clusterCfg struct {
 }
 
 func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
-	var tc serverutils.TestClusterInterface
-	var cleanup func()
 	params := base.TestClusterArgs{}
 	params.ServerArgs.ExternalIODirConfig = cfg.ioConf
 
@@ -199,20 +197,22 @@ func (d *datadrivenTestState) addCluster(t *testing.T, cfg clusterCfg) error {
 			t.Fatalf("TestingKnobCfg %s not found", cfg.testingKnobCfg)
 		}
 	}
+
+	opts := []backuptestutils.BackupTestArg{
+		backuptestutils.WithParams(params),
+		backuptestutils.WithTempDir(cfg.iodir),
+	}
 	if cfg.iodir == "" {
-		tc, _, cfg.iodir, cleanup = backupRestoreTestSetupWithParams(t, clusterSize, cfg.splits,
-			InitManualReplication, params)
-	} else {
-		tc, _, cleanup = backupRestoreTestSetupEmptyWithParams(t, clusterSize, cfg.iodir,
-			InitManualReplication, params)
+		opts = append(opts, backuptestutils.WithBank(cfg.splits))
 	}
-	cleanupFn := func() {
-		cleanup()
-	}
+
+	var tc serverutils.TestClusterInterface
+	var cleanup func()
+	tc, _, cfg.iodir, cleanup = backuptestutils.StartBackupRestoreTestCluster(t, clusterSize, opts...)
 	d.clusters[cfg.name] = tc
 	d.firstNode[cfg.name] = tc.Server(0)
 	d.dataDirs[cfg.name] = cfg.iodir
-	d.cleanupFns = append(d.cleanupFns, cleanupFn)
+	d.cleanupFns = append(d.cleanupFns, cleanup)
 
 	return nil
 }
@@ -230,7 +230,7 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, name string, user string) *
 	if db, ok := d.sqlDBs[key]; ok {
 		return db
 	}
-	addr := d.firstNode[name].ServingSQLAddr()
+	addr := d.firstNode[name].ApplicationLayer().AdvSQLAddr()
 	pgURL, cleanup := sqlutils.PGUrl(t, addr, "TestBackupRestoreDataDriven", url.User(user))
 	d.cleanupFns = append(d.cleanupFns, cleanup)
 
@@ -286,7 +286,7 @@ func (d *datadrivenTestState) getSQLDB(t *testing.T, name string, user string) *
 //   - testingKnobCfg: specifies a key to a hardcoded testingKnob configuration
 //
 //   - disable-tenant : ensures the test is never run in a multitenant environment by
-//     setting testserverargs.DefaultTestTenant to base.TestTenantDisabled.
+//     setting testserverargs.DefaultTestTenant to base.TODOTestTenantDisabled.
 //
 //   - "upgrade-cluster version=<version>"
 //     Upgrade the cluster version of the active cluster to the passed in
@@ -510,7 +510,7 @@ func runTestDataDriven(t *testing.T, testFilePathFromWorkspace string) {
 				d.ScanArgs(t, "testingKnobCfg", &testingKnobCfg)
 			}
 			if d.HasArg("disable-tenant") {
-				defaultTestTenant = base.TestTenantDisabled
+				defaultTestTenant = base.TODOTestTenantDisabled
 			}
 
 			lastCreatedCluster = name

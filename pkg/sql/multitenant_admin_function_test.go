@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
@@ -251,13 +252,7 @@ func (tc testCase) runTest(
 
 	testServer := testCluster.Server(0)
 
-	systemDB := serverutils.OpenDBConn(
-		t,
-		testServer.ServingSQLAddr(),
-		"",    /* useDatabase */
-		false, /* insecure */
-		testServer.Stopper(),
-	)
+	systemDB := testServer.SystemLayer().SQLConn(t, "")
 
 	createSecondaryDB := func(
 		tenantID roachpb.TenantID,
@@ -416,6 +411,7 @@ func bcap(cap tenantcapabilities.ID, val bool) capValue {
 func TestMultiTenantAdminFunction(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 
 	testCases := []testCase{
 		{
@@ -628,6 +624,7 @@ func TestMultiTenantAdminFunction(t *testing.T) {
 func TestTruncateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 
 	tc := testCase{
 		system: tenantExpected{
@@ -679,6 +676,7 @@ func TestTruncateTable(t *testing.T) {
 func TestRelocateVoters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 
 	testCases := []testCase{
 		{
@@ -770,6 +768,7 @@ func TestRelocateVoters(t *testing.T) {
 func TestExperimentalRelocateVoters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 
 	testCases := []testCase{
 		{
@@ -843,6 +842,7 @@ func TestExperimentalRelocateVoters(t *testing.T) {
 func TestRelocateNonVoters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 
 	testCases := []testCase{
 		{
@@ -929,6 +929,7 @@ func TestRelocateNonVoters(t *testing.T) {
 func TestExperimentalRelocateNonVoters(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 
 	testCases := []testCase{
 		{

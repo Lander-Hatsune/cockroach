@@ -1160,9 +1160,16 @@ func (d *DDecimal) Next(ctx CompareContext) (Datum, bool) {
 	return nil, false
 }
 
-var dZeroDecimal = &DDecimal{Decimal: apd.Decimal{}}
-var dPosInfDecimal = &DDecimal{Decimal: apd.Decimal{Form: apd.Infinite, Negative: false}}
-var dNaNDecimal = &DDecimal{Decimal: apd.Decimal{Form: apd.NaN}}
+var (
+	// DZeroDecimal is the decimal constant '0'.
+	DZeroDecimal = &DDecimal{Decimal: apd.Decimal{}}
+
+	// dNaNDecimal is the decimal constant 'NaN'.
+	dNaNDecimal = &DDecimal{Decimal: apd.Decimal{Form: apd.NaN}}
+
+	// dPosInfDecimal is the decimal constant 'inf'.
+	dPosInfDecimal = &DDecimal{Decimal: apd.Decimal{Form: apd.Infinite, Negative: false}}
+)
 
 // IsMax implements the Datum interface.
 func (d *DDecimal) IsMax(ctx CompareContext) bool {
@@ -5671,6 +5678,11 @@ func (d *DOid) Min(ctx CompareContext) (Datum, bool) {
 	return &DOid{0, d.semanticType, ""}, true
 }
 
+// Name returns the name associated with this DOid.
+func (d *DOid) Name() string {
+	return d.name
+}
+
 // DOidWrapper is a Datum implementation which is a wrapper around a Datum, allowing
 // custom Oid values to be attached to the Datum and its types.T.
 // The reason the Datum type was introduced was to permit the introduction of Datum
@@ -5909,7 +5921,7 @@ func NewDefaultDatum(collationEnv *CollationEnvironment, t *types.T) (d Datum, e
 	case types.FloatFamily:
 		return DZeroFloat, nil
 	case types.DecimalFamily:
-		return dZeroDecimal, nil
+		return DZeroDecimal, nil
 	case types.DateFamily:
 		return dEpochDate, nil
 	case types.TimestampFamily:

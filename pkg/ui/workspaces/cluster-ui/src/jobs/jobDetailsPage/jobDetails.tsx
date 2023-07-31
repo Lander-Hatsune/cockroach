@@ -39,10 +39,16 @@ import jobStyles from "src/jobs/jobs.module.scss";
 
 import classNames from "classnames/bind";
 import { Timestamp } from "../../timestamp";
-import { RequestState } from "../../api";
+import {
+  GetJobProfilerExecutionDetailRequest,
+  GetJobProfilerExecutionDetailResponse,
+  ListJobProfilerExecutionDetailsRequest,
+  ListJobProfilerExecutionDetailsResponse,
+  RequestState,
+} from "../../api";
 import moment from "moment-timezone";
 import { CockroachCloudContext } from "src/contexts";
-import { InlineAlert } from "@cockroachlabs/ui-components";
+import { JobProfilerView } from "./jobProfilerView";
 
 const { TabPane } = Tabs;
 
@@ -51,15 +57,24 @@ const jobCx = classNames.bind(jobStyles);
 
 enum TabKeysEnum {
   OVERVIEW = "Overview",
-  PROFILER = "Profiler",
+  PROFILER = "Advanced Debugging",
 }
 
 export interface JobDetailsStateProps {
   jobRequest: RequestState<JobResponse>;
+  jobProfilerExecutionDetailFilesResponse: RequestState<ListJobProfilerExecutionDetailsResponse>;
+  jobProfilerLastUpdated: moment.Moment;
+  jobProfilerDataIsValid: boolean;
+  onDownloadExecutionFileClicked: (
+    req: GetJobProfilerExecutionDetailRequest,
+  ) => Promise<GetJobProfilerExecutionDetailResponse>;
 }
 
 export interface JobDetailsDispatchProps {
   refreshJob: (req: JobRequest) => void;
+  refreshExecutionDetailFiles: (
+    req: ListJobProfilerExecutionDetailsRequest,
+  ) => void;
 }
 
 export interface JobDetailsState {
@@ -117,25 +132,19 @@ export class JobDetails extends React.Component<
     job: cockroach.server.serverpb.JobResponse,
   ): React.ReactElement => {
     const id = job?.id;
-    // This URL results in a cluster-wide CPU profile to be collected for 5
-    // seconds. We set `tagfocus` (tf) to only view the samples corresponding to
-    // this job's execution.
-    const url = `debug/pprof/ui/cpu?node=all&seconds=5&labels=true&tf=job.*${id}`;
     return (
-      <Row gutter={24}>
-        <Col className="gutter-row" span={24}>
-          <SummaryCard className={cardCx("summary-card")}>
-            <SummaryCardItem
-              label="Cluster-wide CPU Profile"
-              value={<a href={url}>Profile</a>}
-            />
-            <InlineAlert
-              intent="warning"
-              title="This operation buffers profiles in memory for all the nodes in the cluster and can result in increased memory usage."
-            />
-          </SummaryCard>
-        </Col>
-      </Row>
+      <JobProfilerView
+        jobID={id}
+        executionDetailFilesResponse={
+          this.props.jobProfilerExecutionDetailFilesResponse
+        }
+        refreshExecutionDetailFiles={this.props.refreshExecutionDetailFiles}
+        lastUpdated={this.props.jobProfilerLastUpdated}
+        isDataValid={this.props.jobProfilerDataIsValid}
+        onDownloadExecutionFileClicked={
+          this.props.onDownloadExecutionFileClicked
+        }
+      />
     );
   };
 
@@ -300,7 +309,7 @@ export class JobDetails extends React.Component<
                     {this.renderOverviewTabContent(hasNextRun, nextRun, job)}
                   </TabPane>
                   {!useContext(CockroachCloudContext) && (
-                    <TabPane tab={TabKeysEnum.PROFILER} key="profiler">
+                    <TabPane tab={TabKeysEnum.PROFILER} key="advancedDebugging">
                       {this.renderProfilerTabContent(job)}
                     </TabPane>
                   )}

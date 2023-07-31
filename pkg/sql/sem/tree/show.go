@@ -152,6 +152,7 @@ type ShowBackupOptions struct {
 	DecryptionKMSURI     StringOrPlaceholderOptList
 	EncryptionPassphrase Expr
 	Privileges           bool
+	SkipSize             bool
 
 	// EncryptionInfoDir is a hidden option used when the user wants to run the deprecated
 	//
@@ -221,6 +222,10 @@ func (o *ShowBackupOptions) Format(ctx *FmtCtx) {
 		ctx.WriteString("kms = ")
 		ctx.FormatNode(&o.DecryptionKMSURI)
 	}
+	if o.SkipSize {
+		maybeAddSep()
+		ctx.WriteString("skip size")
+	}
 	if o.DebugMetadataSST {
 		maybeAddSep()
 		ctx.WriteString("debug_dump_metadata_sst")
@@ -253,6 +258,7 @@ func (o ShowBackupOptions) IsDefault() bool {
 		cmp.Equal(o.DecryptionKMSURI, options.DecryptionKMSURI) &&
 		o.EncryptionPassphrase == options.EncryptionPassphrase &&
 		o.Privileges == options.Privileges &&
+		o.SkipSize == options.SkipSize &&
 		o.DebugMetadataSST == options.DebugMetadataSST &&
 		o.EncryptionInfoDir == options.EncryptionInfoDir &&
 		o.CheckConnectionTransferSize == options.CheckConnectionTransferSize &&
@@ -319,6 +325,10 @@ func (o *ShowBackupOptions) CombineWith(other *ShowBackupOptions) error {
 		return err
 	}
 	o.Privileges, err = combineBools(o.Privileges, other.Privileges, "privileges")
+	if err != nil {
+		return err
+	}
+	o.SkipSize, err = combineBools(o.SkipSize, other.SkipSize, "skip size")
 	if err != nil {
 		return err
 	}
@@ -560,7 +570,7 @@ func (node *ShowChangefeedJobs) Format(ctx *FmtCtx) {
 	}
 }
 
-// ShowSurvivalGoal represents a SHOW REGIONS statement
+// ShowSurvivalGoal represents a SHOW SURVIVAL GOAL statement
 type ShowSurvivalGoal struct {
 	DatabaseName Name
 }
@@ -1120,13 +1130,13 @@ func (node *ShowTableStats) Format(ctx *FmtCtx) {
 	}
 }
 
-// ShowTenantOptions represents the WITH clause in SHOW TENANT.
+// ShowTenantOptions represents the WITH clause in SHOW VIRTUAL CLUSTER.
 type ShowTenantOptions struct {
 	WithReplication  bool
 	WithCapabilities bool
 }
 
-// ShowTenant represents a SHOW TENANT statement.
+// ShowTenant represents a SHOW VIRTUAL CLUSTER statement.
 type ShowTenant struct {
 	TenantSpec *TenantSpec
 	ShowTenantOptions
@@ -1134,7 +1144,7 @@ type ShowTenant struct {
 
 // Format implements the NodeFormatter interface.
 func (node *ShowTenant) Format(ctx *FmtCtx) {
-	ctx.WriteString("SHOW TENANT ")
+	ctx.WriteString("SHOW VIRTUAL CLUSTER ")
 	ctx.FormatNode(node.TenantSpec)
 
 	withs := []string{}

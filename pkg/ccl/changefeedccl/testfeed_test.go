@@ -66,7 +66,7 @@ import (
 )
 
 type sinklessFeedFactory struct {
-	s serverutils.TestTenantInterface
+	s serverutils.ApplicationLayerInterface
 	// postgres url used for creating sinkless changefeeds. This may be the same as
 	// the rootURL.
 	sink url.URL
@@ -78,7 +78,7 @@ type sinklessFeedFactory struct {
 // makeSinklessFeedFactory returns a TestFeedFactory implementation using the
 // `experimental-sql` uri.
 func makeSinklessFeedFactory(
-	s serverutils.TestTenantInterface, sink url.URL, rootConn url.URL, sinkForUser sinkForUser,
+	s serverutils.ApplicationLayerInterface, sink url.URL, rootConn url.URL, sinkForUser sinkForUser,
 ) cdctest.TestFeedFactory {
 	return &sinklessFeedFactory{s: s, sink: sink, rootURL: rootConn, sinkForUser: sinkForUser}
 }
@@ -140,7 +140,7 @@ func (f *sinklessFeedFactory) Feed(create string, args ...interface{}) (cdctest.
 }
 
 // Server implements the TestFeedFactory interface.
-func (f *sinklessFeedFactory) Server() serverutils.TestTenantInterface {
+func (f *sinklessFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return f.s
 }
 
@@ -158,6 +158,9 @@ func (t seenTrackerMap) markSeen(m *cdctest.TestFeedMessage) (isNew bool) {
 	// Fixme.
 	seenKey := m.Topic + m.Partition + string(m.Key) + string(m.Value)
 	if _, ok := t[seenKey]; ok {
+		if log.V(1) {
+			log.Infof(context.Background(), "skip dup %s", seenKey)
+		}
 		return false
 	}
 	t[seenKey] = struct{}{}
@@ -635,7 +638,7 @@ func (s *notifyFlushSink) EncodeAndEmitRow(
 var _ Sink = (*notifyFlushSink)(nil)
 
 // feedInjectable is the subset of the
-// TestServerInterface/TestTenantInterface needed for depInjector to
+// TestServerInterface/ApplicationLayerInterface needed for depInjector to
 // work correctly.
 type feedInjectable interface {
 	JobRegistry() interface{}
@@ -736,7 +739,7 @@ func (di *depInjector) getJobFeed(jobID jobspb.JobID) *jobFeed {
 }
 
 type enterpriseFeedFactory struct {
-	s  serverutils.TestTenantInterface
+	s  serverutils.ApplicationLayerInterface
 	di *depInjector
 	// db is used for creating changefeeds. This may be the same as rootDB.
 	db *gosql.DB
@@ -799,9 +802,11 @@ type tableFeedFactory struct {
 	uri url.URL
 }
 
-func getInjectables(srvOrCluster interface{}) (serverutils.TestTenantInterface, []feedInjectable) {
+func getInjectables(
+	srvOrCluster interface{},
+) (serverutils.ApplicationLayerInterface, []feedInjectable) {
 	switch t := srvOrCluster.(type) {
-	case serverutils.TestTenantInterface:
+	case serverutils.ApplicationLayerInterface:
 		t.PGServer()
 		return t, []feedInjectable{t}
 	case serverutils.TestClusterInterface:
@@ -882,7 +887,7 @@ func (f *tableFeedFactory) Feed(
 }
 
 // Server implements the TestFeedFactory interface.
-func (f *tableFeedFactory) Server() serverutils.TestTenantInterface {
+func (f *tableFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return f.s
 }
 
@@ -1080,7 +1085,6 @@ func (f *cloudFeedFactory) Feed(
 			parquetPossible = false
 		}
 		if parquetPossible {
-			log.Infof(context.Background(), "using parquet format")
 			createStmt.Options = append(
 				createStmt.Options,
 				tree.KVOption{
@@ -1126,7 +1130,7 @@ func (f *cloudFeedFactory) Feed(
 }
 
 // Server implements the TestFeedFactory interface.
-func (f *cloudFeedFactory) Server() serverutils.TestTenantInterface {
+func (f *cloudFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return f.s
 }
 
@@ -1137,8 +1141,9 @@ type cloudFeed struct {
 	dir    string
 	isBare bool
 
-	resolved string
-	rows     []*cdctest.TestFeedMessage
+	resolved  string
+	seenFiles map[string]struct{}
+	rows      []*cdctest.TestFeedMessage
 }
 
 var _ cdctest.TestFeed = (*cloudFeed)(nil)
@@ -1448,21 +1453,15 @@ func (c *cloudFeed) walkDir(path string, info os.FileInfo, err error) error {
 		return nil
 	}
 
-	tsFromPath := func(p string) string {
-		return strings.Split(filepath.Base(p), "-")[0]
+	// Skip files we processed before.
+	if c.seenFiles == nil {
+		c.seenFiles = make(map[string]struct{})
 	}
-
-	// Skip files with timestamp greater than the previously observed timestamp.
-	// Note: theoretically, we should be able to skip any file with timestamp
-	// greater *or equal* to the previously observed timestamp.  However, alter
-	// changefeed pose a problem, since a table maybe added with initial scan
-	// option, causing new events (possibly including resolved event) to be
-	// emitted as of previously emitted timestamp.
-	// See https://github.com/cockroachdb/cockroach/issues/84102
-	if strings.Compare(tsFromPath(c.resolved), tsFromPath(path)) >= 0 {
-		// Already output this in a previous walkDir.
+	if _, seen := c.seenFiles[path]; seen {
+		log.Infof(context.Background(), "Skip file %s", path)
 		return nil
 	}
+	c.seenFiles[path] = struct{}{}
 
 	details, err := c.Details()
 	if err != nil {
@@ -1829,7 +1828,7 @@ func (k *kafkaFeedFactory) Feed(create string, args ...interface{}) (cdctest.Tes
 }
 
 // Server implements TestFeedFactory
-func (k *kafkaFeedFactory) Server() serverutils.TestTenantInterface {
+func (k *kafkaFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return k.s
 }
 
@@ -2030,7 +2029,7 @@ func (f *webhookFeedFactory) Feed(create string, args ...interface{}) (cdctest.T
 	return c, nil
 }
 
-func (f *webhookFeedFactory) Server() serverutils.TestTenantInterface {
+func (f *webhookFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return f.s
 }
 
@@ -2341,7 +2340,7 @@ func makePubsubFeedFactory(srvOrCluster interface{}, rootDB *gosql.DB) cdctest.T
 	s, injectables := getInjectables(srvOrCluster)
 
 	switch t := srvOrCluster.(type) {
-	case serverutils.TestTenantInterface:
+	case serverutils.ApplicationLayerInterface:
 		t.DistSQLServer().(*distsql.ServerImpl).TestingKnobs.Changefeed.(*TestingKnobs).PubsubClientSkipClientCreation = true
 	case serverutils.TestClusterInterface:
 		servers := make([]feedInjectable, t.NumServers())
@@ -2419,7 +2418,7 @@ func (p *pubsubFeedFactory) Feed(create string, args ...interface{}) (cdctest.Te
 }
 
 // Server implements TestFeedFactory
-func (p *pubsubFeedFactory) Server() serverutils.TestTenantInterface {
+func (p *pubsubFeedFactory) Server() serverutils.ApplicationLayerInterface {
 	return p.s
 }
 

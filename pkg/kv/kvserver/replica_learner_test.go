@@ -142,7 +142,7 @@ func TestAddReplicaViaLearner(t *testing.T) {
 	var receivedSnap int64
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		if atomic.CompareAndSwapInt64(&receivedSnap, 0, 1) {
 			close(blockUntilSnapshotCh)
 		} else {
@@ -238,7 +238,7 @@ func TestAddReplicaWithReceiverThrottling(t *testing.T) {
 	activateBlocking := int64(1)
 	var count int64
 	knobs, ltk := makeReplicationTestKnobs()
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		if atomic.LoadInt64(&activateBlocking) > 0 {
 			// Signal waitForRebalanceToBlockCh to indicate the testing knob was hit.
 			close(waitForRebalanceToBlockCh)
@@ -250,7 +250,7 @@ func TestAddReplicaWithReceiverThrottling(t *testing.T) {
 	ltk.storeKnobs.BeforeSendSnapshotThrottle = func() {
 		atomic.AddInt64(&count, 1)
 	}
-	ltk.storeKnobs.AfterSendSnapshotThrottle = func() {
+	ltk.storeKnobs.AfterSnapshotThrottle = func() {
 		atomic.AddInt64(&count, -1)
 	}
 	ctx := context.Background()
@@ -492,7 +492,7 @@ func TestDelegateSnapshotFails(t *testing.T) {
 	}
 
 	setupFn := func(t *testing.T,
-		receiveFunc func(*kvserverpb.SnapshotRequest_Header) error,
+		receiveFunc func(context.Context, *kvserverpb.SnapshotRequest_Header) error,
 		sendFunc func(*kvserverpb.DelegateSendSnapshotRequest),
 		processRaft func(roachpb.StoreID) bool,
 	) (
@@ -618,7 +618,7 @@ func TestDelegateSnapshotFails(t *testing.T) {
 		var block atomic.Int32
 		tc, scratchKey := setupFn(
 			t,
-			func(h *kvserverpb.SnapshotRequest_Header) error {
+			func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 				// TODO(abaptist): Remove this check once #96841 is fixed.
 				if h.SenderQueueName == kvserverpb.SnapshotRequest_RAFT_SNAPSHOT_QUEUE {
 					return nil
@@ -862,7 +862,7 @@ func TestLearnerSnapshotFailsRollback(t *testing.T) {
 	runTest := func(t *testing.T, replicaType roachpb.ReplicaType) {
 		var rejectSnapshotErr atomic.Value // error
 		knobs, ltk := makeReplicationTestKnobs()
-		ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+		ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 			if err := rejectSnapshotErr.Load().(error); err != nil {
 				return err
 			}
@@ -1374,7 +1374,7 @@ func TestRaftSnapshotQueueSeesLearner(t *testing.T) {
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
 	ltk.storeKnobs.DisableRaftSnapshotQueue = true
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		select {
 		case <-blockSnapshotsCh:
 		case <-time.After(10 * time.Second):
@@ -1438,7 +1438,7 @@ func TestLearnerAdminChangeReplicasRace(t *testing.T) {
 	blockUntilSnapshotCh := make(chan struct{}, 2)
 	blockSnapshotsCh := make(chan struct{})
 	knobs, ltk := makeReplicationTestKnobs()
-	ltk.storeKnobs.ReceiveSnapshot = func(h *kvserverpb.SnapshotRequest_Header) error {
+	ltk.storeKnobs.ReceiveSnapshot = func(_ context.Context, h *kvserverpb.SnapshotRequest_Header) error {
 		blockUntilSnapshotCh <- struct{}{}
 		<-blockSnapshotsCh
 		return nil
@@ -1991,7 +1991,7 @@ func TestMergeQueueDoesNotInterruptReplicationChange(t *testing.T) {
 						// Disable load-based splitting, so that the absence of sufficient
 						// QPS measurements do not prevent ranges from merging.
 						DisableLoadBasedSplitting: true,
-						ReceiveSnapshot: func(_ *kvserverpb.SnapshotRequest_Header) error {
+						ReceiveSnapshot: func(_ context.Context, _ *kvserverpb.SnapshotRequest_Header) error {
 							if atomic.LoadInt64(&activateSnapshotTestingKnob) == 1 {
 								// While the snapshot RPC should only happen once given
 								// that the cluster is running under manual replication,
@@ -2440,4 +2440,53 @@ func TestRebalancingAndCrossRegionZoneSnapshotMetrics(t *testing.T) {
 		require.Equal(t, secReceiverExpected, secReceiverDelta)
 	})
 
+}
+
+// TestAddVotersWithoutRaftQueue verifies that in normal operations Raft
+// snapshots are not required. This test creates a range with a single voter,
+// then adds two additional voters. Most of the time this succeeds, however it
+// fails (today) occasionally due to the addition of the first voter being
+// "incomplete" and therefore the second voter is not able to be added because
+// there is no quorum.
+//
+// Specifically the following sequence of events happens when the leader adds
+// the first voter:
+//  1. AdminChangeReplicasRequest is processed on n1.
+//     a) Adds a n2 as a LEARNER to raft.
+//     b) Sends an initial snapshot to n2.
+//     c) n2 receives and applies the snapshot.
+//     d) n2 responds that it successfully applied the snapshot.
+//     e) n1 receives the response and updates state to Follower.
+//  2. Before step c above, n1 sends a MsgApp to n2
+//     a) MsgApp - entries up-to and including the conf change.
+//     b) The MsgApp is received and REJECTED because the term is wrong.
+//     c) After 1e above, n1 receives the rejection.
+//     d) n1 updates n2 from StateReplicate to StateProbe and then StateSnapshot.
+//
+// From n2's perspective, it receives the MsgApp prior to the initial snapshot.
+// This results in it responding with a rejected MsgApp. Later it receives the
+// snapshot and correctly applies it. However, when n1 sees the rejected MsgApp,
+// it moves n2 status to StateProbe and stops sending Raft updates to it as it
+// plans to fix it with a Raft Snapshot. As the raft snapshot queue is disabled
+// this never happens and the state is stuck as a non-Learner in StateProbe. At
+// this point, the Raft group is wedged since it only has 1/2 nodes available
+// for Raft consensus.
+func TestAddVotersWithoutRaftQueue(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ctx := context.Background()
+
+	// Disable the raft snapshot queue to make sure we don't require a raft snapshot.
+	tc := testcluster.StartTestCluster(
+		t, 3, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{DisableRaftSnapshotQueue: true}},
+			},
+			ReplicationMode: base.ReplicationManual,
+		},
+	)
+	defer tc.Stopper().Stop(ctx)
+
+	key := tc.ScratchRange(t)
+	tc.AddVotersOrFatal(t, key, tc.Target(1))
+	tc.AddVotersOrFatal(t, key, tc.Target(2))
 }

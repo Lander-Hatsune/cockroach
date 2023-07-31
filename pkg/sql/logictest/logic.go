@@ -18,7 +18,6 @@ import (
 	gosql "database/sql"
 	"flag"
 	"fmt"
-	"math"
 	"math/rand"
 	"net"
 	"net/url"
@@ -70,6 +69,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/floatcmp"
 	"github.com/cockroachdb/cockroach/pkg/testutils/physicalplanutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
@@ -994,6 +994,7 @@ type logicTest struct {
 	// If this test uses a SQL tenant server, this is its address. In this case,
 	// all clients are created against this tenant.
 	tenantAddrs []string
+	tenantApps  []serverutils.ApplicationLayerInterface
 	// map of built clients, keyed first on username and then node idx.
 	// They are persisted so that they can be reused. They are not closed
 	// until the end of a test.
@@ -1197,7 +1198,7 @@ func (t *logicTest) getOrOpenClient(user string, nodeIdx int) *gosql.DB {
 		pgURL.Host = net.JoinHostPort("127.0.0.1", port)
 		pgURL.User = url.User(pgUser)
 	} else {
-		addr := t.cluster.Server(nodeIdx).ServingSQLAddr()
+		addr := t.cluster.Server(nodeIdx).AdvSQLAddr()
 		if len(t.tenantAddrs) > 0 && !strings.HasPrefix(user, "host-cluster-") {
 			addr = t.tenantAddrs[nodeIdx]
 		}
@@ -1246,6 +1247,9 @@ func (t *logicTest) openDB(pgURL url.URL) *gosql.DB {
 		}
 		if notice.Hint != "" {
 			t.noticeBuffer = append(t.noticeBuffer, "HINT: "+notice.Hint)
+		}
+		if notice.Code != "" && notice.Code != "00000" {
+			t.noticeBuffer = append(t.noticeBuffer, "SQLSTATE: "+string(notice.Code))
 		}
 	})
 
@@ -1382,12 +1386,17 @@ func (t *logicTest) newCluster(
 	shouldUseMVCCRangeTombstonesForPointDeletes := useMVCCRangeTombstonesForPointDeletes && !serverArgs.DisableUseMVCCRangeTombstonesForPointDeletes
 	ignoreMVCCRangeTombstoneErrors := globalMVCCRangeTombstone || shouldUseMVCCRangeTombstonesForPointDeletes
 
-	defaultTestTenant := t.cfg.DefaultTestTenant
-	if defaultTestTenant == base.TestTenantEnabled {
-		// If the test tenant is explicitly enabled then `logic test` will handle
-		// the creation of a configured test tenant, thus for this case we disable
-		// the implicit creation of the default test tenant.
-		defaultTestTenant = base.TestTenantDisabled
+	var defaultTestTenant base.DefaultTestTenantOptions
+	switch t.cfg.UseSecondaryTenant {
+	case logictestbase.Always, logictestbase.Never:
+		// If the test tenant is explicitly enabled or disabled then
+		// `logic test` will handle the creation of a configured test
+		// tenant, thus for this case we disable the implicit creation of
+		// the default test tenant.
+		defaultTestTenant = base.TestControlsTenantsExplicitly
+	case logictestbase.Random:
+		// Delegate to the test framework what to do.
+		defaultTestTenant = base.TestTenantProbabilisticOnly
 	}
 
 	params := base.TestClusterArgs{
@@ -1418,9 +1427,14 @@ func (t *logicTest) newCluster(
 	setSQLTestingKnobs(&params.ServerArgs.Knobs)
 
 	cfg := t.cfg
-	if cfg.DefaultTestTenant == base.TestTenantEnabled {
+	if cfg.UseSecondaryTenant == logictestbase.Always {
 		// In the tenant case we need to enable replication in order to split and
 		// relocate ranges correctly.
+		//
+		// TODO(#76378): This condition is faulty. In the case where the
+		// profile is configured with "Random", we want to set the
+		// replication mode as well when a test tenant is effectively
+		// created. This currently is not happening.
 		params.ReplicationMode = base.ReplicationAuto
 	}
 	if cfg.BootstrapVersion != clusterversion.Key(0) {
@@ -1488,8 +1502,14 @@ func (t *logicTest) newCluster(
 	}
 
 	connsForClusterSettingChanges := []*gosql.DB{t.cluster.ServerConn(0)}
-	if cfg.DefaultTestTenant == base.TestTenantEnabled {
+	if cfg.UseSecondaryTenant == logictestbase.Always {
+		// The config profile requires the test to run with a secondary
+		// tenant. Set the tenant servers up now.
+		//
+		// TODO(cli): maybe share this code with the code in
+		// cli/democluster which does a very similar thing.
 		t.tenantAddrs = make([]string, cfg.NumNodes)
+		t.tenantApps = make([]serverutils.ApplicationLayerInterface, cfg.NumNodes)
 		for i := 0; i < cfg.NumNodes; i++ {
 			settings := makeClusterSettings(false /* forSystemTenant */)
 			tempStorageConfig := base.DefaultTestTempStorageConfigWithSize(settings, tempStorageDiskLimit)
@@ -1517,21 +1537,13 @@ func (t *logicTest) newCluster(
 			if err != nil {
 				t.rootT.Fatalf("%+v", err)
 			}
+			t.tenantApps[i] = tenant
 			t.tenantAddrs[i] = tenant.SQLAddr()
 		}
 
 		// Open a connection to a tenant to set any cluster settings specified
 		// by the test config.
-		pgURL, cleanup := sqlutils.PGUrl(t.rootT, t.tenantAddrs[0], "Tenant", url.User(username.RootUser))
-		defer cleanup()
-		if params.ServerArgs.Insecure {
-			pgURL.RawQuery = "sslmode=disable"
-		}
-		db, err := gosql.Open("postgres", pgURL.String())
-		if err != nil {
-			t.rootT.Fatal(err)
-		}
-		defer db.Close()
+		db := t.tenantApps[0].SQLConn(t.rootT, "")
 		connsForClusterSettingChanges = append(connsForClusterSettingChanges, db)
 
 		// Increase tenant rate limits for faster tests.
@@ -1551,9 +1563,9 @@ func (t *logicTest) newCluster(
 	// If we've created a tenant (either explicitly, or probabilistically and
 	// implicitly) set any necessary cluster settings to override blocked
 	// behavior.
-	if cfg.DefaultTestTenant == base.TestTenantEnabled || t.cluster.StartedDefaultTestTenant() {
+	if cfg.UseSecondaryTenant == logictestbase.Always || t.cluster.StartedDefaultTestTenant() {
 
-		conn := t.cluster.StorageClusterConn()
+		conn := t.cluster.SystemLayer(0).SQLConn(t.rootT, "")
 		clusterSettings := toa.clusterSettings
 		_, ok := clusterSettings[sql.SecondaryTenantZoneConfigsEnabled.Key()]
 		if ok {
@@ -1751,21 +1763,14 @@ func (t *logicTest) waitForTenantReadOnlyClusterSettingToTakeEffectOrFatal(
 	settingName string, expValue string, insecure bool,
 ) {
 	// Wait until all tenant servers are aware of the setting override.
+	dbs := make([]*gosql.DB, len(t.tenantApps))
+	for i := range dbs {
+		dbs[i] = t.tenantApps[i].SQLConn(t.rootT, "")
+	}
 	testutils.SucceedsSoon(t.rootT, func() error {
-		for i := 0; i < len(t.tenantAddrs); i++ {
-			pgURL, cleanup := sqlutils.PGUrl(t.rootT, t.tenantAddrs[0], "Tenant", url.User(username.RootUser))
-			defer cleanup()
-			if insecure {
-				pgURL.RawQuery = "sslmode=disable"
-			}
-			db, err := gosql.Open("postgres", pgURL.String())
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer db.Close()
-
+		for i := 0; i < len(t.tenantApps); i++ {
 			var val string
-			err = db.QueryRow(
+			err := dbs[i].QueryRow(
 				fmt.Sprintf("SHOW CLUSTER SETTING %s", settingName),
 			).Scan(&val)
 			if err != nil {
@@ -1854,7 +1859,7 @@ func (t *logicTest) setup(
 		if err != nil {
 			t.Fatal(err)
 		}
-		bootstrapVersion, err := version.PredecessorVersion(*upgradeVersion)
+		bootstrapVersion, err := release.LatestPredecessor(upgradeVersion)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2297,8 +2302,9 @@ func (t *logicTest) maybeBackupRestore(
 		}
 	}
 
-	backupLocation := fmt.Sprintf("gs://cockroachdb-backup-testing/logic-test-backup-restore-nightly/%s?AUTH=implicit",
-		strconv.FormatInt(timeutil.Now().UnixNano(), 10))
+	bucket := testutils.BackupTestingBucket()
+	backupLocation := fmt.Sprintf("gs://%s/logic-test-backup-restore-nightly/%s?AUTH=implicit",
+		bucket, strconv.FormatInt(timeutil.Now().UnixNano(), 10))
 
 	// Perform the backup and restore as root.
 	t.setUser(username.RootUser, 0 /* nodeIdx */)
@@ -2974,7 +2980,12 @@ func (t *logicTest) processSubtest(
 			t.setUser(fields[1], nodeIdx)
 			// In multi-tenant tests, we may need to also create database test when
 			// we switch to a different tenant.
-			if t.cfg.DefaultTestTenant == base.TestTenantEnabled && strings.HasPrefix(fields[1], "host-cluster-") {
+			//
+			// TODO(#76378): It seems the conditional should include `||
+			// t.cluster.StartedDefaultTestTenant()` here, to cover the case
+			// where the config specified "Random" and a test tenant was
+			// effectively created.
+			if t.cfg.UseSecondaryTenant == logictestbase.Always && strings.HasPrefix(fields[1], "host-cluster-") {
 				if _, err := t.db.Exec("CREATE DATABASE IF NOT EXISTS test; USE test;"); err != nil {
 					return errors.Wrapf(err, "error creating database on admin tenant")
 				}
@@ -3129,8 +3140,8 @@ func (t *logicTest) maybeSkipOnRetry(err error) {
 func (t *logicTest) verifyError(
 	sql, pos, expectNotice, expectErr, expectErrCode string, err error,
 ) (bool, error) {
+	t.maybeSkipOnRetry(err)
 	if expectErr == "" && expectErrCode == "" && err != nil {
-		t.maybeSkipOnRetry(err)
 		return t.unexpectedError(sql, pos, err)
 	}
 	if expectNotice != "" {
@@ -3651,9 +3662,9 @@ func (t *logicTest) finishExecQuery(query logicQuery, rows *gosql.Rows, err erro
 				// ('R') coltypes are approximately equal to take into account
 				// platform differences in floating point calculations.
 				if runtime.GOARCH == "s390x" && (colT == 'F' || colT == 'R') {
-					resultMatches, err = floatsMatchApprox(expected, actual)
+					resultMatches, err = floatcmp.FloatsMatchApprox(expected, actual)
 				} else if colT == 'F' {
-					resultMatches, err = floatsMatch(expected, actual)
+					resultMatches, err = floatcmp.FloatsMatch(expected, actual)
 				}
 				if err != nil {
 					return errors.CombineErrors(makeError(), err)
@@ -3719,93 +3730,6 @@ func (t *logicTest) finishExecQuery(query logicQuery, rows *gosql.Rows, err erro
 
 	t.finishOne("OK")
 	return nil
-}
-
-// parseExpectedAndActualFloats converts the strings expectedString and
-// actualString to float64 values.
-func parseExpectedAndActualFloats(expectedString, actualString string) (float64, float64, error) {
-	expected, err := strconv.ParseFloat(expectedString, 64 /* bitSize */)
-	if err != nil {
-		return 0, 0, errors.Wrap(err, "when parsing expected")
-	}
-	actual, err := strconv.ParseFloat(actualString, 64 /* bitSize */)
-	if err != nil {
-		return 0, 0, errors.Wrap(err, "when parsing actual")
-	}
-	return expected, actual, nil
-}
-
-// floatsMatchApprox returns whether two floating point represented as
-// strings are equal within a tolerance.
-func floatsMatchApprox(expectedString, actualString string) (bool, error) {
-	expected, actual, err := parseExpectedAndActualFloats(expectedString, actualString)
-	if err != nil {
-		return false, err
-	}
-	return floatcmp.EqualApprox(expected, actual, floatcmp.CloseFraction, floatcmp.CloseMargin), nil
-}
-
-// floatsMatch returns whether two floating point numbers represented as
-// strings have matching 15 significant decimal digits (this is the precision
-// that Postgres supports for 'double precision' type).
-func floatsMatch(expectedString, actualString string) (bool, error) {
-	expected, actual, err := parseExpectedAndActualFloats(expectedString, actualString)
-	if err != nil {
-		return false, err
-	}
-	// Check special values - NaN, +Inf, -Inf, 0.
-	if math.IsNaN(expected) || math.IsNaN(actual) {
-		return math.IsNaN(expected) == math.IsNaN(actual), nil
-	}
-	if math.IsInf(expected, 0 /* sign */) || math.IsInf(actual, 0 /* sign */) {
-		bothNegativeInf := math.IsInf(expected, -1 /* sign */) == math.IsInf(actual, -1 /* sign */)
-		bothPositiveInf := math.IsInf(expected, 1 /* sign */) == math.IsInf(actual, 1 /* sign */)
-		return bothNegativeInf || bothPositiveInf, nil
-	}
-	if expected == 0 || actual == 0 {
-		return expected == actual, nil
-	}
-	// Check that the numbers have the same sign.
-	if expected*actual < 0 {
-		return false, nil
-	}
-	expected = math.Abs(expected)
-	actual = math.Abs(actual)
-	// Check that 15 significant digits match. We do so by normalizing the
-	// numbers and then checking one digit at a time.
-	//
-	// normalize converts f to base * 10**power representation where base is in
-	// [1.0, 10.0) range.
-	normalize := func(f float64) (base float64, power int) {
-		for f >= 10 {
-			f = f / 10
-			power++
-		}
-		for f < 1 {
-			f *= 10
-			power--
-		}
-		return f, power
-	}
-	var expPower, actPower int
-	expected, expPower = normalize(expected)
-	actual, actPower = normalize(actual)
-	if expPower != actPower {
-		return false, nil
-	}
-	// TODO(yuzefovich): investigate why we can't always guarantee deterministic
-	// 15 significant digits and switch back from 14 to 15 digits comparison
-	// here. See #56446 for more details.
-	for i := 0; i < 14; i++ {
-		expDigit := int(expected)
-		actDigit := int(actual)
-		if expDigit != actDigit {
-			return false, nil
-		}
-		expected -= (expected - float64(expDigit)) * 10
-		actual -= (actual - float64(actDigit)) * 10
-	}
-	return true, nil
 }
 
 func (t *logicTest) formatValues(vals []string, valsPerLine int) []string {

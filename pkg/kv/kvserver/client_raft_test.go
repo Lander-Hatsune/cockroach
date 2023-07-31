@@ -17,6 +17,7 @@ import (
 	"math"
 	"math/rand"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowdispatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
@@ -42,13 +44,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/server"
-	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/spanconfig"
-	"github.com/cockroachdb/cockroach/pkg/sql/catalog/bootstrap"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/storageutils"
@@ -60,10 +60,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/assert"
@@ -94,11 +97,14 @@ func TestStoreRecoverFromEngine(t *testing.T) {
 
 	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1,
 		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
 			ServerArgs: base.TestServerArgs{
 				StoreSpecs: []base.StoreSpec{
 					{
@@ -200,6 +206,8 @@ func TestStoreRecoverWithErrors(t *testing.T) {
 
 	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	numIncrements := 0
 	keyA := roachpb.Key("a")
@@ -207,7 +215,8 @@ func TestStoreRecoverWithErrors(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 1,
 		base.TestClusterArgs{
-			ReplicationMode: base.ReplicationManual,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
 			ServerArgs: base.TestServerArgs{
 				Knobs: base.TestingKnobs{
 					Server: &server.TestingKnobs{
@@ -343,6 +352,8 @@ func TestRestoreReplicas(t *testing.T) {
 
 	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	const numServers int = 2
 	stickyServerArgs := make(map[int]base.TestServerArgs)
@@ -365,8 +376,9 @@ func TestRestoreReplicas(t *testing.T) {
 	ctx := context.Background()
 	tc := testcluster.StartTestCluster(t, 2,
 		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
+			ServerArgsPerNode:   stickyServerArgs,
 		})
 	defer tc.Stopper().Stop(ctx)
 	store := tc.GetFirstStoreFromServer(t, 0)
@@ -663,6 +675,8 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 			defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+			lisReg := listenerutil.NewListenerRegistry()
+			defer lisReg.Close()
 
 			const numServers int = 3
 			stickyServerArgs := make(map[int]base.TestServerArgs)
@@ -685,8 +699,9 @@ func TestSnapshotAfterTruncation(t *testing.T) {
 			ctx := context.Background()
 			tc := testcluster.StartTestCluster(t, numServers,
 				base.TestClusterArgs{
-					ReplicationMode:   base.ReplicationManual,
-					ServerArgsPerNode: stickyServerArgs,
+					ReplicationMode:     base.ReplicationManual,
+					ReusableListenerReg: lisReg,
+					ServerArgsPerNode:   stickyServerArgs,
 				})
 			defer tc.Stopper().Stop(ctx)
 			store := tc.GetFirstStoreFromServer(t, 0)
@@ -1335,6 +1350,7 @@ func TestRequestsOnFollowerWithNonLiveLeaseholder(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	kvserver.ExpirationLeasesOnly.Override(ctx, &st.SV, false) // override metamorphism
 
+	manualClock := hlc.NewHybridManualClock()
 	clusterArgs := base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
@@ -1346,12 +1362,8 @@ func TestRequestsOnFollowerWithNonLiveLeaseholder(t *testing.T) {
 				RaftEnableCheckQuorum: true,
 			},
 			Knobs: base.TestingKnobs{
-				NodeLiveness: kvserver.NodeLivenessTestingKnobs{
-					// This test waits for an epoch-based lease to expire, so we're
-					// setting the liveness duration as low as possible while still
-					// keeping the test stable.
-					LivenessDuration: 3000 * time.Millisecond,
-					RenewalDuration:  1500 * time.Millisecond,
+				Server: &server.TestingKnobs{
+					WallClock: manualClock,
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					// We eliminate clock offsets in order to eliminate the stasis period
@@ -1420,26 +1432,36 @@ func TestRequestsOnFollowerWithNonLiveLeaseholder(t *testing.T) {
 	atomic.StoreInt32(&installPartition, 1)
 
 	// Wait until the lease expires.
-	log.Infof(ctx, "test: waiting for lease expiration")
+	log.Infof(ctx, "test: waiting for lease expiration on r%d", store0Repl.RangeID)
 	testutils.SucceedsSoon(t, func() error {
+		dur, _ := store0.GetStoreConfig().NodeLivenessDurations()
+		manualClock.Increment(dur.Nanoseconds())
 		leaseStatus = store0Repl.CurrentLeaseStatus(ctx)
+		// If we failed to pin the lease, it likely won't ever expire due to the particular
+		// partition we've set up. Bail early instead of wasting 45s.
+		require.True(t, leaseStatus.Lease.OwnedBy(store0.StoreID()), "failed to pin lease")
+
+		// Lease is on s1, and it should be invalid now. The only reason there's a
+		// retry loop is that there could be a race where we bump the clock while a
+		// heartbeat is inflight (and which picks up the new expiration).
 		if leaseStatus.IsValid() {
-			return errors.New("lease still valid")
+			return errors.Errorf("lease still valid: %+v", leaseStatus)
 		}
 		return nil
 	})
 	log.Infof(ctx, "test: lease expired")
 
 	{
+		tBegin := timeutil.Now()
 		// Increment the initial value again, which requires range availability. To
 		// get there, the request will need to trigger a lease request on a follower
 		// replica, which will call a Raft election, acquire Raft leadership, then
 		// acquire the range lease.
+		log.Infof(ctx, "test: waiting for new lease...")
 		_, err := tc.Server(0).DB().Inc(ctx, key, 1)
 		require.NoError(t, err)
-		log.Infof(ctx, "test: waiting for new lease...")
 		tc.WaitForValues(t, key, []int64{2, 2, 2, 0})
-		log.Infof(ctx, "test: waiting for new lease... done")
+		log.Infof(ctx, "test: waiting for new lease... done [%.2fs]", timeutil.Since(tBegin).Seconds())
 	}
 
 	// Store 0 no longer holds the lease.
@@ -1460,6 +1482,187 @@ func (c fakeSnapshotStream) Recv() (*kvserverpb.SnapshotRequest, error) {
 // Send implements the SnapshotResponseStream interface.
 func (c fakeSnapshotStream) Send(request *kvserverpb.SnapshotResponse) error {
 	return nil
+}
+
+type snapshotTestSignals struct {
+	// Receiver-side wait channels.
+	receiveErrCh        chan error
+	batchReceiveReadyCh chan struct{}
+
+	// Sender-side wait channels.
+	svrContextDone        <-chan struct{}
+	receiveStartedCh      chan struct{}
+	batchReceiveStartedCh chan struct{}
+	receiverDoneCh        chan struct{}
+}
+
+// TestReceiveSnapshotLogging tests that a snapshot receiver properly captures
+// the collected tracing spans in the last response, or logs the span if the
+// context is cancelled from the client side.
+func TestReceiveSnapshotLogging(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	const senderNodeIdx = 0
+	const receiverNodeIdx = 1
+	const dummyEventMsg = "test receive snapshot logging - dummy event"
+
+	setupTest := func(t *testing.T) (context.Context, *testcluster.TestCluster, *roachpb.RangeDescriptor, *snapshotTestSignals) {
+		ctx := context.Background()
+
+		signals := &snapshotTestSignals{
+			receiveErrCh:        make(chan error),
+			batchReceiveReadyCh: make(chan struct{}),
+
+			svrContextDone:        nil,
+			receiveStartedCh:      make(chan struct{}),
+			batchReceiveStartedCh: make(chan struct{}),
+			receiverDoneCh:        make(chan struct{}, 1),
+		}
+
+		tc := testcluster.StartTestCluster(t, 3, base.TestClusterArgs{
+			ServerArgs: base.TestServerArgs{
+				Knobs: base.TestingKnobs{
+					Store: &kvserver.StoreTestingKnobs{
+						DisableRaftSnapshotQueue: true,
+					},
+				},
+			},
+			ReplicationMode: base.ReplicationManual,
+			ServerArgsPerNode: map[int]base.TestServerArgs{
+				receiverNodeIdx: {
+					Knobs: base.TestingKnobs{
+						Store: &kvserver.StoreTestingKnobs{
+							DisableRaftSnapshotQueue: true,
+							ThrottleEmptySnapshots:   true,
+							ReceiveSnapshot: func(ctx context.Context, _ *kvserverpb.SnapshotRequest_Header) error {
+								t.Logf("incoming snapshot on n2")
+								log.Event(ctx, dummyEventMsg)
+								signals.svrContextDone = ctx.Done()
+								close(signals.receiveStartedCh)
+								return <-signals.receiveErrCh
+							},
+							BeforeRecvAcceptedSnapshot: func() {
+								t.Logf("receiving on n2")
+								signals.batchReceiveStartedCh <- struct{}{}
+								<-signals.batchReceiveReadyCh
+							},
+							HandleSnapshotDone: func() {
+								t.Logf("receiver on n2 completed")
+								signals.receiverDoneCh <- struct{}{}
+							},
+						},
+					},
+				},
+			},
+		})
+
+		_, scratchRange, err := tc.Servers[0].ScratchRangeEx()
+		require.NoError(t, err)
+
+		return ctx, tc, &scratchRange, signals
+	}
+
+	snapshotAndValidateLogs := func(t *testing.T, ctx context.Context, tc *testcluster.TestCluster, rngDesc *roachpb.RangeDescriptor, signals *snapshotTestSignals, expectTraceOnSender bool) error {
+		t.Helper()
+
+		repl := tc.GetFirstStoreFromServer(t, senderNodeIdx).LookupReplica(rngDesc.StartKey)
+		chgs := kvpb.MakeReplicationChanges(roachpb.ADD_VOTER, tc.Target(receiverNodeIdx))
+
+		testStartTs := timeutil.Now()
+		_, pErr := repl.ChangeReplicas(ctx, rngDesc, kvserverpb.SnapshotRequest_REBALANCE, kvserverpb.ReasonRangeUnderReplicated, "", chgs)
+
+		// When ready, flush logs and check messages from store_raft.go since
+		// call to repl.ChangeReplicas(..).
+		<-signals.receiverDoneCh
+		log.Flush()
+		entries, err := log.FetchEntriesFromFiles(testStartTs.UnixNano(),
+			math.MaxInt64, 100, regexp.MustCompile(`store_raft\.go`), log.WithMarkedSensitiveData)
+		require.NoError(t, err)
+
+		errRegexp, err := regexp.Compile(`incoming snapshot stream failed with error`)
+		require.NoError(t, err)
+		foundEntry := false
+		var entry logpb.Entry
+		for _, entry = range entries {
+			if errRegexp.MatchString(entry.Message) {
+				foundEntry = true
+				break
+			}
+		}
+		expectTraceOnReceiver := !expectTraceOnSender
+		require.Equal(t, expectTraceOnReceiver, foundEntry)
+		if expectTraceOnReceiver {
+			require.Contains(t, entry.Message, dummyEventMsg)
+		}
+
+		// Check that receiver traces were imported in sender's context on success.
+		clientTraces := tracing.SpanFromContext(ctx).GetConfiguredRecording()
+		_, receiverTraceFound := clientTraces.FindLogMessage(dummyEventMsg)
+		require.Equal(t, expectTraceOnSender, receiverTraceFound)
+
+		return pErr
+	}
+
+	t.Run("cancel on header", func(t *testing.T) {
+		ctx, tc, scratchRange, signals := setupTest(t)
+		defer tc.Stopper().Stop(ctx)
+
+		ctx, sp := tracing.EnsureChildSpan(ctx, tc.GetFirstStoreFromServer(t, senderNodeIdx).GetStoreConfig().Tracer(),
+			t.Name(), tracing.WithRecording(tracingpb.RecordingVerbose))
+		defer sp.Finish()
+
+		ctx, cancel := context.WithCancel(ctx)
+		go func() {
+			<-signals.receiveStartedCh
+			cancel()
+			<-signals.svrContextDone
+			time.Sleep(10 * time.Millisecond)
+			signals.receiveErrCh <- errors.Errorf("header is bad")
+		}()
+		err := snapshotAndValidateLogs(t, ctx, tc, scratchRange, signals, false /* expectTraceOnSender */)
+		require.Error(t, err)
+	})
+	t.Run("cancel during receive", func(t *testing.T) {
+		ctx, tc, scratchRange, signals := setupTest(t)
+		defer tc.Stopper().Stop(ctx)
+
+		ctx, sp := tracing.EnsureChildSpan(ctx, tc.GetFirstStoreFromServer(t, senderNodeIdx).GetStoreConfig().Tracer(),
+			t.Name(), tracing.WithRecording(tracingpb.RecordingVerbose))
+		defer sp.Finish()
+
+		ctx, cancel := context.WithCancel(ctx)
+		close(signals.receiveErrCh)
+		go func() {
+			<-signals.receiveStartedCh
+			<-signals.batchReceiveStartedCh
+			cancel()
+			<-signals.svrContextDone
+			time.Sleep(10 * time.Millisecond)
+			close(signals.batchReceiveReadyCh)
+		}()
+		err := snapshotAndValidateLogs(t, ctx, tc, scratchRange, signals, false /* expectTraceOnSender */)
+		require.Error(t, err)
+	})
+	t.Run("successful send", func(t *testing.T) {
+		ctx, tc, scratchRange, signals := setupTest(t)
+		defer tc.Stopper().Stop(ctx)
+
+		ctx, sp := tracing.EnsureChildSpan(ctx, tc.GetFirstStoreFromServer(t, senderNodeIdx).GetStoreConfig().Tracer(),
+			t.Name(), tracing.WithRecording(tracingpb.RecordingVerbose))
+		defer sp.Finish()
+
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		close(signals.receiveErrCh)
+		close(signals.batchReceiveReadyCh)
+		go func() {
+			<-signals.receiveStartedCh
+			<-signals.batchReceiveStartedCh
+		}()
+		err := snapshotAndValidateLogs(t, ctx, tc, scratchRange, signals, true /* expectTraceOnSender */)
+		require.NoError(t, err)
+	})
 }
 
 // TestFailedSnapshotFillsReservation tests that failing to finish applying an
@@ -3291,113 +3494,6 @@ HAVING
 	}
 }
 
-func TestDecommission(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	// Five nodes is too much to reliably run under testrace with our aggressive
-	// liveness timings.
-	skip.UnderRace(t, "#39807 and #37811")
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 5, base.TestClusterArgs{
-		ReplicationMode: base.ReplicationAuto,
-		ServerArgs: base.TestServerArgs{
-			Knobs: base.TestingKnobs{
-				SpanConfig: &spanconfig.TestingKnobs{
-					ConfigureScratchRange: true,
-				},
-			},
-		},
-	})
-	defer tc.Stopper().Stop(ctx)
-
-	k := tc.ScratchRange(t)
-	admin, err := tc.GetAdminClient(ctx, t, 0)
-	require.NoError(t, err)
-
-	// Decommission the first node, which holds most of the leases.
-	_, err = admin.Decommission(
-		ctx, &serverpb.DecommissionRequest{
-			NodeIDs:          []roachpb.NodeID{1},
-			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
-		},
-	)
-	require.NoError(t, err)
-
-	requireNoReplicas := func(storeID roachpb.StoreID, repFactor int) {
-		attempt := 0
-		testutils.SucceedsSoon(t, func() error {
-			attempt++
-			desc := tc.LookupRangeOrFatal(t, k)
-			for _, rDesc := range desc.Replicas().VoterDescriptors() {
-				store, err := tc.Servers[int(rDesc.NodeID-1)].Stores().GetStore(rDesc.StoreID)
-				require.NoError(t, err)
-				if err := store.ForceReplicationScanAndProcess(); err != nil {
-					return err
-				}
-			}
-			if sl := desc.Replicas().FilterToDescriptors(func(rDesc roachpb.ReplicaDescriptor) bool {
-				return rDesc.StoreID == storeID
-			}); len(sl) > 0 {
-				return errors.Errorf("still a replica on s%d: %s on attempt %d", storeID, &desc, attempt)
-			}
-			if len(desc.Replicas().VoterDescriptors()) != repFactor {
-				return errors.Errorf("expected %d replicas: %s on attempt %d", repFactor, &desc, attempt)
-			}
-			return nil
-		})
-	}
-
-	const triplicated = 3
-
-	requireNoReplicas(1, triplicated)
-
-	runner := sqlutils.MakeSQLRunner(tc.ServerConn(0))
-	ts := timeutil.Now()
-
-	_, err = admin.Decommission(
-		ctx, &serverpb.DecommissionRequest{
-			NodeIDs:          []roachpb.NodeID{2},
-			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
-		},
-	)
-	require.NoError(t, err)
-
-	// Both s1 and s2 are out, so neither ought to have replicas.
-	requireNoReplicas(1, triplicated)
-	requireNoReplicas(2, triplicated)
-
-	// Going from three replicas to three replicas should have used atomic swaps
-	// only. We didn't verify this before the first decommissioning op because
-	// lots of ranges were over-replicated due to ranges recently having split
-	// off from the five-fold replicated system ranges.
-	requireOnlyAtomicChanges(t, runner, tc.LookupRangeOrFatal(t, k).RangeID, triplicated, ts)
-
-	sqlutils.SetZoneConfig(t, runner, "RANGE default", "num_replicas: 1")
-
-	const single = 1
-
-	// The range should drop down to one replica on a non-decommissioning store.
-	requireNoReplicas(1, single)
-	requireNoReplicas(2, single)
-
-	// Decommission two more nodes. Only n5 is left; getting the replicas there
-	// can't use atomic replica swaps because the leaseholder can't be removed.
-	_, err = admin.Decommission(
-		ctx, &serverpb.DecommissionRequest{
-			NodeIDs:          []roachpb.NodeID{3, 4},
-			TargetMembership: livenesspb.MembershipStatus_DECOMMISSIONING,
-		},
-	)
-	require.NoError(t, err)
-
-	requireNoReplicas(1, single)
-	requireNoReplicas(2, single)
-	requireNoReplicas(3, single)
-	requireNoReplicas(4, single)
-}
-
 // TestReplicateRogueRemovedNode ensures that a rogue removed node
 // (i.e. a node that has been removed from the range but doesn't know
 // it yet because it was down or partitioned away when it happened)
@@ -4292,78 +4388,6 @@ func TestUninitializedReplicaRemainsQuiesced(t *testing.T) {
 	}
 }
 
-// TestInitRaftGroupOnRequest verifies that an uninitialized Raft group
-// is initialized if a request is received, even if the current range
-// lease points to a different replica.
-func TestInitRaftGroupOnRequest(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
-	const numServers int = 2
-	stickyServerArgs := make(map[int]base.TestServerArgs)
-	for i := 0; i < numServers; i++ {
-		stickyServerArgs[i] = base.TestServerArgs{
-			StoreSpecs: []base.StoreSpec{
-				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
-				},
-			},
-			Knobs: base.TestingKnobs{
-				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
-				},
-			},
-		}
-	}
-
-	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, numServers,
-		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
-		})
-	defer tc.Stopper().Stop(ctx)
-
-	// Split so we can rely on RHS range being quiescent after a restart.
-	// We use UserTableDataMin to avoid having the range activated to
-	// gossip system table data.
-	splitKey := bootstrap.TestingUserTableDataMin()
-	tc.SplitRangeOrFatal(t, splitKey)
-	tc.AddVotersOrFatal(t, splitKey, tc.Target(1))
-	desc := tc.LookupRangeOrFatal(t, splitKey)
-	leaseHolder, err := tc.FindRangeLeaseHolder(desc, nil)
-	require.NoError(t, err)
-
-	require.NoError(t, tc.Restart())
-
-	followerIdx := int(leaseHolder.StoreID) % numServers
-	followerStore := tc.GetFirstStoreFromServer(t, followerIdx)
-
-	repl := followerStore.LookupReplica(roachpb.RKey(splitKey))
-	require.NotNil(t, repl)
-
-	// TODO(spencer): Raft messages seem to turn up
-	// occasionally on restart, which initialize the replica, so
-	// this is not a test failure. Not sure how to work around this
-	// problem.
-	// Verify the raft group isn't initialized yet.
-	if repl.IsRaftGroupInitialized() {
-		log.Errorf(ctx, "expected raft group to be uninitialized")
-	}
-	// Send an increment and verify that initializes the Raft group.
-	//
-	// NB: We don't know who has the lease, so we ignore any errors (i.e.
-	// NotLeaseHolderError). We only care that it initializes the Raft group.
-	_, pErr := kv.SendWrapped(ctx, followerStore.TestSender(), incrementArgs(splitKey, 1))
-	_ = pErr // appease returncheck linter
-
-	require.True(t, repl.IsRaftGroupInitialized(), "expected raft group to be initialized")
-}
-
 // TestFailedConfChange verifies correct behavior after a configuration change
 // experiences an error when applying EndTxn. Specifically, it verifies that
 // https://github.com/cockroachdb/cockroach/issues/13506 has been fixed.
@@ -4812,6 +4836,8 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 
 	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
 	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
+	lisReg := listenerutil.NewListenerRegistry()
+	defer lisReg.Close()
 
 	stopper := stop.NewStopper()
 	ctx := context.Background()
@@ -4873,8 +4899,9 @@ func TestDefaultConnectionDisruptionDoesNotInterfereWithSystemTraffic(t *testing
 
 	tc := testcluster.StartTestCluster(t, numServers,
 		base.TestClusterArgs{
-			ReplicationMode:   base.ReplicationManual,
-			ServerArgsPerNode: stickyServerArgs,
+			ReplicationMode:     base.ReplicationManual,
+			ReusableListenerReg: lisReg,
+			ServerArgsPerNode:   stickyServerArgs,
 		})
 	defer tc.Stopper().Stop(ctx)
 	// Make a key that's in the user data space.
@@ -5206,6 +5233,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		stickyEngineRegistry server.StickyInMemEnginesRegistry,
 	) {
 		stickyEngineRegistry = server.NewStickyInMemEnginesRegistry()
+		lisReg := listenerutil.NewListenerRegistry()
 		const numServers int = 3
 		stickyServerArgs := make(map[int]base.TestServerArgs)
 		for i := 0; i < numServers; i++ {
@@ -5237,10 +5265,12 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 
 		tc = testcluster.StartTestCluster(t, numServers,
 			base.TestClusterArgs{
-				ReplicationMode:   base.ReplicationManual,
-				ServerArgsPerNode: stickyServerArgs,
+				ReplicationMode:     base.ReplicationManual,
+				ReusableListenerReg: lisReg,
+				ServerArgsPerNode:   stickyServerArgs,
 			})
 
+		tc.Stopper().AddCloser(stop.CloserFn(lisReg.Close))
 		db = tc.GetFirstStoreFromServer(t, 1).DB()
 
 		// Split off a non-system range so we don't have to account for node liveness
@@ -6524,7 +6554,7 @@ func TestRaftLeaderRemovesItself(t *testing.T) {
 				// Set a large election timeout. We don't want replicas to call
 				// elections due to timeouts, we want them to campaign and obtain
 				// votes despite PreVote+CheckQuorum.
-				RaftElectionTimeoutTicks: 200,
+				RaftElectionTimeoutTicks: 300,
 			},
 			Knobs: base.TestingKnobs{
 				Store: &kvserver.StoreTestingKnobs{
@@ -6578,6 +6608,9 @@ func TestRaftLeaderRemovesItself(t *testing.T) {
 	tc.RemoveVotersOrFatal(t, key, tc.Target(0))
 	t.Logf("n1 removed from range")
 
+	// Make sure we didn't time out on the above.
+	require.NoError(t, ctx.Err())
+
 	require.Eventually(t, func() bool {
 		logStatus(repl2.RaftStatus())
 		logStatus(repl3.RaftStatus())
@@ -6587,6 +6620,8 @@ func TestRaftLeaderRemovesItself(t *testing.T) {
 		}
 		return false
 	}, 10*time.Second, 500*time.Millisecond)
+
+	require.NoError(t, ctx.Err())
 }
 
 // TestRaftUnquiesceLeaderNoProposal tests that unquiescing a Raft leader does
@@ -6743,9 +6778,6 @@ func TestRaftPreVoteUnquiesceDeadLeader(t *testing.T) {
 				Server: &server.TestingKnobs{
 					WallClock: manualClock,
 				},
-				Store: &kvserver.StoreTestingKnobs{
-					DisableLivenessMapConnHealth: true, // to mark n1 as not live
-				},
 			},
 		},
 	})
@@ -6806,8 +6838,7 @@ func TestRaftPreVoteUnquiesceDeadLeader(t *testing.T) {
 	manualClock.Forward(lv.Expiration.WallTime + 1)
 
 	for i := 0; i < tc.NumServers(); i++ {
-		isLive, err := tc.Server(i).NodeLiveness().(*liveness.NodeLiveness).IsLive(1)
-		require.NoError(t, err)
+		isLive := tc.Server(i).NodeLiveness().(*liveness.NodeLiveness).GetNodeVitalityFromCache(1).IsLive(livenesspb.LeaseCampaign)
 		require.False(t, isLive)
 		tc.GetFirstStoreFromServer(t, i).UpdateLivenessMap()
 	}
@@ -6932,4 +6963,66 @@ func TestStoreMetricsOnIncomingOutgoingMsg(t *testing.T) {
 		}
 		require.Equal(t, expected, actual)
 	})
+}
+
+// TestInvalidConfChangeRejection is a regression test for [1]. It proposes
+// an (intentionally) invalid configuration change and makes sure that raft
+// does not drop it.
+//
+// [1]: https://github.com/cockroachdb/cockroach/issues/105797
+func TestInvalidConfChangeRejection(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This is a regression test against a stuck command, so set a timeout to get
+	// a shot at a graceful failure on regression.
+	ctx, cancel := context.WithTimeout(context.Background(), testutils.DefaultSucceedsSoonDuration)
+	defer cancel()
+
+	// When our configuration change shows up below raft, we need to apply it as a
+	// no-op, since the config change is intentionally invalid and assertions
+	// would fail if we were to try to actually apply it.
+	injErr := errors.New("injected error")
+	tc := testcluster.StartTestCluster(t, 1, base.TestClusterArgs{
+		ReplicationMode: base.ReplicationManual,
+		ServerArgs: base.TestServerArgs{Knobs: base.TestingKnobs{Store: &kvserver.StoreTestingKnobs{
+			TestingApplyCalledTwiceFilter: func(args kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
+				if args.Req != nil && args.Req.Txn != nil && args.Req.Txn.Name == "fake" {
+					return 0, kvpb.NewError(injErr)
+				}
+				return 0, nil
+			}}}},
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	k := tc.ScratchRange(t)
+
+	repl := tc.GetFirstStoreFromServer(t, 0).LookupReplica(keys.MustAddr(k))
+
+	// Try to leave a joint config even though we're not in one. This is something
+	// that will lead raft to propose an empty entry instead of our conf change.
+	//
+	// See: https://github.com/cockroachdb/cockroach/issues/105797
+	var ba kvpb.BatchRequest
+	now := tc.Server(0).Clock().Now()
+	txn := roachpb.MakeTransaction("fake", k, isolation.Serializable, roachpb.NormalUserPriority, now, 500*time.Millisecond.Nanoseconds(), 1)
+	ba.Txn = &txn
+	ba.Timestamp = now
+	ba.Add(&kvpb.EndTxnRequest{
+		RequestHeader: kvpb.RequestHeader{
+			Key: k,
+		},
+		Commit: true,
+		InternalCommitTrigger: &roachpb.InternalCommitTrigger{
+			ChangeReplicasTrigger: &roachpb.ChangeReplicasTrigger{
+				Desc: repl.Desc(),
+			},
+		},
+	})
+
+	_, pErr := repl.Send(ctx, &ba)
+	// Verify that we see the configuration change below raft, where we rejected it
+	// (since it would've otherwise blow up the Replica: after all, we intentionally
+	// proposed an invalid configuration change.
+	require.True(t, errors.Is(pErr.GoError(), injErr), "%+v", pErr.GoError())
 }

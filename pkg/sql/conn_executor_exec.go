@@ -627,7 +627,8 @@ func (ex *connExecutor) execStmtInOpenState(
 	if !isPausablePortal() || portal.pauseInfo.execStmtInOpenState.ihWrapper == nil {
 		ctx, needFinish = ih.Setup(
 			ctx, ex.server.cfg, ex.statsCollector, p, ex.stmtDiagnosticsRecorder,
-			stmt.StmtNoConstants, os.ImplicitTxn.Get(), ex.extraTxnState.shouldCollectTxnExecutionStats,
+			stmt.StmtNoConstants, os.ImplicitTxn.Get(), ex.state.priority,
+			ex.extraTxnState.shouldCollectTxnExecutionStats,
 		)
 	} else {
 		ctx = portal.pauseInfo.execStmtInOpenState.ihWrapper.ctx
@@ -1512,6 +1513,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 						int(ex.state.mu.autoRetryCounter),
 						ex.extraTxnState.txnCounter,
 						ppInfo.dispatchToExecutionEngine.rowsAffected,
+						ex.state.mu.stmtCount,
 						bulkJobId,
 						ppInfo.curRes.ErrAllowReleased(),
 						ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived),
@@ -1539,6 +1541,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 				int(ex.state.mu.autoRetryCounter),
 				ex.extraTxnState.txnCounter,
 				nonBulkJobNumRows,
+				ex.state.mu.stmtCount,
 				bulkJobId,
 				res.Err(),
 				ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived),
@@ -1691,7 +1694,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		ppInfo.dispatchToExecutionEngine.cleanup.appendFunc(namedFunc{
 			fName: "populate query level stats and regions",
 			f: func() {
-				populateQueryLevelStatsAndRegions(ctx, &curPlanner, ex.server.cfg, ppInfo.dispatchToExecutionEngine.queryStats, &ex.cpuStatsCollector)
+				populateQueryLevelStats(ctx, &curPlanner, ex.server.cfg, ppInfo.dispatchToExecutionEngine.queryStats, &ex.cpuStatsCollector)
 				ppInfo.dispatchToExecutionEngine.stmtFingerprintID = ex.recordStatementSummary(
 					ctx, &curPlanner,
 					int(ex.state.mu.autoRetryCounter), ppInfo.dispatchToExecutionEngine.rowsAffected, ppInfo.curRes.ErrAllowReleased(), *ppInfo.dispatchToExecutionEngine.queryStats,
@@ -1699,7 +1702,7 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 			},
 		})
 	} else {
-		populateQueryLevelStatsAndRegions(ctx, planner, ex.server.cfg, &stats, &ex.cpuStatsCollector)
+		populateQueryLevelStats(ctx, planner, ex.server.cfg, &stats, &ex.cpuStatsCollector)
 		stmtFingerprintID = ex.recordStatementSummary(
 			ctx, planner,
 			int(ex.state.mu.autoRetryCounter), res.RowsAffected(), res.Err(), stats,
@@ -1747,12 +1750,11 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 	return err
 }
 
-// populateQueryLevelStatsAndRegions collects query-level execution statistics
+// populateQueryLevelStats collects query-level execution statistics
 // and populates it in the instrumentationHelper's queryLevelStatsWithErr field.
 // Query-level execution statistics are collected using the statement's trace
-// and the plan's flow metadata. It also populates the regions field and
-// annotates the explainPlan field of the instrumentationHelper.
-func populateQueryLevelStatsAndRegions(
+// and the plan's flow metadata.
+func populateQueryLevelStats(
 	ctx context.Context,
 	p *planner,
 	cfg *ExecutorConfig,
@@ -1794,7 +1796,7 @@ func populateQueryLevelStatsAndRegions(
 		}
 	}
 	if ih.traceMetadata != nil && ih.explainPlan != nil {
-		ih.regions = ih.traceMetadata.annotateExplain(
+		ih.traceMetadata.annotateExplain(
 			ih.explainPlan,
 			trace,
 			cfg.TestingKnobs.DeterministicExplain,
@@ -2925,7 +2927,11 @@ func (ex *connExecutor) recordTransactionFinish(
 		RowsWritten:             ex.extraTxnState.rowsWritten,
 		BytesRead:               ex.extraTxnState.bytesRead,
 		Priority:                ex.state.priority,
-		SessionData:             ex.sessionData(),
+		// TODO(107318): add isolation level
+		// TODO(107318): add qos
+		// TODO(107318): add asoftime or ishistorical
+		// TODO(107318): add readonly
+		SessionData: ex.sessionData(),
 	}
 
 	if ex.server.cfg.TestingKnobs.OnRecordTxnFinish != nil {

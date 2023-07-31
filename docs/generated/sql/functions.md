@@ -337,6 +337,8 @@
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="cardinality"></a><code>cardinality(input: anyelement[]) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the number of elements contained in <code>input</code></p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="crdb_internal.merge_aggregated_stmt_metadata"></a><code>crdb_internal.merge_aggregated_stmt_metadata(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of AggregatedStatementMetadata into a single JSONB object</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="crdb_internal.merge_statement_stats"></a><code>crdb_internal.merge_statement_stats(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of appstatspb.StatementStatistics into a single JSONB object</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="crdb_internal.merge_stats_metadata"></a><code>crdb_internal.merge_stats_metadata(input: jsonb[]) &rarr; jsonb</code></td><td><span class="funcdesc"><p>Merge an array of StmtStatsMetadata into a single JSONB object</p>
@@ -1434,6 +1436,14 @@ the locality flag on node startup. Returns an error if no region is set.</p>
 <tr><td><a name="unnest"></a><code>unnest(anyelement[], anyelement[], anyelement[]...) &rarr; tuple{anyelement AS unnest, anyelement AS unnest, anyelement AS unnest}</code></td><td><span class="funcdesc"><p>Returns the input arrays as a set of rows</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="unnest"></a><code>unnest(input: anyelement[]) &rarr; anyelement</code></td><td><span class="funcdesc"><p>Returns the input array as a set of rows</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="workload_index_recs"></a><code>workload_index_recs() &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns set of index recommendations</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="workload_index_recs"></a><code>workload_index_recs(budget: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns set of index recommendations</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="workload_index_recs"></a><code>workload_index_recs(timestamptz: <a href="timestamp.html">timestamptz</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns set of index recommendations</p>
+</span></td><td>Immutable</td></tr>
+<tr><td><a name="workload_index_recs"></a><code>workload_index_recs(timestamptz: <a href="timestamp.html">timestamptz</a>, budget: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns set of index recommendations</p>
 </span></td><td>Immutable</td></tr></tbody>
 </table>
 
@@ -3114,6 +3124,7 @@ Case mode values range between 0 - 1, representing lower casing and upper casing
 a CockroachDB HLC in decimal form.</p>
 <p>Note that uses of this function disable server-side optimizations and
 may increase either contention or retry errors, or both.</p>
+<p>Returns an error if run in a transaction with an isolation level weaker than SERIALIZABLE.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.active_version"></a><code>crdb_internal.active_version() &rarr; jsonb</code></td><td><span class="funcdesc"><p>Returns the current active cluster version.</p>
 </span></td><td>Volatile</td></tr>
@@ -3274,10 +3285,14 @@ active for the current transaction.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.repair_ttl_table_scheduled_job"></a><code>crdb_internal.repair_ttl_table_scheduled_job(oid: oid) &rarr; void</code></td><td><span class="funcdesc"><p>Repairs the scheduled job for a TTL table if it is missing.</p>
 </span></td><td>Volatile</td></tr>
+<tr><td><a name="crdb_internal.request_job_execution_details"></a><code>crdb_internal.request_job_execution_details(jobID: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Used to request the collection of execution details for a given job ID</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.request_statement_bundle"></a><code>crdb_internal.request_statement_bundle(stmtFingerprint: <a href="string.html">string</a>, samplingProbability: <a href="float.html">float</a>, minExecutionLatency: <a href="interval.html">interval</a>, expiresAfter: <a href="interval.html">interval</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Used to request statement bundle for a given statement fingerprint
 that has execution latency greater than the ‘minExecutionLatency’. If the
 ‘expiresAfter’ argument is empty, then the statement bundle request never
 expires until the statement bundle is collected</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="crdb_internal.reset_activity_tables"></a><code>crdb_internal.reset_activity_tables() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the {statement|transaction} activity system tables.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.reset_index_usage_stats"></a><code>crdb_internal.reset_index_usage_stats() &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function is used to clear the collected index usage statistics.</p>
 </span></td><td>Volatile</td></tr>
@@ -3304,6 +3319,8 @@ table. Returns an error if validation fails.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="crdb_internal.set_vmodule"></a><code>crdb_internal.set_vmodule(vmodule_string: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Set the equivalent of the <code>--vmodule</code> flag on the gateway node processing this request; it affords control over the logging verbosity of different files. Example syntax: <code>crdb_internal.set_vmodule('recordio=2,file=1,gfs*=3')</code>. Reset with: <code>crdb_internal.set_vmodule('')</code>. Raising the verbosity can severely affect performance.</p>
 </span></td><td>Volatile</td></tr>
+<tr><td><a name="crdb_internal.sstable_metrics"></a><code>crdb_internal.sstable_metrics(node_id: <a href="int.html">int</a>, store_id: <a href="int.html">int</a>, start_key: <a href="bytes.html">bytes</a>, end_key: <a href="bytes.html">bytes</a>) &rarr; tuple{int AS node_id, int AS store_id, int AS level, int AS file_num, int AS approximate_span_<a href="bytes.html">bytes</a>, jsonb AS metrics}</code></td><td><span class="funcdesc"><p>Returns statistics for the sstables containing keys in the range start_key and end_key for the provided node id.</p>
+</span></td><td>Stable</td></tr>
 <tr><td><a name="crdb_internal.table_span"></a><code>crdb_internal.table_span(table_id: <a href="int.html">int</a>) &rarr; <a href="bytes.html">bytes</a>[]</code></td><td><span class="funcdesc"><p>This function returns the span that contains the keys for the given table.</p>
 </span></td><td>Leakproof</td></tr>
 <tr><td><a name="crdb_internal.trace_id"></a><code>crdb_internal.trace_id() &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the current trace ID or an error if no trace is open.</p>
@@ -3350,6 +3367,8 @@ table. Returns an error if validation fails.</p>
 <thead><tr><th>Function &rarr; Returns</th><th>Description</th><th>Volatility</th></tr></thead>
 <tbody>
 <tr><td><a name="crdb_internal.force_delete_table_data"></a><code>crdb_internal.force_delete_table_data(id: <a href="int.html">int</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>This function can be used to clear the data belonging to a table, when the table cannot be dropped.</p>
+</span></td><td>Volatile</td></tr>
+<tr><td><a name="crdb_internal.repair_catalog_corruption"></a><code>crdb_internal.repair_catalog_corruption(descriptor_id: <a href="int.html">int</a>, corruption: <a href="string.html">string</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>repair_catalog_corruption(descriptor_id,corruption) attempts to repair corrupt records in system tables associated with that descriptor id</p>
 </span></td><td>Volatile</td></tr></tbody>
 </table>
 
@@ -3577,6 +3596,8 @@ table. Returns an error if validation fails.</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="information_schema._pg_numeric_scale"></a><code>information_schema._pg_numeric_scale(typid: oid, typmod: int4) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the scale of the given type with type modifier</p>
 </span></td><td>Immutable</td></tr>
+<tr><td><a name="nameconcatoid"></a><code>nameconcatoid(name: <a href="string.html">string</a>, oid: oid) &rarr; name</code></td><td><span class="funcdesc"><p>Used in the information_schema to produce specific_name columns, which are supposed to be unique per schema. The result is the same as ($1::text || ‘_’ || $2::text)::name except that, if it would not fit in 63 characters, we make it do so by truncating the name input (not the oid).</p>
+</span></td><td>Immutable</td></tr>
 <tr><td><a name="obj_description"></a><code>obj_description(object_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the comment for a database object specified by its OID alone. This is deprecated since there is no guarantee that OIDs are unique across different system catalogs; therefore, the wrong comment might be returned.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="obj_description"></a><code>obj_description(object_oid: oid, catalog_name: <a href="string.html">string</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the comment for a database object specified by its OID and the name of the containing system catalog. For example, obj_description(123456, ‘pg_class’) would retrieve the comment for the table with OID 123456.</p>
@@ -3590,6 +3611,8 @@ table. Returns an error if validation fails.</p>
 <tr><td><a name="pg_column_size"></a><code>pg_column_size(anyelement...) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Return size in bytes of the column provided as an argument</p>
 </span></td><td>Immutable</td></tr>
 <tr><td><a name="pg_function_is_visible"></a><code>pg_function_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the function with the given OID belongs to one of the schemas on the search path.</p>
+</span></td><td>Stable</td></tr>
+<tr><td><a name="pg_get_function_arg_default"></a><code>pg_get_function_arg_default(func_oid: oid, arg_num: int4) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Get textual representation of a function argument’s default value. The second argument of this function is the argument number among all arguments (i.e. proallargtypes, <em>not</em> proargtypes), starting with 1, because that’s how information_schema.sql uses it. Currently, this always returns NULL, since CockroachDB does not support default values.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_get_function_arguments"></a><code>pg_get_function_arguments(func_oid: oid) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Returns the argument list (with defaults) necessary to identify a function, in the form it would need to appear in within CREATE FUNCTION.</p>
 </span></td><td>Stable</td></tr>
@@ -3627,6 +3650,8 @@ table. Returns an error if validation fails.</p>
 </span></td><td>Stable</td></tr>
 <tr><td><a name="pg_relation_is_updatable"></a><code>pg_relation_is_updatable(reloid: oid, include_triggers: <a href="bool.html">bool</a>) &rarr; int4</code></td><td><span class="funcdesc"><p>Returns the update events the relation supports.</p>
 </span></td><td>Stable</td></tr>
+<tr><td><a name="pg_sequence_last_value"></a><code>pg_sequence_last_value(sequence_oid: oid) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Returns the last value generated by a sequence, or NULL if the sequence has not been used yet.</p>
+</span></td><td>Volatile</td></tr>
 <tr><td><a name="pg_sleep"></a><code>pg_sleep(seconds: <a href="float.html">float</a>) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>pg_sleep makes the current session’s process sleep until seconds seconds have elapsed. seconds is a value of type double precision, so fractional-second delays can be specified.</p>
 </span></td><td>Volatile</td></tr>
 <tr><td><a name="pg_table_is_visible"></a><code>pg_table_is_visible(oid: oid) &rarr; <a href="bool.html">bool</a></code></td><td><span class="funcdesc"><p>Returns whether the table with the given OID belongs to one of the schemas on the search path.</p>

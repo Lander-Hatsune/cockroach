@@ -35,6 +35,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/certnames"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -79,7 +80,7 @@ type transientCluster struct {
 	stopper       *stop.Stopper
 	firstServer   *server.TestServer
 	servers       []serverEntry
-	tenantServers []serverutils.TestTenantInterface
+	tenantServers []serverutils.ApplicationLayerInterface
 	defaultDB     string
 
 	adminPassword string
@@ -400,7 +401,7 @@ func (c *transientCluster) Start(ctx context.Context) (err error) {
 		if c.demoCtx.Multitenant {
 			c.infoLog(ctx, "starting tenant nodes")
 
-			c.tenantServers = make([]serverutils.TestTenantInterface, c.demoCtx.NumNodes)
+			c.tenantServers = make([]serverutils.ApplicationLayerInterface, c.demoCtx.NumNodes)
 			for i := 0; i < c.demoCtx.NumNodes; i++ {
 				createTenant := i == 0
 
@@ -408,7 +409,7 @@ func (c *transientCluster) Start(ctx context.Context) (err error) {
 					ContextTestingKnobs.InjectedLatencyOracle
 				c.infoLog(ctx, "starting tenant node %d", i)
 
-				var ts serverutils.TestTenantInterface
+				var ts serverutils.ApplicationLayerInterface
 				if c.demoCtx.DisableServerController {
 					tenantStopper := stop.NewStopper()
 					args := base.TestTenantArgs{
@@ -591,7 +592,7 @@ func (c *transientCluster) createAndAddNode(
 		// The caller is responsible for ensuring that the method
 		// is not called before the first server has finished
 		// computing its RPC listen address.
-		joinAddr = c.firstServer.ServingRPCAddr()
+		joinAddr = c.firstServer.AdvRPCAddr()
 	}
 	socketDetails, err := c.sockForServer(idx, forSystemTenant)
 	if err != nil {
@@ -890,7 +891,7 @@ func (demoCtx *Context) testServerArgsForTransientCluster(
 		EnableDemoLoginEndpoint: true,
 		// Demo clusters by default will create their own tenants, so we
 		// don't need to create them here.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 
 		Knobs: base.TestingKnobs{
 			Server: &server.TestingKnobs{
@@ -1140,7 +1141,7 @@ func (c *transientCluster) startServerInternal(
 	args := c.demoCtx.testServerArgsForTransientCluster(
 		socketDetails,
 		serverIdx,
-		c.firstServer.ServingRPCAddr(), c.demoDir,
+		c.firstServer.AdvRPCAddr(), c.demoDir,
 		c.stickyEngineRegistry)
 	s, err := server.TestServerFactory.New(args)
 	if err != nil {
@@ -1484,7 +1485,7 @@ func (c *transientCluster) getNetworkURLForServer(
 			return nil, err
 		}
 	}
-	sqlAddr := c.servers[serverIdx].ServingSQLAddr()
+	sqlAddr := c.servers[serverIdx].AdvSQLAddr()
 	database := c.defaultDB
 	if target == forSecondaryTenant {
 		sqlAddr = c.tenantServers[serverIdx].SQLAddr()
@@ -1899,26 +1900,21 @@ func (c *transientCluster) ListDemoNodes(w, ew io.Writer, justOne, verbose bool)
 			}
 
 			rpcAddr := c.tenantServers[i].RPCAddr()
-			tenantUiURLstr := c.tenantServers[i].AdminURL()
-			tenantUiURL, err := url.Parse(tenantUiURLstr)
+			tenantUiURL := c.tenantServers[i].AdminURL()
+			tenantSqlURL, err := c.getNetworkURLForServer(context.Background(), i,
+				false /* includeAppName */, forSecondaryTenant)
 			if err != nil {
 				fmt.Fprintln(ew, errors.Wrap(err, "retrieving network URL for tenant server"))
 			} else {
-				tenantSqlURL, err := c.getNetworkURLForServer(context.Background(), i,
-					false /* includeAppName */, forSecondaryTenant)
-				if err != nil {
-					fmt.Fprintln(ew, errors.Wrap(err, "retrieving network URL for tenant server"))
-				} else {
-					// Only include a separate HTTP URL if there's no server
-					// controller.
-					includeHTTP := !c.demoCtx.Multitenant || c.demoCtx.DisableServerController
+				// Only include a separate HTTP URL if there's no server
+				// controller.
+				includeHTTP := !c.demoCtx.Multitenant || c.demoCtx.DisableServerController
 
-					socketDetails, err := c.sockForServer(i, forSecondaryTenant)
-					if err != nil {
-						fmt.Fprintln(ew, errors.Wrap(err, "retrieving socket URL for tenant server"))
-					}
-					c.printURLs(w, ew, tenantSqlURL, tenantUiURL, socketDetails, rpcAddr, verbose, includeHTTP)
+				socketDetails, err := c.sockForServer(i, forSecondaryTenant)
+				if err != nil {
+					fmt.Fprintln(ew, errors.Wrap(err, "retrieving socket URL for tenant server"))
 				}
+				c.printURLs(w, ew, tenantSqlURL, tenantUiURL.URL, socketDetails, rpcAddr, verbose, includeHTTP)
 			}
 			fmt.Fprintln(w)
 			if verbose {
@@ -1928,8 +1924,8 @@ func (c *transientCluster) ListDemoNodes(w, ew io.Writer, justOne, verbose bool)
 		if !c.demoCtx.Multitenant || verbose {
 			// Connection parameters for the system tenant follow.
 			uiURL := s.Cfg.AdminURL()
-			if q := uiURL.Query(); c.demoCtx.Multitenant && !c.demoCtx.DisableServerController && !q.Has(server.TenantNameParamInQueryURL) {
-				q.Add(server.TenantNameParamInQueryURL, catconstants.SystemTenantName)
+			if q := uiURL.Query(); c.demoCtx.Multitenant && !c.demoCtx.DisableServerController && !q.Has(server.ClusterNameParamInQueryURL) {
+				q.Add(server.ClusterNameParamInQueryURL, catconstants.SystemTenantName)
 				uiURL.RawQuery = q.Encode()
 			}
 
@@ -1945,7 +1941,7 @@ func (c *transientCluster) ListDemoNodes(w, ew io.Writer, justOne, verbose bool)
 				if err != nil {
 					fmt.Fprintln(ew, errors.Wrap(err, "retrieving socket URL for system tenant server"))
 				}
-				c.printURLs(w, ew, sqlURL, uiURL, socketDetails, s.ServingRPCAddr(), verbose, includeHTTP)
+				c.printURLs(w, ew, sqlURL, uiURL, socketDetails, s.AdvRPCAddr(), verbose, includeHTTP)
 			}
 			fmt.Fprintln(w)
 		}
@@ -2007,11 +2003,11 @@ func (c *transientCluster) addDemoLoginToURL(uiURL *url.URL, includeTenantName b
 		// in that case.
 		q.Add("username", c.adminUser.Normalized())
 		q.Add("password", c.adminPassword)
-		uiURL.Path = server.DemoLoginPath
+		uiURL.Path = authserver.DemoLoginPath
 	}
 
 	if !includeTenantName {
-		q.Del(server.TenantNameParamInQueryURL)
+		q.Del(server.ClusterNameParamInQueryURL)
 	}
 
 	uiURL.RawQuery = q.Encode()

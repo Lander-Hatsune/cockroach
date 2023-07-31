@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logcrash"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/errors"
 	"go.etcd.io/raft/v3"
@@ -99,7 +100,6 @@ func newReplicaGCQueue(store *Store, db *kv.DB) *replicaGCQueue {
 		queueConfig{
 			maxSize:                  defaultQueueMaxSize,
 			needsLease:               false,
-			needsRaftInitialized:     true,
 			needsSpanConfigs:         false,
 			acceptsUnsplitRanges:     true,
 			processDestroyedReplicas: true,
@@ -323,6 +323,9 @@ func (rgcq *replicaGCQueue) process(
 		if err := repl.store.RemoveReplica(ctx, repl, nextReplicaID, RemoveOptions{
 			DestroyData: true,
 		}); err != nil {
+			// Should never get an error from RemoveReplica.
+			const format = "error during replicaGC: %v"
+			logcrash.ReportOrPanic(ctx, &repl.store.ClusterSettings().SV, format, err)
 			return false, err
 		}
 	} else {

@@ -170,6 +170,19 @@ var (
 		Measurement: "Replicas",
 		Unit:        metric.Unit_COUNT,
 	}
+	metaLeaseViolatingPreferencesCount = metric.Metadata{
+		Name:        "leases.preferences.violating",
+		Help:        "Number of replica leaseholders which violate lease preferences",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaLeaseLessPreferredCount = metric.Metadata{
+		Name: "leases.preferences.less-preferred",
+		Help: "Number of replica leaseholders which satisfy a lease " +
+			"preference which is not the most preferred",
+		Measurement: "Replicas",
+		Unit:        metric.Unit_COUNT,
+	}
 
 	// Storage metrics.
 	metaLiveBytes = metric.Metadata{
@@ -1229,6 +1242,32 @@ metric, which receives datapoints for each sub-batch processed in the process.`,
 		Measurement: "Latency",
 		Unit:        metric.Unit_NANOSECONDS,
 	}
+	metaRaftReplicationLatency = metric.Metadata{
+		Name: "raft.replication.latency",
+		Help: `The duration elapsed between having evaluated a BatchRequest and it being
+reflected in the proposer's state machine (i.e. having applied fully).
+
+This encompasses time spent in the quota pool, in replication (including
+reproposals), and application, but notably *not* sequencing latency (i.e.
+contention and latch acquisition).
+
+No measurement is recorded for read-only commands as well as read-write commands
+which end up not writing (such as a DeleteRange on an empty span). Commands that
+result in 'above-replication' errors (i.e. txn retries, etc) are similarly
+excluded. Errors that arise while waiting for the in-flight replication result
+or result from application of the command are included.
+
+Note also that usually, clients are signalled at beginning of application, but
+the recorded measurement captures the entirety of log application.
+
+The duration is always measured on the proposer, even if the Raft leader and
+leaseholder are not colocated, or the request is proposed from a follower.
+
+Commands that use async consensus will still cause a measurement that reflects
+the actual replication latency, despite returning early to the client.`,
+		Measurement: "Latency",
+		Unit:        metric.Unit_COUNT,
+	}
 	metaRaftSchedulerLatency = metric.Metadata{
 		Name: "raft.scheduler.latency",
 		Help: `Queueing durations for ranges waiting to be processed by the Raft scheduler.
@@ -2148,14 +2187,16 @@ type StoreMetrics struct {
 	// Lease request metrics for successful and failed lease requests. These
 	// count proposals (i.e. it does not matter how many replicas apply the
 	// lease).
-	LeaseRequestSuccessCount  *metric.Counter
-	LeaseRequestErrorCount    *metric.Counter
-	LeaseRequestLatency       metric.IHistogram
-	LeaseTransferSuccessCount *metric.Counter
-	LeaseTransferErrorCount   *metric.Counter
-	LeaseExpirationCount      *metric.Gauge
-	LeaseEpochCount           *metric.Gauge
-	LeaseLivenessCount        *metric.Gauge
+	LeaseRequestSuccessCount       *metric.Counter
+	LeaseRequestErrorCount         *metric.Counter
+	LeaseRequestLatency            metric.IHistogram
+	LeaseTransferSuccessCount      *metric.Counter
+	LeaseTransferErrorCount        *metric.Counter
+	LeaseExpirationCount           *metric.Gauge
+	LeaseEpochCount                *metric.Gauge
+	LeaseLivenessCount             *metric.Gauge
+	LeaseViolatingPreferencesCount *metric.Gauge
+	LeaseLessPreferredCount        *metric.Gauge
 
 	// Storage metrics.
 	ResolveCommitCount *metric.Counter
@@ -2334,6 +2375,7 @@ type StoreMetrics struct {
 	RaftCommandCommitLatency   metric.IHistogram
 	RaftHandleReadyLatency     metric.IHistogram
 	RaftApplyCommittedLatency  metric.IHistogram
+	RaftReplicationLatency     metric.IHistogram
 	RaftSchedulerLatency       metric.IHistogram
 	RaftTimeoutCampaign        *metric.Counter
 	RaftStorageReadBytes       *metric.Counter
@@ -2799,13 +2841,15 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 			Mode:     metric.HistogramModePreferHdrLatency,
 			Metadata: metaLeaseRequestLatency,
 			Duration: histogramWindow,
-			Buckets:  metric.NetworkLatencyBuckets,
+			Buckets:  metric.IOLatencyBuckets,
 		}),
-		LeaseTransferSuccessCount: metric.NewCounter(metaLeaseTransferSuccessCount),
-		LeaseTransferErrorCount:   metric.NewCounter(metaLeaseTransferErrorCount),
-		LeaseExpirationCount:      metric.NewGauge(metaLeaseExpirationCount),
-		LeaseEpochCount:           metric.NewGauge(metaLeaseEpochCount),
-		LeaseLivenessCount:        metric.NewGauge(metaLeaseLivenessCount),
+		LeaseTransferSuccessCount:      metric.NewCounter(metaLeaseTransferSuccessCount),
+		LeaseTransferErrorCount:        metric.NewCounter(metaLeaseTransferErrorCount),
+		LeaseExpirationCount:           metric.NewGauge(metaLeaseExpirationCount),
+		LeaseEpochCount:                metric.NewGauge(metaLeaseEpochCount),
+		LeaseLivenessCount:             metric.NewGauge(metaLeaseLivenessCount),
+		LeaseViolatingPreferencesCount: metric.NewGauge(metaLeaseViolatingPreferencesCount),
+		LeaseLessPreferredCount:        metric.NewGauge(metaLeaseLessPreferredCount),
 
 		// Intent resolution metrics.
 		ResolveCommitCount: metric.NewCounter(metaResolveCommit),
@@ -2994,6 +3038,12 @@ func newStoreMetrics(histogramWindow time.Duration) *StoreMetrics {
 		RaftApplyCommittedLatency: metric.NewHistogram(metric.HistogramOptions{
 			Mode:     metric.HistogramModePreferHdrLatency,
 			Metadata: metaRaftApplyCommittedLatency,
+			Duration: histogramWindow,
+			Buckets:  metric.IOLatencyBuckets,
+		}),
+		RaftReplicationLatency: metric.NewHistogram(metric.HistogramOptions{
+			Mode:     metric.HistogramModePrometheus,
+			Metadata: metaRaftReplicationLatency,
 			Duration: histogramWindow,
 			Buckets:  metric.IOLatencyBuckets,
 		}),

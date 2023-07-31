@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkeys"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/descmetadata"
@@ -184,8 +185,8 @@ func (p *planner) waitForDescriptorSchemaChanges(
 	ctx context.Context, descID descpb.ID, scs SchemaChangerState,
 ) error {
 
-	if knobs := p.ExecCfg().DeclarativeSchemaChangerTestingKnobs; knobs != nil &&
-		knobs.BeforeWaitingForConcurrentSchemaChanges != nil {
+	knobs := p.ExecCfg().DeclarativeSchemaChangerTestingKnobs
+	if knobs != nil && knobs.BeforeWaitingForConcurrentSchemaChanges != nil {
 		knobs.BeforeWaitingForConcurrentSchemaChanges(scs.stmts)
 	}
 
@@ -198,16 +199,11 @@ func (p *planner) waitForDescriptorSchemaChanges(
 
 	// Wait for the descriptor to no longer be claimed by a schema change.
 	start := timeutil.Now()
-	logEvery := log.Every(30 * time.Second)
+	logEvery := log.Every(10 * time.Second)
 	for r := retry.StartWithCtx(ctx, base.DefaultRetryOptions()); r.Next(); {
 		now := p.ExecCfg().Clock.Now()
-		if logEvery.ShouldLog() {
-			log.Infof(ctx,
-				"schema change waiting for concurrent schema changes on descriptor %d,"+
-					" waited %v so far", descID, timeutil.Since(start),
-			)
-		}
-		blocked := false
+		var isBlocked bool
+		var blockingJobIDs []catpb.JobID
 		if err := p.ExecCfg().InternalDB.DescsTxn(ctx, func(
 			ctx context.Context, txn descs.Txn,
 		) error {
@@ -218,15 +214,26 @@ func (p *planner) waitForDescriptorSchemaChanges(
 			if err != nil {
 				return err
 			}
-			blocked = desc.HasConcurrentSchemaChanges()
+			isBlocked = desc.HasConcurrentSchemaChanges()
+			blockingJobIDs = desc.ConcurrentSchemaChangeJobIDs()
 			return nil
 		}); err != nil {
 			return err
 		}
-		if !blocked {
+		if !isBlocked {
 			break
 		}
+		if logEvery.ShouldLog() {
+			log.Infof(ctx,
+				"schema change waiting for %v concurrent schema change job(s) %v on descriptor %d,"+
+					" waited %v so far", len(blockingJobIDs), blockingJobIDs, descID, timeutil.Since(start),
+			)
+		}
+		if knobs != nil && knobs.WhileWaitingForConcurrentSchemaChanges != nil {
+			knobs.WhileWaitingForConcurrentSchemaChanges(scs.stmts)
+		}
 	}
+
 	log.Infof(
 		ctx,
 		"done waiting for concurrent schema changes on descriptor %d after %v",

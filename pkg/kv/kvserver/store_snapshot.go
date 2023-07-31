@@ -383,6 +383,12 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 	recordBytesReceived snapshotRecordMetrics,
 ) (IncomingSnapshot, error) {
 	assertStrategy(ctx, header, kvserverpb.SnapshotRequest_KV_BATCH)
+	if fn := s.cfg.TestingKnobs.BeforeRecvAcceptedSnapshot; fn != nil {
+		fn()
+	}
+	snapshotCtx := ctx
+	ctx, rSp := tracing.EnsureChildSpan(ctx, s.cfg.Tracer(), "receive snapshot data")
+	defer rSp.Finish() // Ensure that the tracing span is closed, even if Receive errors.
 
 	// These stopwatches allow us to time the various components of Receive().
 	// - totalTime Stopwatch measures the total time spent within this function.
@@ -421,7 +427,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 		}
 		if req.Header != nil {
 			err := errors.New("client error: provided a header mid-stream")
-			return noSnap, sendSnapshotError(ctx, s, stream, err)
+			return noSnap, sendSnapshotError(snapshotCtx, s, stream, err)
 		}
 
 		if req.KVBatch != nil {
@@ -487,7 +493,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 			snapUUID, err := uuid.FromBytes(header.RaftMessageRequest.Message.Snapshot.Data)
 			if err != nil {
 				err = errors.Wrap(err, "client error: invalid snapshot")
-				return noSnap, sendSnapshotError(ctx, s, stream, err)
+				return noSnap, sendSnapshotError(snapshotCtx, s, stream, err)
 			}
 
 			inSnap := IncomingSnapshot{
@@ -498,6 +504,7 @@ func (kvSS *kvBatchSnapshotStrategy) Receive(
 				DataSize:          dataSize,
 				snapType:          header.Type,
 				raftAppliedIndex:  header.State.RaftAppliedIndex,
+				msgAppRespCh:      make(chan raftpb.Message, 1),
 			}
 
 			timingTag.stop("totalTime")
@@ -786,7 +793,7 @@ func (s *Store) throttleSnapshot(
 		select {
 		case permit = <-task.GetWaitChan():
 			// Got a spot in the snapshotQueue, continue with sending the snapshot.
-			if fn := s.cfg.TestingKnobs.AfterSendSnapshotThrottle; fn != nil {
+			if fn := s.cfg.TestingKnobs.AfterSnapshotThrottle; fn != nil {
 				fn()
 			}
 			log.Event(ctx, "acquired spot in the snapshot snapshotQueue")
@@ -983,10 +990,10 @@ func (s *Store) getLocalityComparison(
 	secLocality := s.cfg.StorePool.GetNodeLocality(toNodeID)
 	comparisonResult, regionErr, zoneErr := firstLocality.CompareWithLocality(secLocality)
 	if regionErr != nil {
-		log.VEventf(ctx, 2, "unable to determine if the given nodes are cross region %+v", regionErr)
+		log.VEventf(ctx, 5, "unable to determine if the given nodes are cross region %v", regionErr)
 	}
 	if zoneErr != nil {
-		log.VEventf(ctx, 2, "unable to determine if the given nodes are cross zone %+v", zoneErr)
+		log.VEventf(ctx, 5, "unable to determine if the given nodes are cross zone %v", zoneErr)
 	}
 	return comparisonResult
 }
@@ -1017,7 +1024,7 @@ func (s *Store) receiveSnapshot(
 	}
 
 	if fn := s.cfg.TestingKnobs.ReceiveSnapshot; fn != nil {
-		if err := fn(header); err != nil {
+		if err := fn(ctx, header); err != nil {
 			// NB: we intentionally don't mark this error as errMarkSnapshotError so
 			// that we don't end up retrying injected errors in tests.
 			return sendSnapshotError(ctx, s, stream, err)
@@ -1123,8 +1130,6 @@ func (s *Store) receiveSnapshot(
 			s.metrics.RangeSnapshotUnknownRcvdBytes.Inc(inc)
 		}
 	}
-	ctx, rSp := tracing.EnsureChildSpan(ctx, s.cfg.Tracer(), "receive snapshot data")
-	defer rSp.Finish() // Ensure that the tracing span is closed, even if ss.Receive errors
 	inSnap, err := ss.Receive(ctx, s, stream, *header, recordBytesReceived)
 	if err != nil {
 		return err
@@ -1136,7 +1141,8 @@ func (s *Store) receiveSnapshot(
 	// already received the entire snapshot here, so there's no point in
 	// abandoning application half-way through if the caller goes away.
 	applyCtx := s.AnnotateCtx(context.Background())
-	if pErr := s.processRaftSnapshotRequest(applyCtx, header, inSnap); pErr != nil {
+	msgAppResp, pErr := s.processRaftSnapshotRequest(applyCtx, header, inSnap)
+	if pErr != nil {
 		err := pErr.GoError()
 		// We mark this error as a snapshot error which will be interpreted by the
 		// sender as this being a retriable error, see isSnapshotError().
@@ -1147,6 +1153,7 @@ func (s *Store) receiveSnapshot(
 	return stream.Send(&kvserverpb.SnapshotResponse{
 		Status:         kvserverpb.SnapshotResponse_APPLIED,
 		CollectedSpans: tracing.SpanFromContext(ctx).GetConfiguredRecording(),
+		MsgAppResp:     msgAppResp,
 	})
 }
 
@@ -1374,7 +1381,7 @@ func SendEmptySnapshot(
 	var ms enginepb.MVCCStats
 	// Seed an empty range into the new engine.
 	if err := storage.MVCCPutProto(
-		ctx, eng, &ms, keys.RangeDescriptorKey(desc.StartKey), now, hlc.ClockTimestamp{}, nil /* txn */, &desc,
+		ctx, eng, keys.RangeDescriptorKey(desc.StartKey), now, &desc, storage.MVCCWriteOptions{Stats: &ms},
 	); err != nil {
 		return err
 	}
@@ -1478,7 +1485,7 @@ func SendEmptySnapshot(
 		}
 	}()
 
-	return sendSnapshot(
+	if _, err := sendSnapshot(
 		ctx,
 		st,
 		tracer,
@@ -1489,7 +1496,10 @@ func SendEmptySnapshot(
 		eng.NewWriteBatch,
 		func() {},
 		nil, /* recordBytesSent */
-	)
+	); err != nil {
+		return err
+	}
+	return nil
 }
 
 // noopStorePool is a hollowed out StorePool that does not throttle. It's used in recovery scenarios.
@@ -1509,7 +1519,7 @@ func sendSnapshot(
 	newWriteBatch func() storage.WriteBatch,
 	sent func(),
 	recordBytesSent snapshotRecordMetrics,
-) error {
+) (*kvserverpb.SnapshotResponse, error) {
 	if recordBytesSent == nil {
 		// NB: Some tests and an offline tool (ResetQuorum) call into `sendSnapshotUsingDelegate`
 		// with a nil metrics tracking function. We pass in a fake metrics tracking function here that isn't
@@ -1522,7 +1532,7 @@ func sendSnapshot(
 	start := timeutil.Now()
 	to := header.RaftMessageRequest.ToReplica
 	if err := stream.Send(&kvserverpb.SnapshotRequest{Header: &header}); err != nil {
-		return err
+		return nil, err
 	}
 	log.Event(ctx, "sent SNAPSHOT_REQUEST message to server")
 	// Wait until we get a response from the server. The recipient may queue us
@@ -1532,13 +1542,13 @@ func sendSnapshot(
 	resp, err := stream.Recv()
 	if err != nil {
 		storePool.Throttle(storepool.ThrottleFailed, err.Error(), to.StoreID)
-		return err
+		return nil, err
 	}
 	switch resp.Status {
 	case kvserverpb.SnapshotResponse_ERROR:
 		sp.ImportRemoteRecording(resp.CollectedSpans)
 		storePool.Throttle(storepool.ThrottleFailed, resp.DeprecatedMessage, to.StoreID)
-		return errors.Wrapf(maybeHandleDeprecatedSnapErr(resp.Error()), "%s: remote couldn't accept %s", to, snap)
+		return nil, errors.Wrapf(maybeHandleDeprecatedSnapErr(resp.Error()), "%s: remote couldn't accept %s", to, snap)
 	case kvserverpb.SnapshotResponse_ACCEPTED:
 		// This is the response we're expecting. Continue with snapshot sending.
 		log.Event(ctx, "received SnapshotResponse_ACCEPTED message from server")
@@ -1546,7 +1556,7 @@ func sendSnapshot(
 		err := errors.Errorf("%s: server sent an invalid status while negotiating %s: %s",
 			to, snap, resp.Status)
 		storePool.Throttle(storepool.ThrottleFailed, err.Error(), to.StoreID)
-		return err
+		return nil, err
 	}
 
 	durQueued := timeutil.Since(start)
@@ -1582,7 +1592,7 @@ func sendSnapshot(
 	// Record timings for snapshot send if kv.trace.snapshot.enable_threshold is enabled
 	numBytesSent, err := ss.Send(ctx, stream, header, snap, recordBytesSent)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	durSent := timeutil.Since(start)
 
@@ -1591,7 +1601,7 @@ func sendSnapshot(
 	// applied.
 	sent()
 	if err := stream.Send(&kvserverpb.SnapshotRequest{Final: true}); err != nil {
-		return err
+		return nil, err
 	}
 	log.KvDistribution.Infof(
 		ctx,
@@ -1608,7 +1618,7 @@ func sendSnapshot(
 
 	resp, err = stream.Recv()
 	if err != nil {
-		return errors.Wrapf(err, "%s: remote failed to apply snapshot", to)
+		return nil, errors.Wrapf(err, "%s: remote failed to apply snapshot", to)
 	}
 	sp.ImportRemoteRecording(resp.CollectedSpans)
 	// NB: wait for EOF which ensures that all processing on the server side has
@@ -1616,19 +1626,19 @@ func sendSnapshot(
 	// received).
 	if unexpectedResp, err := stream.Recv(); err != io.EOF {
 		if err != nil {
-			return errors.Wrapf(err, "%s: expected EOF, got resp=%v with error", to, unexpectedResp)
+			return nil, errors.Wrapf(err, "%s: expected EOF, got resp=%v with error", to, unexpectedResp)
 		}
-		return errors.Newf("%s: expected EOF, got resp=%v", to, unexpectedResp)
+		return nil, errors.Newf("%s: expected EOF, got resp=%v", to, unexpectedResp)
 	}
 	switch resp.Status {
 	case kvserverpb.SnapshotResponse_ERROR:
-		return errors.Wrapf(
+		return nil, errors.Wrapf(
 			maybeHandleDeprecatedSnapErr(resp.Error()), "%s: remote failed to apply snapshot", to,
 		)
 	case kvserverpb.SnapshotResponse_APPLIED:
-		return nil
+		return resp, nil
 	default:
-		return errors.Errorf("%s: server sent an invalid status during finalization: %s",
+		return nil, errors.Errorf("%s: server sent an invalid status during finalization: %s",
 			to, resp.Status,
 		)
 	}

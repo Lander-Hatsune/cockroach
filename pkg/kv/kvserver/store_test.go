@@ -258,7 +258,7 @@ func createTestStoreWithoutStart(
 		NodeDescs:          mockNodeStore{desc: nodeDesc},
 		RPCContext:         rpcContext,
 		RPCRetryOptions:    &retry.Options{},
-		NodeDialer:         nodedialer.New(rpcContext, gossip.AddressResolver(cfg.Gossip)), // TODO
+		NodeDialer:         cfg.NodeDialer,
 		FirstRangeProvider: rangeProv,
 		TestingKnobs: kvcoord.ClientTestingKnobs{
 			TransportFactory: kvcoord.SenderTransportFactory(cfg.AmbientCtx.Tracer, &storeSender),
@@ -381,12 +381,10 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 			if err := storage.MVCCPut(
 				ctx,
 				eng,
-				nil, /* ms */
 				key,
 				hlc.Timestamp{},
-				hlc.ClockTimestamp{},
 				roachpb.MakeValueFromString("fake value for "+key.String()),
-				nil, /* txn */
+				storage.MVCCWriteOptions{},
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -418,7 +416,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 
 			t.Logf("writing tombstone at rangeID=%d", rangeID)
 			if err := storage.MVCCPutProto(
-				ctx, eng, nil /* ms */, keys.RangeTombstoneKey(rangeID), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil /* txn */, &tombstone,
+				ctx, eng, keys.RangeTombstoneKey(rangeID), hlc.Timestamp{}, &tombstone, storage.MVCCWriteOptions{},
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -740,15 +738,31 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
-		DestroyData: true,
-	}); err != nil {
-		t.Fatal(err)
+
+	// Can't remove Replica with DestroyData false because this requires the destroyStatus
+	// to already have been set by the caller (but we didn't).
+	require.ErrorContains(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+		DestroyData: false,
+	}), `replica not marked as destroyed`)
+
+	// Remove the Replica twice, as this should be idempotent.
+	// NB: we rely on this idempotency today (as @tbg found out when he accidentally
+	// removed it).
+	for i := 0; i < 2; i++ {
+		require.NoError(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+			DestroyData: true,
+		}), "%d", i)
 	}
+
+	// However, if we have DestroyData=false, caller is expected to be the unique first "destroyer"
+	// of the Replica.
+	require.ErrorContains(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+		DestroyData: false,
+	}), `does not exist`)
 
 	// Verify that removal of a replica marks it as destroyed so that future raft
 	// commands on the Replica will silently be dropped.
-	err = repl1.withRaftGroup(true, func(r *raft.RawNode) (bool, error) {
+	err = repl1.withRaftGroup(func(r *raft.RawNode) (bool, error) {
 		return true, errors.Errorf("unexpectedly created a raft group")
 	})
 	require.Equal(t, errRemoved, err)
@@ -885,7 +899,7 @@ func TestMarkReplicaInitialized(t *testing.T) {
 	require.NoError(t,
 		logstore.NewStateLoader(newRangeID).SetRaftReplicaID(ctx, store.TODOEngine(), replicaID))
 
-	r := newUninitializedReplica(store, newRangeID, replicaID)
+	r, err := newUninitializedReplica(store, newRangeID, replicaID)
 	require.NoError(t, err)
 
 	store.mu.Lock()
@@ -3032,13 +3046,14 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	require.NoError(t, s.processRaftSnapshotRequest(ctx, req,
+	_, pErr := s.processRaftSnapshotRequest(ctx, req,
 		IncomingSnapshot{
 			SnapUUID:    uuid.MakeV4(),
 			Desc:        desc,
 			placeholder: placeholder,
 		},
-	).GoError())
+	)
+	require.NoError(t, pErr.GoError())
 
 	testutils.SucceedsSoon(t, func() error {
 		s.mu.Lock()
@@ -3111,7 +3126,7 @@ func TestSendSnapshotThrottling(t *testing.T) {
 		sp := &fakeStorePool{}
 		expectedErr := errors.New("")
 		c := fakeSnapshotStream{nil, expectedErr}
-		err := sendSnapshot(
+		_, err := sendSnapshot(
 			ctx, st, tr, c, sp, header, nil /* snap */, newBatch, nil /* sent */, nil, /* recordBytesSent */
 		)
 		if sp.failedThrottles != 1 {
@@ -3130,7 +3145,7 @@ func TestSendSnapshotThrottling(t *testing.T) {
 			EncodedError: errors.EncodeError(ctx, errors.New("boom")),
 		}
 		c := fakeSnapshotStream{resp, nil}
-		err := sendSnapshot(
+		_, err := sendSnapshot(
 			ctx, st, tr, c, sp, header, nil /* snap */, newBatch, nil /* sent */, nil, /* recordBytesSent */
 		)
 		if sp.failedThrottles != 1 {

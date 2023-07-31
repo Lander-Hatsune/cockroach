@@ -17,6 +17,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdcevent"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
@@ -37,8 +38,11 @@ type parquetWriter struct {
 	schemaDef    *parquet.SchemaDefinition
 	datumAlloc   []tree.Datum
 
-	// Cached object builder for when using the `diff` option.
-	vb *json.FixedKeysObjectBuilder
+	// Cached object builder for previous row when using the `diff` option.
+	prevState struct {
+		vb      *json.FixedKeysObjectBuilder
+		version descpb.DescriptorVersion
+	}
 }
 
 // newParquetSchemaDefintion returns a parquet schema definition based on the
@@ -112,7 +116,8 @@ func newParquetWriterFromRow(
 			return nil, err
 		}
 	}
-	writer, err := newParquetWriter(schemaDef, sink, opts...)
+	writer, err := parquet.NewWriter(schemaDef, sink, opts...)
+
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +170,7 @@ func (w *parquetWriter) populateDatums(
 		if prevRow.IsDeleted() {
 			datums = append(datums, tree.DNull)
 		} else {
-			if w.vb == nil {
+			if w.prevState.vb == nil || w.prevState.version != prevRow.Version {
 				keys := make([]string, 0, len(prevRow.ResultColumns()))
 				_ = prevRow.ForEachColumn().Col(func(col cdcevent.ResultColumn) error {
 					keys = append(keys, col.Name)
@@ -175,7 +180,8 @@ func (w *parquetWriter) populateDatums(
 				if err != nil {
 					return err
 				}
-				w.vb = valueBuilder
+				w.prevState.version = prevRow.Version
+				w.prevState.vb = valueBuilder
 			}
 
 			if err := prevRow.ForEachColumn().Datum(func(d tree.Datum, col cdcevent.ResultColumn) error {
@@ -183,12 +189,12 @@ func (w *parquetWriter) populateDatums(
 				if err != nil {
 					return err
 				}
-				return w.vb.Set(col.Name, j)
+				return w.prevState.vb.Set(col.Name, j)
 			}); err != nil {
 				return err
 			}
 
-			j, err := w.vb.Build()
+			j, err := w.prevState.vb.Build()
 			if err != nil {
 				return err
 			}
@@ -318,18 +324,4 @@ func deserializeMap(s string) (orderedKeys []string, m map[string]int, err error
 		m[key] = value
 	}
 	return orderedKeys, m, nil
-}
-
-// newParquetWriter allocates a new parquet writer using the provided
-// schema definition.
-func newParquetWriter(
-	sch *parquet.SchemaDefinition, sink io.Writer, opts ...parquet.Option,
-) (*parquet.Writer, error) {
-	if includeParquestTestMetadata {
-		// To use parquet test utils for reading datums, the writer needs to be
-		// configured with additional metadata.
-		return parquet.NewWriterWithReaderMeta(sch, sink, opts...)
-	}
-
-	return parquet.NewWriter(sch, sink, opts...)
 }

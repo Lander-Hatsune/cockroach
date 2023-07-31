@@ -24,8 +24,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
+	"github.com/cockroachdb/cockroach/pkg/testutils/release"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 )
 
 func registerIndexBackfill(r registry.Registry) {
@@ -70,7 +70,7 @@ func registerIndexBackfill(r registry.Registry) {
 				// snapshots.
 				runTPCE(ctx, t, c, tpceOptions{
 					start: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-						pred, err := version.PredecessorVersion(*t.BuildVersion())
+						pred, err := release.LatestPredecessor(t.BuildVersion())
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -165,15 +165,6 @@ func registerIndexBackfill(r registry.Registry) {
 				during: func(ctx context.Context) error {
 					db := c.Conn(ctx, t.L(), 1)
 					defer db.Close()
-
-					// Crank up AddSST concurrency to increase the likelihood
-					// of getting into IO overload regime due to follower
-					// activity.
-					if _, err := db.ExecContext(ctx,
-						"SET CLUSTER SETTING kv.bulk_io_write.concurrent_addsstable_requests = 3",
-					); err != nil {
-						t.Fatal(err)
-					}
 
 					// Defeat https://github.com/cockroachdb/cockroach/issues/98311.
 					if _, err := db.ExecContext(ctx,

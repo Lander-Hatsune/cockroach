@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/importer"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -41,16 +42,15 @@ func TestBackupTenantImportingTable(t *testing.T) {
 	tc := testcluster.StartTestCluster(t, 1,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				// Test is designed to run with explicit tenants. No need to
-				// implicitly create a tenant.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TestControlsTenantsExplicitly,
 			},
 		})
 	defer tc.Stopper().Stop(ctx)
 	sqlDB := sqlutils.MakeSQLRunner(tc.Conns[0])
 
+	tenantID := roachpb.MustMakeTenantID(10)
 	tSrv, tSQL := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
-		TenantID:     roachpb.MustMakeTenantID(10),
+		TenantID:     tenantID,
 		TestingKnobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
 	})
 	defer tSQL.Close()
@@ -80,14 +80,19 @@ func TestBackupTenantImportingTable(t *testing.T) {
 	}
 	// Destroy the tenant, then restore it.
 	tSrv.Stopper().Stop(ctx)
-	if _, err := sqlDB.DB.ExecContext(ctx, "DROP TENANT [10] IMMEDIATE"); err != nil {
+	if _, err := sqlDB.DB.ExecContext(ctx, "ALTER TENANT [10] STOP SERVICE; DROP TENANT [10] IMMEDIATE"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqlDB.DB.ExecContext(ctx, "RESTORE TENANT 10 FROM $1", dst); err != nil {
 		t.Fatal(err)
 	}
+
+	if err := tc.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+		t.Fatal(err)
+	}
+
 	_, tSQL = serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
-		TenantID:     roachpb.MustMakeTenantID(10),
+		TenantID:     tenantID,
 		TestingKnobs: base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()},
 	})
 	defer tSQL.Close()

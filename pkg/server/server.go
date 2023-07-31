@@ -52,7 +52,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
@@ -69,8 +68,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/security/clientsecopts"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
+	"github.com/cockroachdb/cockroach/pkg/server/privchecker"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/serverrules"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -108,6 +109,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/goschedstats"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logmetrics"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
@@ -157,12 +159,12 @@ type Server struct {
 	ctSender         *sidetransport.Sender
 
 	http            *httpServer
-	adminAuthzCheck *adminPrivilegeChecker
+	adminAuthzCheck privchecker.CheckerForRPCHandlers
 	admin           *systemAdminServer
 	status          *systemStatusServer
 	drain           *drainServer
-	decomNodeMap    *decommissioningNodeMap
-	authentication  *authenticationServer
+	decomNodeMap    *DecommissioningNodeMap
+	authentication  authserver.Server
 	migrationServer *migrationServer
 	tsDB            *ts.DB
 	tsServer        *ts.Server
@@ -484,14 +486,14 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	stores := kvserver.NewStores(cfg.AmbientCtx, clock)
 
-	decomNodeMap := &decommissioningNodeMap{
+	decomNodeMap := &DecommissioningNodeMap{
 		nodes: make(map[roachpb.NodeID]interface{}),
 	}
 	nodeLiveness := liveness.NewNodeLiveness(liveness.NodeLivenessOptions{
 		AmbientCtx:              cfg.AmbientCtx,
 		Stopper:                 stopper,
 		Clock:                   clock,
-		DB:                      db,
+		Storage:                 liveness.NewKVStorage(db),
 		Gossip:                  g,
 		LivenessThreshold:       nlActive,
 		RenewalDuration:         nlRenewal,
@@ -501,17 +503,17 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		// enqueue the ranges we have that also have a replica on the
 		// decommissioning node.
 		OnNodeDecommissioning: decomNodeMap.makeOnNodeDecommissioningCallback(stores),
-		OnNodeDecommissioned: func(liveness livenesspb.Liveness) {
+		OnNodeDecommissioned: func(id roachpb.NodeID) {
 			if knobs, ok := cfg.TestingKnobs.Server.(*TestingKnobs); ok && knobs.OnDecommissionedCallback != nil {
-				knobs.OnDecommissionedCallback(liveness)
+				knobs.OnDecommissionedCallback(id)
 			}
 			if err := nodeTombStorage.SetDecommissioned(
-				ctx, liveness.NodeID, timeutil.Unix(0, liveness.Expiration.WallTime).UTC(),
+				ctx, id, clock.PhysicalTime().UTC(),
 			); err != nil {
-				log.Fatalf(ctx, "unable to add tombstone for n%d: %s", liveness.NodeID, err)
+				log.Fatalf(ctx, "unable to add tombstone for n%d: %s", id, err)
 			}
 
-			decomNodeMap.onNodeDecommissioned(liveness.NodeID)
+			decomNodeMap.onNodeDecommissioned(id)
 		},
 		Engines: engines,
 		OnSelfHeartbeat: func(ctx context.Context) {
@@ -712,6 +714,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 
 	tenantCapabilitiesWatcher := tenantcapabilitieswatcher.New(
 		clock,
+		cfg.Settings,
 		rangeFeedFactory,
 		keys.TenantsTableID,
 		stopper,
@@ -914,6 +917,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 		gcoords.Stores,
 		tenantUsage,
 		tenantSettingsWatcher,
+		tenantCapabilitiesWatcher,
 		spanConfig.kvAccessor,
 		spanConfig.reporter,
 	)
@@ -950,11 +954,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	// Instantiate the API privilege checker.
 	//
 	// TODO(tbg): give adminServer only what it needs (and avoid circular deps).
-	adminAuthzCheck := &adminPrivilegeChecker{
-		ie:          internalExecutor,
-		st:          st,
-		makePlanner: nil,
-	}
+	adminAuthzCheck := privchecker.NewChecker(internalExecutor, st)
 
 	// Instantiate the HTTP server.
 	// These callbacks help us avoid a dependency on gossip in httpServer.
@@ -1158,11 +1158,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	}
 
 	// Tell the authz server how to connect to SQL.
-	adminAuthzCheck.makePlanner = func(opName string) (interface{}, func()) {
+	adminAuthzCheck.SetAuthzAccessorFactory(func(opName string) (sql.AuthorizationAccessor, func()) {
 		// This is a hack to get around a Go package dependency cycle. See comment
 		// in sql/jobs/registry.go on planHookMaker.
 		txn := db.NewTxn(ctx, "check-system-privilege")
-		return sql.NewInternalPlanner(
+		p, cleanup := sql.NewInternalPlanner(
 			opName,
 			txn,
 			username.RootUserName(),
@@ -1170,10 +1170,11 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			sqlServer.execCfg,
 			sql.NewInternalSessionData(ctx, sqlServer.execCfg.Settings, opName),
 		)
-	}
+		return p.(sql.AuthorizationAccessor), cleanup
+	})
 
 	// Create the authentication RPC server (login/logout).
-	sAuth := newAuthenticationServer(cfg.Config, sqlServer)
+	sAuth := authserver.NewServer(cfg.Config, sqlServer)
 
 	// Create a drain server.
 	drain := newDrainServer(cfg.BaseConfig, stopper, stopTrigger, grpcServer, sqlServer)
@@ -1242,6 +1243,8 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 			}
 			return errors.Newf("server found with type %T", d)
 		},
+		roachpb.SystemTenantID,
+		authorizer,
 	)
 
 	recoveryServer := loqrecovery.NewServer(
@@ -1838,9 +1841,16 @@ func (s *Server) PreStart(ctx context.Context) error {
 		})
 	})
 
+	// Init a log metrics registry.
+	logRegistry := logmetrics.NewRegistry()
+	if logRegistry == nil {
+		panic(errors.AssertionFailedf("nil log metrics registry at server startup"))
+	}
+
 	// We can now add the node registry.
 	s.recorder.AddNode(
 		s.registry,
+		logRegistry,
 		s.node.Descriptor,
 		s.node.startedAt,
 		s.cfg.AdvertiseAddr,
@@ -1898,13 +1908,17 @@ func (s *Server) PreStart(ctx context.Context) error {
 	// initialized.
 	s.grpc.setMode(modeOperational)
 
+	s.nodeLiveness.Start(workersCtx)
+
 	// We'll block here until all stores are fully initialized. We do this here
-	// for two reasons:
+	// for several reasons:
 	// - some of the components below depend on all stores being fully
 	//   initialized (like the debug server registration for e.g.)
 	// - we'll need to do it after having opened up the RPC floodgates (due to
 	//   the hazard described in Node.start, around initializing additional
 	//   stores)
+	// - we'll need to do it after starting node liveness, see:
+	//   https://github.com/cockroachdb/cockroach/issues/106706#issuecomment-1640254715
 	s.node.waitForAdditionalStoreInit()
 
 	additionalStoreIDs, err := state.additionalStoreIDs()
@@ -1951,11 +1965,6 @@ func (s *Server) PreStart(ctx context.Context) error {
 	log.Ops.Infof(ctx, "advertising CockroachDB node at %s", log.SafeManaged(s.cfg.AdvertiseAddr))
 
 	log.Event(ctx, "accepting connections")
-
-	// Begin the node liveness heartbeat. Add a callback which records the local
-	// store "last up" timestamp for every store whenever the liveness record is
-	// updated.
-	s.nodeLiveness.Start(workersCtx)
 
 	// Begin recording status summaries.
 	if err := s.node.startWriteNodeStatus(base.DefaultMetricsSampleInterval); err != nil {
@@ -2048,6 +2057,11 @@ func (s *Server) PreStart(ctx context.Context) error {
 		nil, /* TenantExternalIORecorder */
 		s.registry,
 	)
+	if err := s.cfg.ExternalStorageAccessor.Init(
+		s.externalStorageBuilder.makeExternalStorage, s.externalStorageBuilder.makeExternalStorageFromURI,
+	); err != nil {
+		return err
+	}
 
 	// If enabled, start reporting diagnostics.
 	if s.cfg.StartDiagnosticsReporting && !cluster.TelemetryOptOut {

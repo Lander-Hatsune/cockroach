@@ -28,7 +28,7 @@ func TestServerController(t *testing.T) {
 	ctx := context.Background()
 
 	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -60,7 +60,7 @@ func TestServerController(t *testing.T) {
 	// controller itself: it's sufficient to see that the
 	// tenant constructor was called.
 	require.Error(t, err, "tenant connector requires a CCL binary")
-	// TODO(knz): test something about d
+	// TODO(knz): test something about d.
 }
 
 func TestSQLErrorUponInvalidTenant(t *testing.T) {
@@ -69,13 +69,12 @@ func TestSQLErrorUponInvalidTenant(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestTenantDisabled,
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
 
-	sqlAddr := s.ServingSQLAddr()
-	db, err := serverutils.OpenDBConnE(sqlAddr, "cluster:nonexistent", false, s.Stopper())
+	db, err := s.SystemLayer().SQLConnE("cluster:nonexistent")
 	// Expect no error yet: the connection is opened lazily; an
 	// error here means the parameters were incorrect.
 	require.NoError(t, err)

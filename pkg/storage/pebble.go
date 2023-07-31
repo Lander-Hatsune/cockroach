@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"io"
 	"math"
@@ -31,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -51,7 +53,7 @@ import (
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
-	"github.com/cockroachdb/pebble/objstorage/shared"
+	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/rangekey"
 	"github.com/cockroachdb/pebble/replay"
 	"github.com/cockroachdb/pebble/sstable"
@@ -714,6 +716,12 @@ type PebbleConfig struct {
 	// SharedStorage is a cloud.ExternalStorage that can be used by all Pebble
 	// stores on this node and on other nodes to store sstables.
 	SharedStorage cloud.ExternalStorage
+
+	// RemoteStorageFactory is used to pass the ExternalStorage factory.
+	RemoteStorageFactory *cloud.ExternalStorageAccessor
+
+	// onClose is a slice of functions to be invoked before the engine is closed.
+	onClose []func(*Pebble)
 }
 
 // EncryptionStatsHandler provides encryption related stats.
@@ -796,6 +804,8 @@ type Pebble struct {
 	// closer is populated when the database is opened. The closer is associated
 	// with the filesystem.
 	closer io.Closer
+	// onClose is a slice of functions to be invoked before the engine closes.
+	onClose []func(*Pebble)
 
 	wrappedIntentWriter intentDemuxWriter
 
@@ -849,7 +859,7 @@ func (p *Pebble) SetStoreID(ctx context.Context, storeID int32) error {
 		return nil
 	}
 	p.storeIDPebbleLog.Set(ctx, storeID)
-	// Note that SetCreatorID only does something if shared storage is configured
+	// Note that SetCreatorID only does something if remote storage is configured
 	// in the pebble options. The version gate protects against accidentally
 	// setting the creator ID on an older store.
 	if storeID != base.TempStoreID && p.minVersion.AtLeast(clusterversion.ByKey(clusterversion.V23_1SetPebbleCreatorID)) {
@@ -875,16 +885,28 @@ func (p *Pebble) GetStoreID() (int32, error) {
 	return storeID, nil
 }
 
+type remoteStorageAdaptor struct {
+	p       *Pebble
+	ctx     context.Context
+	factory *cloud.ExternalStorageAccessor
+}
+
+func (r remoteStorageAdaptor) CreateStorage(locator remote.Locator) (remote.Storage, error) {
+	es, err := r.factory.OpenURL(r.ctx, string(locator), username.SQLUsername{})
+	return &externalStorageWrapper{p: r.p, ctx: r.ctx, es: es}, err
+}
+
 // ResolveEncryptedEnvOptions creates the EncryptionEnv and associated file
 // registry if this store has encryption-at-rest enabled; otherwise returns a
 // nil EncryptionEnv.
 func ResolveEncryptedEnvOptions(
-	cfg *base.StorageConfig, fs vfs.FS, readOnly bool,
+	ctx context.Context, cfg *base.StorageConfig, fs vfs.FS, readOnly bool,
 ) (*PebbleFileRegistry, *EncryptionEnv, error) {
 	var fileRegistry *PebbleFileRegistry
 	if cfg.UseFileRegistry {
-		fileRegistry = &PebbleFileRegistry{FS: fs, DBDir: cfg.Dir, ReadOnly: readOnly}
-		if err := fileRegistry.Load(); err != nil {
+		fileRegistry = &PebbleFileRegistry{FS: fs, DBDir: cfg.Dir, ReadOnly: readOnly,
+			NumOldRegistryFiles: DefaultNumOldFileRegistryFiles}
+		if err := fileRegistry.Load(ctx); err != nil {
 			return nil, nil, err
 		}
 	} else {
@@ -1013,7 +1035,8 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 	// For some purposes, we want to always use an unencrypted
 	// filesystem.
 	unencryptedFS := opts.FS
-	fileRegistry, encryptionEnv, err := ResolveEncryptedEnvOptions(&cfg.StorageConfig, opts.FS, opts.ReadOnly)
+	fileRegistry, encryptionEnv, err :=
+		ResolveEncryptedEnvOptions(ctx, &cfg.StorageConfig, opts.FS, opts.ReadOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -1072,6 +1095,7 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 		logCtx:           logCtx,
 		storeIDPebbleLog: storeIDContainer,
 		closer:           filesystemCloser,
+		onClose:          cfg.onClose,
 		replayer:         replay.NewWorkloadCollector(cfg.StorageConfig.Dir),
 	}
 
@@ -1124,11 +1148,15 @@ func NewPebble(ctx context.Context, cfg PebbleConfig) (p *Pebble, err error) {
 
 	if cfg.SharedStorage != nil {
 		esWrapper := &externalStorageWrapper{p: p, es: cfg.SharedStorage, ctx: ctx}
-		opts.Experimental.SharedStorage = shared.MakeSimpleFactory(map[shared.Locator]shared.Storage{
+		opts.Experimental.RemoteStorage = remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
 			"": esWrapper,
 		})
 		opts.Experimental.CreateOnShared = true
 		opts.Experimental.CreateOnSharedLocator = ""
+	}
+
+	if cfg.RemoteStorageFactory != nil {
+		opts.Experimental.RemoteStorage = remoteStorageAdaptor{p: p, ctx: ctx, factory: cfg.RemoteStorageFactory}
 	}
 
 	// Read the current store cluster version.
@@ -1328,6 +1356,10 @@ func (p *Pebble) Close() {
 		p.logger.Infof("closing unopened pebble instance")
 		return
 	}
+	for _, closeFunc := range p.onClose {
+		closeFunc(p)
+	}
+
 	p.closed = true
 
 	// Wait for any asynchronous goroutines to exit.
@@ -1464,37 +1496,48 @@ func (p *Pebble) ApplyBatchRepr(repr []byte, sync bool) error {
 }
 
 // ClearMVCC implements the Engine interface.
-func (p *Pebble) ClearMVCC(key MVCCKey) error {
+func (p *Pebble) ClearMVCC(key MVCCKey, opts ClearOptions) error {
 	if key.Timestamp.IsEmpty() {
 		panic("ClearMVCC timestamp is empty")
 	}
-	return p.clear(key)
+	return p.clear(key, opts)
 }
 
 // ClearUnversioned implements the Engine interface.
-func (p *Pebble) ClearUnversioned(key roachpb.Key) error {
-	return p.clear(MVCCKey{Key: key})
+func (p *Pebble) ClearUnversioned(key roachpb.Key, opts ClearOptions) error {
+	return p.clear(MVCCKey{Key: key}, opts)
 }
 
 // ClearIntent implements the Engine interface.
-func (p *Pebble) ClearIntent(key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID) error {
-	_, err := p.wrappedIntentWriter.ClearIntent(key, txnDidNotUpdateMeta, txnUUID, nil)
+func (p *Pebble) ClearIntent(
+	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts ClearOptions,
+) error {
+	_, err := p.wrappedIntentWriter.ClearIntent(key, txnDidNotUpdateMeta, txnUUID, nil, opts)
 	return err
 }
 
 // ClearEngineKey implements the Engine interface.
-func (p *Pebble) ClearEngineKey(key EngineKey) error {
+func (p *Pebble) ClearEngineKey(key EngineKey, opts ClearOptions) error {
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
-	return p.db.Delete(key.Encode(), pebble.Sync)
+	if !opts.ValueSizeKnown || !p.settings.Version.ActiveVersionOrEmpty(context.TODO()).
+		IsActive(clusterversion.V23_2_UseSizedPebblePointTombstones) {
+		return p.db.Delete(key.Encode(), pebble.Sync)
+	}
+	return p.db.DeleteSized(key.Encode(), opts.ValueSize, pebble.Sync)
 }
 
-func (p *Pebble) clear(key MVCCKey) error {
+func (p *Pebble) clear(key MVCCKey, opts ClearOptions) error {
 	if len(key.Key) == 0 {
 		return emptyKeyError()
 	}
-	return p.db.Delete(EncodeMVCCKey(key), pebble.Sync)
+	if !opts.ValueSizeKnown || !p.settings.Version.ActiveVersionOrEmpty(context.TODO()).
+		IsActive(clusterversion.V23_2_UseSizedPebblePointTombstones) {
+		return p.db.Delete(EncodeMVCCKey(key), pebble.Sync)
+	}
+	// Use DeleteSized to propagate the value size.
+	return p.db.DeleteSized(EncodeMVCCKey(key), opts.ValueSize, pebble.Sync)
 }
 
 // SingleClearEngineKey implements the Engine interface.
@@ -1986,15 +2029,51 @@ func (p *Pebble) PreIngestDelay(ctx context.Context) {
 	preIngestDelay(ctx, p, p.settings)
 }
 
+// GetTableMetrics implements the Engine interface.
+func (p *Pebble) GetTableMetrics(start, end roachpb.Key) ([]enginepb.SSTableMetricsInfo, error) {
+	tableInfo, err := p.db.SSTables(pebble.WithKeyRangeFilter(start, end), pebble.WithProperties(), pebble.WithApproximateSpanBytes())
+
+	if err != nil {
+		return []enginepb.SSTableMetricsInfo{}, err
+	}
+
+	var totalTables int
+	for _, info := range tableInfo {
+		totalTables += len(info)
+	}
+
+	var metricsInfo []enginepb.SSTableMetricsInfo
+
+	for level, sstableInfos := range tableInfo {
+		for _, sstableInfo := range sstableInfos {
+			marshalTableInfo, err := json.Marshal(sstableInfo)
+
+			if err != nil {
+				return []enginepb.SSTableMetricsInfo{}, err
+			}
+
+			tableID := sstableInfo.TableInfo.FileNum
+			approximateSpanBytes, err := strconv.ParseUint(sstableInfo.Properties.UserProperties["approximate-span-bytes"], 10, 64)
+			if err != nil {
+				return []enginepb.SSTableMetricsInfo{}, err
+			}
+			metricsInfo = append(metricsInfo, enginepb.SSTableMetricsInfo{TableID: uint64(tableID), Level: int32(level), ApproximateSpanBytes: approximateSpanBytes, TableInfoJSON: marshalTableInfo})
+		}
+	}
+	return metricsInfo, nil
+}
+
 // ApproximateDiskBytes implements the Engine interface.
-func (p *Pebble) ApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
+func (p *Pebble) ApproximateDiskBytes(
+	from, to roachpb.Key,
+) (bytes, remoteBytes, externalBytes uint64, _ error) {
 	fromEncoded := EngineKey{Key: from}.Encode()
 	toEncoded := EngineKey{Key: to}.Encode()
-	count, err := p.db.EstimateDiskUsage(fromEncoded, toEncoded)
+	bytes, remoteBytes, externalBytes, err := p.db.EstimateDiskUsageByBackingType(fromEncoded, toEncoded)
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, err
 	}
-	return count, nil
+	return bytes, remoteBytes, externalBytes, nil
 }
 
 // Compact implements the Engine interface.
@@ -2113,6 +2192,12 @@ func (p *Pebble) SetMinVersion(version roachpb.Version) error {
 	var formatVers pebble.FormatMajorVersion
 	// Cases are ordered from newer to older versions.
 	switch {
+	case !version.Less(clusterversion.ByKey(clusterversion.V23_2_PebbleFormatVirtualSSTables)):
+		formatVers = pebble.ExperimentalFormatVirtualSSTables
+
+	case !version.Less(clusterversion.ByKey(clusterversion.V23_2_PebbleFormatDeleteSizedAndObsolete)):
+		formatVers = pebble.ExperimentalFormatDeleteSizedAndObsolete
+
 	case !version.Less(clusterversion.ByKey(clusterversion.V23_1EnableFlushableIngest)):
 		formatVers = pebble.FormatFlushableIngest
 
@@ -2358,21 +2443,21 @@ func (p *pebbleReadOnly) ApplyBatchRepr(repr []byte, sync bool) error {
 	panic("not implemented")
 }
 
-func (p *pebbleReadOnly) ClearMVCC(key MVCCKey) error {
+func (p *pebbleReadOnly) ClearMVCC(key MVCCKey, opts ClearOptions) error {
 	panic("not implemented")
 }
 
-func (p *pebbleReadOnly) ClearUnversioned(key roachpb.Key) error {
+func (p *pebbleReadOnly) ClearUnversioned(key roachpb.Key, opts ClearOptions) error {
 	panic("not implemented")
 }
 
 func (p *pebbleReadOnly) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts ClearOptions,
 ) error {
 	panic("not implemented")
 }
 
-func (p *pebbleReadOnly) ClearEngineKey(key EngineKey) error {
+func (p *pebbleReadOnly) ClearEngineKey(key EngineKey, opts ClearOptions) error {
 	panic("not implemented")
 }
 

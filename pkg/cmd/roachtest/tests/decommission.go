@@ -101,7 +101,7 @@ func registerDecommission(r registry.Registry) {
 			Owner:   registry.OwnerKV,
 			Cluster: r.MakeClusterSpec(numNodes),
 			Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-				runDecommissionMixedVersions(ctx, t, c, *t.BuildVersion())
+				runDecommissionMixedVersions(ctx, t, c, t.BuildVersion())
 			},
 		})
 	}
@@ -250,7 +250,7 @@ func runDecommission(
 
 		c.Start(ctx, t.L(), withDecommissionVMod(startOpts), install.MakeClusterSettings(), c.Node(i))
 	}
-	c.Run(ctx, c.Node(pinnedNode), `./workload init kv --drop`)
+	c.Run(ctx, c.Node(pinnedNode), fmt.Sprintf(`./workload init kv --drop {pgurl:%d}`, pinnedNode))
 
 	h := newDecommTestHelper(t, c)
 

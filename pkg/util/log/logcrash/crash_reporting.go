@@ -13,6 +13,7 @@ package logcrash
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
+	"github.com/cockroachdb/cockroach/pkg/util/must"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	sentry "github.com/getsentry/sentry-go"
@@ -263,7 +265,23 @@ func SetupCrashReporter(ctx context.Context, cmd string) {
 			"buildchannel": info.Channel,
 			"envchannel":   info.EnvChannel,
 		})
+
 	})
+}
+
+func getTagsFromEnvironment() map[string]string {
+	tags := map[string]string{}
+	rawTags := envutil.EnvOrDefaultString("COCKROACH_CRASH_REPORT_TAGS", "")
+	if len(rawTags) > 0 {
+		envTags := strings.Split(rawTags, ";")
+		for _, tag := range envTags {
+			parts := strings.Split(tag, "=")
+			if len(parts) == 2 {
+				tags[parts[0]] = parts[1]
+			}
+		}
+	}
+	return tags
 }
 
 func uptimeTag(now time.Time) string {
@@ -300,6 +318,9 @@ const (
 	// ReportTypeLogFatal signifies that this is an error report that
 	// was generated via a log.Fatal call.
 	ReportTypeLogFatal
+	// ReportTypeAssertionFailure signifies that an assertion was violated (see
+	// must package).
+	ReportTypeAssertionFailure
 )
 
 // sendCrashReport posts to sentry.
@@ -359,6 +380,8 @@ func SendReport(
 		event.Tags["report_type"] = "error"
 	case ReportTypeLogFatal:
 		event.Tags["report_type"] = "log_fatal"
+	case ReportTypeAssertionFailure:
+		event.Tags["report_type"] = "assertion"
 	}
 
 	for _, f := range tagFns {
@@ -391,7 +414,7 @@ func ReportOrPanic(
 	if !build.IsRelease() || (sv != nil && PanicOnAssertions.Get(sv)) {
 		panic(err)
 	}
-	log.Warningf(ctx, "%v", err)
+	log.Errorf(ctx, "%v", err)
 	sendCrashReport(ctx, sv, err, ReportTypeError)
 }
 
@@ -420,13 +443,18 @@ func RegisterTagFn(key string, value func(context.Context) string) {
 	tagFns = append(tagFns, tagFn{key, value})
 }
 
-func maybeSendCrashReport(ctx context.Context, err error) {
+func maybeSendCrashReport(ctx context.Context, err error, reportType ReportType) {
 	// We load the ReportingSettings from global singleton in this call path.
 	if sv := getGlobalSettings(); sv != nil {
-		sendCrashReport(ctx, sv, err, ReportTypeLogFatal)
+		sendCrashReport(ctx, sv, err, reportType)
 	}
 }
 
 func init() {
-	log.MaybeSendCrashReport = maybeSendCrashReport
+	log.MaybeSendCrashReport = func(ctx context.Context, err error) {
+		maybeSendCrashReport(ctx, err, ReportTypeLogFatal)
+	}
+	must.MaybeSendReport = func(ctx context.Context, err error) {
+		maybeSendCrashReport(ctx, err, ReportTypeAssertionFailure)
+	}
 }

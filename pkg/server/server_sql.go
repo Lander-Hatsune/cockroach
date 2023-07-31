@@ -41,8 +41,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangestats"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/obs"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -86,6 +88,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/flowinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/gcjob/gcjobnotifier"
 	"github.com/cockroachdb/cockroach/pkg/sql/idxusage"
+	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/optionalnodeliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/querycache"
@@ -208,6 +211,9 @@ type SQLServer struct {
 
 	// Tenant migration server for use in tenant tests.
 	migrationServer *TenantMigrationServer
+
+	// serviceMode is the service mode this server was started with.
+	serviceMode mtinfopb.TenantServiceMode
 }
 
 // sqlServerOptionalKVArgs are the arguments supplied to newSQLServer which are
@@ -256,6 +262,7 @@ type sqlServerOptionalKVArgs struct {
 type sqlServerOptionalTenantArgs struct {
 	tenantConnect      kvtenant.Connector
 	spanLimiterFactory spanLimiterFactory
+	serviceMode        mtinfopb.TenantServiceMode
 
 	promRuleExporter *metric.PrometheusRuleExporter
 }
@@ -889,13 +896,8 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	var isAvailable func(sqlInstanceID base.SQLInstanceID) bool
 	nodeLiveness, hasNodeLiveness := cfg.nodeLiveness.Optional(47900)
 	if hasNodeLiveness {
-		// TODO(erikgrinaker): We may want to use IsAvailableNotDraining instead, to
-		// avoid scheduling long-running flows (e.g. rangefeeds or backups) on nodes
-		// that are being drained/decommissioned. However, these nodes can still be
-		// leaseholders, and preventing processor scheduling on them can cause a
-		// performance cliff for e.g. table reads that then hit the network.
 		isAvailable = func(sqlInstanceID base.SQLInstanceID) bool {
-			return nodeLiveness.IsAvailable(roachpb.NodeID(sqlInstanceID))
+			return nodeLiveness.GetNodeVitalityFromCache(roachpb.NodeID(sqlInstanceID)).IsLive(livenesspb.DistSQL)
 		}
 	} else {
 		// We're on a SQL tenant, so this is the only node DistSQL will ever
@@ -907,40 +909,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 
 	// Setup the trace collector that is used to fetch inflight trace spans from
 	// all nodes in the cluster.
-	// The collector requires nodeliveness to get a list of all the nodes in the
-	// cluster.
-	var getNodes func(ctx context.Context) ([]roachpb.NodeID, error)
-	if isMixedSQLAndKVNode {
-		// TODO(dt): any reason not to just always use the instance reader? And just
-		// pass it directly instead of making a new closure here?
-		getNodes = func(ctx context.Context) ([]roachpb.NodeID, error) {
-			var ns []roachpb.NodeID
-			ls, err := nodeLiveness.GetLivenessesFromKV(ctx)
-			if err != nil {
-				return nil, err
-			}
-			for _, l := range ls {
-				if l.Membership.Decommissioned() {
-					continue
-				}
-				ns = append(ns, l.NodeID)
-			}
-			return ns, nil
-		}
-	} else {
-		getNodes = func(ctx context.Context) ([]roachpb.NodeID, error) {
-			instances, err := cfg.sqlInstanceReader.GetAllInstances(ctx)
-			if err != nil {
-				return nil, err
-			}
-			instanceIDs := make([]roachpb.NodeID, len(instances))
-			for i, instance := range instances {
-				instanceIDs[i] = roachpb.NodeID(instance.InstanceID)
-			}
-			return instanceIDs, err
-		}
-	}
-	traceCollector := collector.New(cfg.Tracer, getNodes, cfg.podNodeDialer)
+	traceCollector := collector.New(cfg.Tracer, cfg.sqlInstanceReader.GetAllInstances, cfg.podNodeDialer)
 	contentionMetrics := contention.NewMetrics()
 	cfg.registry.AddMetricStruct(contentionMetrics)
 
@@ -992,6 +961,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		TestingKnobs:              sqlExecutorTestingKnobs,
 		CompactEngineSpanFunc:     storageEngineClient.CompactEngineSpan,
 		CompactionConcurrencyFunc: storageEngineClient.SetCompactionConcurrency,
+		GetTableMetricsFunc:       storageEngineClient.GetTableMetrics,
 		TraceCollector:            traceCollector,
 		TenantUsageServer:         cfg.tenantUsageServer,
 		KVStoresIterator:          cfg.kvStoresIterator,
@@ -1417,6 +1387,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		cfg:                            cfg.BaseConfig,
 		internalDBMemMonitor:           internalDBMonitor,
 		upgradeManager:                 upgradeMgr,
+		serviceMode:                    cfg.serviceMode,
 	}, nil
 }
 
@@ -1432,6 +1403,9 @@ func (s *SQLServer) preStart(
 	// determined.
 	if s.tenantConnect != nil {
 		if err := s.tenantConnect.Start(ctx); err != nil {
+			return err
+		}
+		if err := s.startCheckService(ctx, stopper); err != nil {
 			return err
 		}
 	}
@@ -1719,6 +1693,69 @@ func (s *SQLServer) preStart(
 	return nil
 }
 
+// startCheckService verifies that the tenant has the right
+// service mode initially, then starts an async checker
+// to stop the server if the service mode changes.
+func (s *SQLServer) startCheckService(ctx context.Context, stopper *stop.Stopper) error {
+	if s.tenantConnect == nil {
+		return errors.AssertionFailedf("programming error: can only check service with a tenant connector")
+	}
+
+	var entry tenantcapabilities.Entry
+	var updateCh <-chan struct{}
+	check := func() error {
+		entry, updateCh = s.tenantConnect.TenantInfo()
+		return checkServerModeMatchesEntry(s.serviceMode, entry)
+	}
+
+	// Do a synchronous check, to prevent starting the SQL service
+	// outright if the service mode is initially incorrect.
+	if err := check(); err != nil {
+		return err
+	}
+
+	return stopper.RunAsyncTask(ctx, "check-tenant-service", func(ctx context.Context) {
+		for {
+			select {
+			case <-stopper.ShouldQuiesce():
+				return
+			case <-ctx.Done():
+				return
+			case <-updateCh:
+				if err := check(); err != nil {
+					s.stopTrigger.signalStop(ctx,
+						MakeShutdownRequest(ShutdownReasonFatalError, err))
+				}
+			}
+		}
+	})
+}
+
+func checkServerModeMatchesEntry(
+	expectedMode mtinfopb.TenantServiceMode, entry tenantcapabilities.Entry,
+) error {
+	if !entry.Ready() {
+		// At the version this check was introduced, the server was
+		// already modified to provide metadata during the initial
+		// handshake.
+		//
+		// If we don't have the metadata here, this means that the
+		// connector is talking to an older-version server.
+		return errors.AssertionFailedf("storage layer did not communicate metadata, is it running an older binary version than the client?")
+	}
+
+	if actualMode := entry.ServiceMode; expectedMode != actualMode {
+		return errors.Newf("service check failed: expected service mode %v, record says %v", expectedMode, actualMode)
+	}
+	// Extra sanity check. This should never happen (we should enforce
+	// a valid data state when the service mode is not NONE) but it's
+	// cheap to check.
+	if expected, actual := mtinfopb.DataStateReady, entry.DataState; expected != actual {
+		return errors.AssertionFailedf("service check failed: expected data state %v, record says %v", expected, actual)
+	}
+	return nil
+}
+
 // SQLInstanceID returns the ephemeral ID assigned to each SQL instance. The ID
 // is guaranteed to be unique across all currently running instances, but may be
 // reused once an instance is stopped.
@@ -1924,4 +1961,14 @@ func (s *SQLServer) LogicalClusterID() uuid.UUID {
 // the server to be shut down.
 func (s *SQLServer) ShutdownRequested() <-chan ShutdownRequest {
 	return s.stopTrigger.C()
+}
+
+// ExecutorConfig is an accessor for the executor config.
+func (s *SQLServer) ExecutorConfig() *sql.ExecutorConfig {
+	return s.execCfg
+}
+
+// InternalExecutor returns an executor for internal SQL queries.
+func (s *SQLServer) InternalExecutor() isql.Executor {
+	return s.internalExecutor
 }

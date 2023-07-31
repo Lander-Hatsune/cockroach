@@ -43,10 +43,9 @@ const elemName = "somestring"
 
 func TestTenantReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 101622, "flaky test")
 	defer log.Scope(t).Close(t)
 
-	rt := startReporterTest(t, base.TestTenantDisabled)
+	rt := startReporterTest(t, base.TestControlsTenantsExplicitly)
 	defer rt.Close()
 
 	tenantArgs := base.TestTenantArgs{
@@ -100,8 +99,7 @@ func TestServerReport(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	var defaultTestTenant base.DefaultTestTenantOptions
-	rt := startReporterTest(t, defaultTestTenant)
+	rt := startReporterTest(t, base.TestIsSpecificToStorageLayerAndNeedsASystemTenant)
 	defer rt.Close()
 
 	ctx := context.Background()
@@ -300,7 +298,6 @@ func TestUsageQuantization(t *testing.T) {
 		},
 	})
 	defer s.Stopper().Stop(ctx)
-	ts := s.(*server.TestServer)
 
 	// Disable periodic reporting so it doesn't interfere with the test.
 	if _, err := db.Exec(`SET CLUSTER SETTING diagnostics.reporting.enabled = false`); err != nil {
@@ -331,6 +328,8 @@ func TestUsageQuantization(t *testing.T) {
 		_, err := db.Exec(`SHOW application_name`)
 		require.NoError(t, err)
 	}
+
+	ts := s.ApplicationLayer()
 
 	// Flush the SQL stat pool.
 	ts.SQLServer().(*sql.Server).GetSQLStatsController().ResetLocalSQLStats(ctx)

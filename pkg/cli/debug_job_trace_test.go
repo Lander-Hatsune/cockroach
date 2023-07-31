@@ -45,6 +45,10 @@ func (r *traceSpanResumer) ForceRealSpan() bool {
 	return true
 }
 
+func (r *traceSpanResumer) DumpTraceAfterRun() bool {
+	return true
+}
+
 type traceSpanResumer struct {
 	ctx               context.Context
 	recordedSpanCh    chan struct{}
@@ -120,7 +124,7 @@ func TestDebugJobTrace(t *testing.T) {
 	<-recordedSpanCh
 
 	args := []string{strconv.Itoa(int(id))}
-	pgURL, cleanup := sqlutils.PGUrl(t, c.TestServer.ServingSQLAddr(),
+	pgURL, cleanup := sqlutils.PGUrl(t, c.TestServer.AdvSQLAddr(),
 		"TestDebugJobTrace", url.User(username.RootUser))
 	defer cleanup()
 

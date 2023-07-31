@@ -40,7 +40,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
+	"github.com/cockroachdb/cockroach/pkg/server/srvtestutils"
 	"github.com/cockroachdb/cockroach/pkg/server/status/statuspb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -61,7 +63,7 @@ import (
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/gogo/protobuf/proto"
 	"github.com/grpc-ecosystem/grpc-gateway/runtime"
-	"github.com/jackc/pgx/v4"
+	pgx "github.com/jackc/pgx/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -73,10 +75,8 @@ import (
 func TestSelfBootstrap(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{})
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 
 	if s.RPCContext().StorageClusterID.Get() == uuid.Nil {
@@ -86,10 +86,9 @@ func TestSelfBootstrap(t *testing.T) {
 
 func TestPanicRecovery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
+	defer log.ScopeWithoutShowLogs(t).Close(t)
 
-	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{})
-	require.NoError(t, err)
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
@@ -99,7 +98,7 @@ func TestPanicRecovery(t *testing.T) {
 	}))
 
 	// Create a request.
-	req, err := http.NewRequest(http.MethodGet, ts.AdminURL()+"/panic", nil /* body */)
+	req, err := http.NewRequest(http.MethodGet, ts.AdminURL().WithPath("/panic").String(), nil /* body */)
 	require.NoError(t, err)
 
 	// Create a ResponseRecorder to record the response.
@@ -129,16 +128,13 @@ func TestHealthCheck(t *testing.T) {
 
 	cfg := zonepb.DefaultZoneConfig()
 	cfg.NumReplicas = proto.Int32(1)
-	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Server: &TestingKnobs{
 				DefaultZoneConfigOverride: &cfg,
 			},
 		},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer s.Stopper().Stop(context.Background())
 
 	ctx := context.Background()
@@ -216,7 +212,7 @@ func TestServerStartClock(t *testing.T) {
 			},
 		},
 	}
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(context.Background())
 
 	// Run a command so that we are sure to touch the timestamp cache. This is
@@ -244,7 +240,7 @@ func TestServerStartClock(t *testing.T) {
 func TestPlainHTTPServer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		// The default context uses embedded certs.
 		Insecure: true,
 	})
@@ -254,14 +250,14 @@ func TestPlainHTTPServer(t *testing.T) {
 	// still works in insecure mode.
 	var data serverpb.JSONResponse
 	testutils.SucceedsSoon(t, func() error {
-		return getStatusJSONProto(s, "metrics/local", &data)
+		return srvtestutils.GetStatusJSONProto(s, "metrics/local", &data)
 	})
 
 	// Now make a couple of direct requests using both http and https.
 	// They won't succeed because we're not jumping through
 	// authentication hoops, but they verify that the server is using
 	// the correct protocol.
-	url := s.AdminURL()
+	url := s.AdminURL().String()
 	if !strings.HasPrefix(url, "http://") {
 		t.Fatalf("expected insecure admin url to start with http://, but got %s", url)
 	}
@@ -290,7 +286,7 @@ func TestPlainHTTPServer(t *testing.T) {
 func TestSecureHTTPRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	ts := s.(*TestServer)
 
@@ -341,7 +337,7 @@ func TestSecureHTTPRedirect(t *testing.T) {
 func TestAcceptEncoding(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	client, err := s.GetAdminHTTPClient()
 	if err != nil {
@@ -372,7 +368,7 @@ func TestAcceptEncoding(t *testing.T) {
 	}
 	for _, d := range testData {
 		func() {
-			req, err := http.NewRequest("GET", s.AdminURL()+statusPrefix+"metrics/local", nil)
+			req, err := http.NewRequest("GET", s.AdminURL().WithPath(apiconstants.StatusPrefix+"metrics/local").String(), nil)
 			if err != nil {
 				t.Fatalf("could not create request: %s", err)
 			}
@@ -419,14 +415,11 @@ func TestListenerFileCreation(t *testing.T) {
 	dir, cleanupFn := testutils.TempDir(t)
 	defer cleanupFn()
 
-	s, err := serverutils.StartServerRaw(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		StoreSpecs: []base.StoreSpec{{
 			Path: dir,
 		}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer s.Stopper().Stop(context.Background())
 
 	files, err := filepath.Glob(filepath.Join(dir, "cockroach.*"))
@@ -436,9 +429,9 @@ func TestListenerFileCreation(t *testing.T) {
 
 	li := listenerInfo{
 		listenRPC:    s.RPCAddr(),
-		advertiseRPC: s.ServingRPCAddr(),
+		advertiseRPC: s.AdvRPCAddr(),
 		listenSQL:    s.SQLAddr(),
-		advertiseSQL: s.ServingSQLAddr(),
+		advertiseSQL: s.AdvSQLAddr(),
 		listenHTTP:   s.HTTPAddr(),
 	}
 	expectedFiles := li.Iter()
@@ -482,9 +475,8 @@ func TestClusterIDMismatch(t *testing.T) {
 			StoreID:   roachpb.StoreID(i + 1),
 		}
 		if err := storage.MVCCPutProto(
-			context.Background(), e, nil, keys.StoreIdentKey(), hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &sIdent,
+			context.Background(), e, keys.StoreIdentKey(), hlc.Timestamp{}, &sIdent, storage.MVCCWriteOptions{},
 		); err != nil {
-
 			t.Fatal(err)
 		}
 		engines[i] = e
@@ -754,7 +746,7 @@ func TestServeIndexHTML(t *testing.T) {
 	}
 
 	t.Run("Insecure mode", func(t *testing.T) {
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{
 			Insecure: true,
 		})
 		defer s.Stopper().Stop(ctx)
@@ -764,7 +756,7 @@ func TestServeIndexHTML(t *testing.T) {
 		require.NoError(t, err)
 
 		t.Run("short build", func(t *testing.T) {
-			resp, err := client.Get(s.AdminURL())
+			resp, err := client.Get(s.AdminURL().String())
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, 200, resp.StatusCode)
@@ -773,19 +765,24 @@ func TestServeIndexHTML(t *testing.T) {
 			require.NoError(t, err)
 
 			respString := string(respBytes)
+			// Since server test package links ccl, build.GetInfo() says that we
+			// think we're using CCL distribution (even though this test file is
+			// in `server` and not in `server_test`). However, serverutils
+			// doesn't link ccl, so it says it uses OSS distribution. Reconcile
+			// this mismatch.
+			buildInfo := strings.Replace(build.GetInfo().Short(), "CockroachDB CCL", "CockroachDB OSS", 1)
 			expected := fmt.Sprintf(`<!DOCTYPE html>
 <title>CockroachDB</title>
 Binary built without web UI.
 <hr>
-<em>%s</em>`,
-				build.GetInfo().Short())
+<em>%s</em>`, buildInfo)
 			require.Equal(t, expected, respString)
 		})
 
 		t.Run("non-short build", func(t *testing.T) {
 			linkInFakeUI()
 			defer unlinkFakeUI()
-			resp, err := client.Get(s.AdminURL())
+			resp, err := client.Get(s.AdminURL().String())
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, 200, resp.StatusCode)
@@ -796,7 +793,7 @@ Binary built without web UI.
 			respString := string(respBytes)
 			require.Equal(t, htmlTemplate, respString)
 
-			resp, err = client.Get(s.AdminURL() + "/uiconfig")
+			resp, err = client.Get(s.AdminURL().WithPath("/uiconfig").String())
 			require.NoError(t, err)
 			defer resp.Body.Close()
 			require.Equal(t, 200, resp.StatusCode)
@@ -804,7 +801,7 @@ Binary built without web UI.
 			respBytes, err = io.ReadAll(resp.Body)
 			require.NoError(t, err)
 			expected := fmt.Sprintf(
-				`{"Insecure":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false}`,
+				`{"Insecure":true,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"Log in with your OIDC provider","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false}`,
 				build.GetInfo().Tag,
 				build.BinaryVersionPrefix(),
 				1,
@@ -816,7 +813,7 @@ Binary built without web UI.
 	t.Run("Secure mode", func(t *testing.T) {
 		linkInFakeUI()
 		defer unlinkFakeUI()
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 		defer s.Stopper().Stop(ctx)
 		tsrv := s.(*TestServer)
 
@@ -832,7 +829,7 @@ Binary built without web UI.
 			{
 				loggedInClient,
 				fmt.Sprintf(
-					`{"Insecure":false,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false}`,
+					`{"Insecure":false,"LoggedInUser":"authentic_user","Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"Log in with your OIDC provider","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false}`,
 					build.GetInfo().Tag,
 					build.BinaryVersionPrefix(),
 					1,
@@ -841,7 +838,7 @@ Binary built without web UI.
 			{
 				loggedOutClient,
 				fmt.Sprintf(
-					`{"Insecure":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false}`,
+					`{"Insecure":false,"LoggedInUser":null,"Tag":"%s","Version":"%s","NodeID":"%d","OIDCAutoLogin":false,"OIDCLoginEnabled":false,"OIDCButtonText":"Log in with your OIDC provider","FeatureFlags":{"can_view_kv_metric_dashboards":true},"OIDCGenerateJWTAuthTokenEnabled":false}`,
 					build.GetInfo().Tag,
 					build.BinaryVersionPrefix(),
 					1,
@@ -851,7 +848,7 @@ Binary built without web UI.
 
 		for i, testCase := range cases {
 			t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-				req, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL(), nil)
+				req, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL().String(), nil)
 				require.NoError(t, err)
 
 				resp, err := testCase.client.Do(req)
@@ -865,7 +862,7 @@ Binary built without web UI.
 				respString := string(respBytes)
 				require.Equal(t, htmlTemplate, respString)
 
-				req, err = http.NewRequestWithContext(ctx, "GET", s.AdminURL()+"/uiconfig", nil)
+				req, err = http.NewRequestWithContext(ctx, "GET", s.AdminURL().WithPath("/uiconfig").String(), nil)
 				require.NoError(t, err)
 
 				resp, err = testCase.client.Do(req)
@@ -899,7 +896,7 @@ Binary built without web UI.
 			ui.Assets = nil
 		}()
 
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 		defer s.Stopper().Stop(ctx)
 		tsrv := s.(*TestServer)
 
@@ -925,7 +922,7 @@ Binary built without web UI.
 		for _, testCase := range cases {
 			t.Run(fmt.Sprintf("bundle caching for %s", testCase.desc), func(t *testing.T) {
 				// Request bundle.js without an If-None-Match header first, to simulate the initial load
-				uncachedReq, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL()+"/bundle.js", nil)
+				uncachedReq, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL().WithPath("/bundle.js").String(), nil)
 				require.NoError(t, err)
 
 				uncachedResp, err := testCase.client.Do(uncachedReq)
@@ -937,7 +934,7 @@ Binary built without web UI.
 				require.NotEmpty(t, etag, "Server must provide ETag response header with asset responses")
 
 				// Use that ETag header on the next request to simulate a client reload
-				cachedReq, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL()+"/bundle.js", nil)
+				cachedReq, err := http.NewRequestWithContext(ctx, "GET", s.AdminURL().WithPath("/bundle.js").String(), nil)
 				require.NoError(t, err)
 				cachedReq.Header.Add("If-None-Match", etag)
 
@@ -1057,8 +1054,7 @@ func TestSQLDecommissioned(t *testing.T) {
 		require.True(t, ok, "expected gRPC status error, got %T: %s", err, err)
 		require.Equal(t, codes.PermissionDenied, s.Code())
 
-		sqlClient, err := serverutils.OpenDBConnE(decomSrv.ServingSQLAddr(), "", true, tc.Stopper())
-		require.NoError(t, err)
+		sqlClient := decomSrv.SQLConn(t, "")
 
 		var result int
 		err = sqlClient.QueryRow("SELECT 1").Scan(&result)
@@ -1081,8 +1077,8 @@ func TestAssertEnginesEmpty(t *testing.T) {
 
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
-	require.NoError(t, storage.MVCCPutProto(ctx, eng, nil, keys.DeprecatedStoreClusterVersionKey(),
-		hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}))
+	require.NoError(t, storage.MVCCPutProto(ctx, eng, keys.DeprecatedStoreClusterVersionKey(),
+		hlc.Timestamp{}, &roachpb.Version{Major: 21, Minor: 1, Internal: 122}, storage.MVCCWriteOptions{}))
 	require.NoError(t, assertEnginesEmpty([]storage.Engine{eng}))
 
 	batch := eng.NewBatch()
@@ -1201,7 +1197,7 @@ func TestSocketAutoNumbering(t *testing.T) {
 		Insecure:   true,
 		SocketFile: socketFile,
 	}
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(ctx)
 
 	_, expectedPort, err := addr.SplitHostPort(s.SQLAddr(), "")
@@ -1217,7 +1213,7 @@ func TestInternalSQL(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	conf, err := pgx.ParseConfig("")

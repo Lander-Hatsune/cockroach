@@ -92,6 +92,13 @@ func (so *DummySequenceOperators) GetLatestValueInSessionForSequenceByID(
 	return 0, errors.WithStack(errSequenceOperators)
 }
 
+// GetLastSequenceValueByID implements the eval.SequenceOperators interface.
+func (so *DummySequenceOperators) GetLastSequenceValueByID(
+	ctx context.Context, seqID uint32,
+) (int64, bool, error) {
+	return 0, false, errors.WithStack(errSequenceOperators)
+}
+
 // SetSequenceValueByID implements the eval.SequenceOperators interface.
 func (so *DummySequenceOperators) SetSequenceValueByID(
 	ctx context.Context, seqID uint32, newVal int64, isCalled bool,
@@ -448,7 +455,7 @@ func (ep *DummyEvalPlanner) ResolveFunction(
 // ResolveFunctionByOID implements FunctionReferenceResolver interface.
 func (ep *DummyEvalPlanner) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (*tree.FunctionName, *tree.Overload, error) {
+) (*tree.RoutineName, *tree.Overload, error) {
 	return nil, nil, errors.AssertionFailedf("ResolveFunctionByOID unimplemented")
 }
 
@@ -578,6 +585,11 @@ var _ eval.ClientNoticeSender = &DummyClientNoticeSender{}
 
 // BufferClientNotice is part of the eval.ClientNoticeSender interface.
 func (c *DummyClientNoticeSender) BufferClientNotice(context.Context, pgnotice.Notice) {}
+
+// SendClientNotice is part of the eval.ClientNoticeSender interface.
+func (c *DummyClientNoticeSender) SendClientNotice(context.Context, pgnotice.Notice) error {
+	return nil
+}
 
 // DummyTenantOperator implements the tree.TenantOperator interface.
 type DummyTenantOperator struct{}

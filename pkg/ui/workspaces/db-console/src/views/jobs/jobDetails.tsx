@@ -16,23 +16,39 @@ import { connect } from "react-redux";
 import { RouteComponentProps, withRouter } from "react-router-dom";
 import {
   createSelectorForKeyedCachedDataField,
+  refreshListExecutionDetailFiles,
   refreshJob,
 } from "src/redux/apiReducers";
 import { AdminUIState } from "src/redux/state";
+import { ListJobProfilerExecutionDetailsResponseMessage } from "src/util/api";
+import { api as clusterUiApi } from "@cockroachlabs/cluster-ui";
 
 const selectJob = createSelectorForKeyedCachedDataField("job", selectID);
-
+const selectExecutionDetailFiles =
+  createSelectorForKeyedCachedDataField<ListJobProfilerExecutionDetailsResponseMessage>(
+    "jobProfiler",
+    selectID,
+  );
 const mapStateToProps = (
   state: AdminUIState,
   props: RouteComponentProps,
 ): JobDetailsStateProps => {
+  const jobID = selectID(state, props);
   return {
     jobRequest: selectJob(state, props),
+    jobProfilerExecutionDetailFilesResponse: selectExecutionDetailFiles(
+      state,
+      props,
+    ),
+    jobProfilerLastUpdated: state.cachedData.jobProfiler[jobID]?.setAt,
+    jobProfilerDataIsValid: state.cachedData.jobProfiler[jobID]?.valid,
+    onDownloadExecutionFileClicked: clusterUiApi.getExecutionDetailFile,
   };
 };
 
 const mapDispatchToProps = {
   refreshJob,
+  refreshExecutionDetailFiles: refreshListExecutionDetailFiles,
 };
 
 export default withRouter(

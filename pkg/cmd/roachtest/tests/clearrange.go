@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
-	"github.com/cockroachdb/cockroach/pkg/util/version"
 )
 
 func registerClearRange(r registry.Registry) {
@@ -42,26 +41,24 @@ func registerClearRange(r registry.Registry) {
 					runClearRange(ctx, t, c, checks, rangeTombstones)
 				},
 			})
-
-			// Using a separate clearrange test on zfs instead of randomly
-			// using the same test, cause the Timeout might be different,
-			// and may need to be tweaked.
-			r.Add(registry.TestSpec{
-				Name:  fmt.Sprintf(`clearrange/zfs/checks=%t/rangeTs=%t`, checks, rangeTombstones),
-				Skip:  "Consistently failing. See #68716 context.",
-				Owner: registry.OwnerStorage,
-				// 5h for import, 120 for the test. The import should take closer
-				// to <3:30h but it varies.
-				Timeout:           5*time.Hour + 120*time.Minute,
-				Cluster:           r.MakeClusterSpec(10, spec.CPU(16), spec.SetFileSystem(spec.Zfs)),
-				EncryptionSupport: registry.EncryptionMetamorphic,
-				Leases:            registry.MetamorphicLeases,
-				Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
-					runClearRange(ctx, t, c, checks, rangeTombstones)
-				},
-			})
 		}
 	}
+	// Using a separate clearrange test on zfs instead of randomly
+	// using the same test, cause the Timeout might be different,
+	// and may need to be tweaked.
+	r.Add(registry.TestSpec{
+		Name:  `clearrange/zfs/checks=true/rangeTs=true`,
+		Owner: registry.OwnerStorage,
+		// 5h for import, 120 for the test. The import should take closer
+		// to <3:30h but it varies.
+		Timeout:           5*time.Hour + 120*time.Minute,
+		Cluster:           r.MakeClusterSpec(10, spec.CPU(16), spec.SetFileSystem(spec.Zfs)),
+		EncryptionSupport: registry.EncryptionMetamorphic,
+		Leases:            registry.MetamorphicLeases,
+		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
+			runClearRange(ctx, t, c, true /* checks */, true /* rangeTombstones */)
+		},
+	})
 }
 
 func runClearRange(
@@ -110,14 +107,6 @@ func runClearRange(
 	// the  cluster still works.
 	t.Status(`restoring tiny table`)
 	defer t.WorkerStatus()
-
-	if t.BuildVersion().AtLeast(version.MustParse("v19.2.0")) {
-		conn := c.Conn(ctx, t.L(), 1)
-		if _, err := conn.ExecContext(ctx, `SET CLUSTER SETTING kv.bulk_io_write.concurrent_addsstable_requests = 8`); err != nil {
-			t.Fatal(err)
-		}
-		conn.Close()
-	}
 
 	// Use a 120s connect timeout to work around the fact that the server will
 	// declare itself ready before it's actually 100% ready. See:

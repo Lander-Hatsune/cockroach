@@ -28,6 +28,7 @@ type (
 	TestPlan struct {
 		initialVersion string
 		finalVersion   string
+		startClusterID int
 		steps          []testStep
 	}
 
@@ -35,9 +36,11 @@ type (
 	// a test plan from the given rng and user-provided hooks.
 	testPlanner struct {
 		stepCount      int
+		startClusterID int
 		initialVersion string
 		crdbNodes      option.NodeListOption
 		rt             test.Test
+		options        testOptions
 		hooks          *testHooks
 		prng           *rand.Rand
 		bgChans        []shouldStop
@@ -55,8 +58,8 @@ const (
 // testPlanner field. Currently, the test will always follow the
 // following high level outline:
 //
-//   - start all nodes in the cluster from the predecessor version,
-//     using fixtures.
+//   - start all nodes in the cluster from a random predecessor version,
+//     maybe using fixtures.
 //   - set `preserve_downgrade_option`.
 //   - run startup hooks.
 //   - upgrade all nodes to the current cockroach version (running
@@ -72,7 +75,6 @@ const (
 //
 // TODO(renato): further opportunities for random exploration:
 // - going back multiple releases instead of just one
-// - picking a patch release randomly instead of just the latest release
 // - inserting arbitrary delays (`sleep` calls) during the test.
 func (p *testPlanner) Plan() *TestPlan {
 	var steps []testStep
@@ -94,6 +96,7 @@ func (p *testPlanner) Plan() *TestPlan {
 	return &TestPlan{
 		initialVersion: p.initialVersion,
 		finalVersion:   versionMsg(clusterupgrade.MainVersion),
+		startClusterID: p.startClusterID,
 		steps:          steps,
 	}
 }
@@ -120,12 +123,21 @@ func (p *testPlanner) finalContext(finalizing bool) Context {
 // upgrading/downgrading. It will also run any startup hooks the user
 // may have provided.
 func (p *testPlanner) initSteps() []testStep {
-	return append([]testStep{
-		startFromCheckpointStep{id: p.nextID(), version: p.initialVersion, rt: p.rt, crdbNodes: p.crdbNodes},
-		uploadCurrentVersionStep{id: p.nextID(), rt: p.rt, crdbNodes: p.crdbNodes, dest: CurrentCockroachPath},
-		waitForStableClusterVersionStep{id: p.nextID(), nodes: p.crdbNodes},
-		preserveDowngradeOptionStep{id: p.nextID(), prng: p.newRNG(), crdbNodes: p.crdbNodes},
-	}, p.hooks.StartupSteps(p.nextID, p.initialContext())...)
+	var steps []testStep
+	if p.prng.Float64() < p.options.useFixturesProbability {
+		steps = []testStep{installFixturesStep{id: p.nextID(), version: p.initialVersion, crdbNodes: p.crdbNodes}}
+	}
+	p.startClusterID = p.nextID()
+	steps = append(steps, startStep{id: p.startClusterID, version: p.initialVersion, rt: p.rt, crdbNodes: p.crdbNodes})
+
+	return append(
+		append(steps,
+			uploadCurrentVersionStep{id: p.nextID(), rt: p.rt, crdbNodes: p.crdbNodes, dest: CurrentCockroachPath},
+			waitForStableClusterVersionStep{id: p.nextID(), nodes: p.crdbNodes, timeout: p.options.upgradeTimeout},
+			preserveDowngradeOptionStep{id: p.nextID(), prng: p.newRNG(), crdbNodes: p.crdbNodes},
+		),
+		p.hooks.StartupSteps(p.nextID, p.initialContext())...,
+	)
 }
 
 // finalSteps are the steps to be run once the nodes have been
@@ -134,7 +146,7 @@ func (p *testPlanner) initSteps() []testStep {
 // user may have provided.
 func (p *testPlanner) finalSteps() []testStep {
 	return append([]testStep{
-		waitForStableClusterVersionStep{id: p.nextID(), nodes: p.crdbNodes},
+		waitForStableClusterVersionStep{id: p.nextID(), nodes: p.crdbNodes, timeout: p.options.upgradeTimeout},
 	}, p.hooks.AfterUpgradeFinalizedSteps(p.nextID, p.finalContext(false /* finalizing */))...)
 }
 

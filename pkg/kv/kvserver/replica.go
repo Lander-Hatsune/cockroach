@@ -181,6 +181,34 @@ type raftSparseStatus struct {
 	Progress map[uint64]tracker.Progress
 }
 
+// ReplicaMutex is an RWMutex. It has its own type to make it easier to look for
+// usages specific to the replica mutex.
+type ReplicaMutex syncutil.RWMutex
+
+func (mu *ReplicaMutex) Lock() {
+	(*syncutil.RWMutex)(mu).Lock()
+}
+
+func (mu *ReplicaMutex) Unlock() {
+	(*syncutil.RWMutex)(mu).Unlock()
+}
+
+func (mu *ReplicaMutex) RLock() {
+	(*syncutil.RWMutex)(mu).RLock()
+}
+
+func (mu *ReplicaMutex) AssertHeld() {
+	(*syncutil.RWMutex)(mu).AssertHeld()
+}
+
+func (mu *ReplicaMutex) AssertRHeld() {
+	(*syncutil.RWMutex)(mu).AssertRHeld()
+}
+
+func (mu *ReplicaMutex) RUnlock() {
+	(*syncutil.RWMutex)(mu).RUnlock()
+}
+
 // A Replica is a contiguous keyspace with writes managed via an
 // instance of the Raft consensus algorithm. Many ranges may exist
 // in a store and they are unlikely to be contiguous. Ranges are
@@ -386,7 +414,7 @@ type Replica struct {
 
 	mu struct {
 		// Protects all fields in the mu struct.
-		syncutil.RWMutex
+		ReplicaMutex
 		// The destroyed status of a replica indicating if it's alive, corrupt,
 		// scheduled for destruction or has been GCed.
 		// destroyStatus should only be set while also holding the raftMu and
@@ -686,7 +714,10 @@ type Replica struct {
 		// raftMu and the entire handleRaftReady loop. Not needed if raftMu is
 		// already held.
 		applyingEntries bool
-		// The replica's Raft group "node".
+		// The replica's Raft group "node". Can be nil for destroyed replicas
+		// (destroyReasonRemoved) and in some tests, otherwise is never nil.
+		//
+		// TODO(erikgrinaker): make this never be nil.
 		internalRaftGroup *raft.RawNode
 
 		// The ID of the leader replica within the Raft group. NB: this is updated
@@ -1405,7 +1436,7 @@ func (r *Replica) GetLastReplicaGCTimestamp(ctx context.Context) (hlc.Timestamp,
 func (r *Replica) setLastReplicaGCTimestamp(ctx context.Context, timestamp hlc.Timestamp) error {
 	key := keys.RangeLastReplicaGCTimestampKey(r.RangeID)
 	return storage.MVCCPutProto(
-		ctx, r.store.TODOEngine(), nil, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &timestamp)
+		ctx, r.store.TODOEngine(), key, hlc.Timestamp{}, &timestamp, storage.MVCCWriteOptions{})
 }
 
 // getQueueLastProcessed returns the last processed timestamp for the
@@ -2305,7 +2336,8 @@ func (r *Replica) GetEngineCapacity() (roachpb.StoreCapacity, error) {
 // GetApproximateDiskBytes returns an approximate measure of bytes in the store
 // in the specified key range.
 func (r *Replica) GetApproximateDiskBytes(from, to roachpb.Key) (uint64, error) {
-	return r.store.TODOEngine().ApproximateDiskBytes(from, to)
+	bytes, _, _, err := r.store.TODOEngine().ApproximateDiskBytes(from, to)
+	return bytes, err
 }
 
 func init() {

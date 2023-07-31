@@ -66,7 +66,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
-	"github.com/cockroachdb/pebble/objstorage/shared"
+	"github.com/cockroachdb/pebble/objstorage/remote"
 	"github.com/cockroachdb/pebble/tool"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/ttycolor"
@@ -936,7 +936,7 @@ func runDebugCompact(cmd *cobra.Command, args []string) error {
 	}
 
 	{
-		approxBytesBefore, err := db.ApproximateDiskBytes(roachpb.KeyMin, roachpb.KeyMax)
+		approxBytesBefore, _, _, err := db.ApproximateDiskBytes(roachpb.KeyMin, roachpb.KeyMax)
 		if err != nil {
 			return errors.Wrap(err, "while computing approximate size before compaction")
 		}
@@ -966,7 +966,7 @@ func runDebugCompact(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s\n", db.GetMetrics())
 
 	{
-		approxBytesAfter, err := db.ApproximateDiskBytes(roachpb.KeyMin, roachpb.KeyMax)
+		approxBytesAfter, _, _, err := db.ApproximateDiskBytes(roachpb.KeyMin, roachpb.KeyMax)
 		if err != nil {
 			return errors.Wrap(err, "while computing approximate size after compaction")
 		}
@@ -1556,18 +1556,18 @@ func initPebbleCmds(cmd *cobra.Command, pebbleTool *tool.T) {
 					return err
 				}
 				wrapper := storage.MakeExternalStorageWrapper(context.Background(), es)
-				factory := shared.MakeSimpleFactory(map[shared.Locator]shared.Storage{
+				factory := remote.MakeSimpleFactory(map[remote.Locator]remote.Storage{
 					"": wrapper,
 				})
 				pebbleTool.ConfigureSharedStorage(factory, true /* createOnShared */, "" /* createOnSharedLocator */)
 			}
-			return pebbleCryptoInitializer()
+			return pebbleCryptoInitializer(cmd.Context())
 		}
 		initPebbleCmds(c, pebbleTool)
 	}
 }
 
-func pebbleCryptoInitializer() error {
+func pebbleCryptoInitializer(ctx context.Context) error {
 	storageConfig := base.StorageConfig{
 		Settings: serverCfg.Settings,
 		Dir:      serverCfg.Stores.Specs[0].Path,
@@ -1579,7 +1579,8 @@ func pebbleCryptoInitializer() error {
 		}
 	}
 
-	_, encryptedEnv, err := storage.ResolveEncryptedEnvOptions(&storageConfig, vfs.Default, false /* readOnly */)
+	_, encryptedEnv, err := storage.ResolveEncryptedEnvOptions(
+		ctx, &storageConfig, vfs.Default, false /* readOnly */)
 	if err != nil {
 		return err
 	}

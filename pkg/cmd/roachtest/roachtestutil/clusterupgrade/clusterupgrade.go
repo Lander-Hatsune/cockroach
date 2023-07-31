@@ -27,6 +27,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/version"
+	"github.com/cockroachdb/errors"
 )
 
 const (
@@ -81,33 +82,35 @@ func UploadVersion(
 	nodes option.NodeListOption,
 	newVersion string,
 ) (string, error) {
-	binaryName := "./cockroach"
-	if newVersion == MainVersion {
-		if err := c.PutE(ctx, l, t.Cockroach(), binaryName, nodes); err != nil {
-			return "", err
-		}
-	} else if binary, ok := t.VersionsBinaryOverride()[newVersion]; ok {
-		// If an override has been specified for newVersion, use that binary.
-		l.Printf("using binary override for version %s: %s", newVersion, binary)
-		binaryName = "./cockroach-" + newVersion
-		if err := c.PutE(ctx, l, binary, binaryName, nodes); err != nil {
+	dstBinary := BinaryPathForVersion(t, newVersion)
+	srcBinary := t.Cockroach()
+
+	overrideBinary, isOverriden := t.VersionsBinaryOverride()[newVersion]
+	if isOverriden {
+		l.Printf("using binary override for version %s: %s", newVersion, overrideBinary)
+		srcBinary = overrideBinary
+	}
+
+	if newVersion == MainVersion || isOverriden {
+		if err := c.PutE(ctx, l, srcBinary, dstBinary, nodes); err != nil {
 			return "", err
 		}
 	} else {
 		v := "v" + newVersion
-		dir := v
-		binaryName = filepath.Join(dir, "cockroach")
+		dir := filepath.Dir(dstBinary)
+
 		// Check if the cockroach binary already exists.
-		if err := c.RunE(ctx, nodes, "test", "-e", binaryName); err != nil {
-			if err := c.RunE(ctx, nodes, "mkdir", "-p", dir); err != nil {
-				return "", err
-			}
-			if err := c.Stage(ctx, l, "release", v, dir, nodes); err != nil {
-				return "", err
-			}
+		cmd := fmt.Sprintf("test -e %s || mkdir -p %s", dstBinary, dir)
+		if err := c.RunE(ctx, nodes, cmd); err != nil {
+			return "", err
+		}
+
+		if err := c.Stage(ctx, l, "release", v, dir, nodes); err != nil {
+			return "", err
 		}
 	}
-	return BinaryPathFromVersion(newVersion), nil
+
+	return dstBinary, nil
 }
 
 // InstallFixtures copies the previously created fixtures (in
@@ -117,7 +120,10 @@ func UploadVersion(
 func InstallFixtures(
 	ctx context.Context, l *logger.Logger, c cluster.Cluster, nodes option.NodeListOption, v string,
 ) error {
-	c.Run(ctx, nodes, "mkdir -p {store-dir}")
+	if err := c.RunE(ctx, nodes, "mkdir -p {store-dir}"); err != nil {
+		return fmt.Errorf("creating store-dir: %w", err)
+	}
+
 	vv := version.MustParse("v" + v)
 	// The fixtures use cluster version (major.minor) but the input might be
 	// a patch release.
@@ -133,7 +139,10 @@ func InstallFixtures(
 		}
 	}
 	// Extract fixture. Fail if there's already an LSM in the store dir.
-	c.Run(ctx, nodes, "ls {store-dir}/marker.* 1> /dev/null 2>&1 && exit 1 || (cd {store-dir} && tar -xf fixture.tgz)")
+	if err := c.RunE(ctx, nodes, "ls {store-dir}/marker.* 1> /dev/null 2>&1 && exit 1 || (cd {store-dir} && tar -xf fixture.tgz)"); err != nil {
+		return fmt.Errorf("extracting fixtures: %w", err)
+	}
+
 	return nil
 }
 
@@ -151,14 +160,19 @@ func StartWithSettings(
 	return c.StartE(ctx, l, startOpts, settings, nodes)
 }
 
-// BinaryPathFromVersion shows where the binary for the given version
-// can be found on roachprod nodes. It's either `./cockroach` or the
-// path to which a released binary is staged.
-func BinaryPathFromVersion(v string) string {
-	if v == "" {
+// BinaryPathForVersion shows where the binary for the given version
+// is expected to be found on roachprod nodes. The file will only
+// actually exist if there was a previous call to `UploadVersion` with
+// the same version parameter.
+func BinaryPathForVersion(t test.Test, v string) string {
+	if v == MainVersion {
 		return "./cockroach"
+	} else if _, ok := t.VersionsBinaryOverride()[v]; ok {
+		// If an override has been specified for `v`, use that binary.
+		return "./cockroach-" + v
+	} else {
+		return filepath.Join("v"+v, "cockroach")
 	}
-	return filepath.Join("v"+v, "cockroach")
 }
 
 // RestartNodesWithNewBinary uploads a given cockroach version to the
@@ -220,34 +234,71 @@ func RestartNodesWithNewBinary(
 	return nil
 }
 
+// DefaultUpgradeTimeout is the default timeout used when waiting for
+// an upgrade to finish (i.e., for all migrations to run and for the
+// cluster version to propagate). This timeout should be sufficient
+// for simple tests where there isn't a lot of data; in other
+// situations, a custom timeout can be passed to
+// `WaitForClusterUpgrade`.
+var DefaultUpgradeTimeout = 10 * time.Minute
+
 // WaitForClusterUpgrade waits for the cluster version to reach the
 // first node's binary version. This function should only be called if
 // every node in the cluster has been restarted to run the same binary
 // version. We rely on the cluster's internal self-upgrading
 // mechanism to update the underlying cluster version.
 func WaitForClusterUpgrade(
-	ctx context.Context, l *logger.Logger, nodes option.NodeListOption, dbFunc func(int) *gosql.DB,
+	ctx context.Context,
+	l *logger.Logger,
+	nodes option.NodeListOption,
+	dbFunc func(int) *gosql.DB,
+	timeout time.Duration,
 ) error {
-	newVersion, err := BinaryVersion(dbFunc(nodes[0]))
+	firstNode := nodes[0]
+	newVersion, err := BinaryVersion(dbFunc(firstNode))
 	if err != nil {
 		return err
 	}
 
-	l.Printf("waiting for cluster to auto-upgrade to %s", newVersion)
-	for _, node := range nodes {
-		err := retry.ForDuration(10*time.Minute, func() error {
+	// waitForUpgrade will wait for the given `node` to have the
+	// expected cluster version within the given timeout.
+	waitForUpgrade := func(node int, timeout time.Duration) error {
+		var latestVersion roachpb.Version
+		err := retry.ForDuration(timeout, func() error {
 			currentVersion, err := ClusterVersion(ctx, dbFunc(node))
 			if err != nil {
 				return err
 			}
+
+			latestVersion = currentVersion
 			if currentVersion != newVersion {
-				return fmt.Errorf("%d: expected cluster version %s, got %s", node, newVersion, currentVersion)
+				return fmt.Errorf("not upgraded yet")
 			}
-			l.Printf("%s: acked by n%d", currentVersion, node)
 			return nil
 		})
 		if err != nil {
-			return err
+			return errors.Wrapf(err,
+				"timed out after %s: expected n%d to be at cluster version %s, but is still at %s",
+				timeout, node, newVersion, latestVersion,
+			)
+		}
+		l.Printf("%s: acked by n%d", newVersion, node)
+		return nil
+	}
+
+	l.Printf("waiting for cluster to auto-upgrade to %s for %s", newVersion, timeout)
+	if err := waitForUpgrade(firstNode, timeout); err != nil {
+		return err
+	}
+
+	// Wait for `propagationTimeout` for all other nodes to also
+	// acknowledge the same cluster version as the first node. This
+	// should happen much faster, as migrations should already have
+	// finished at this point.
+	propagationTimeout := 3 * time.Minute
+	for _, node := range nodes[1:] {
+		if err := waitForUpgrade(node, propagationTimeout); err != nil {
+			return fmt.Errorf("n%d is already at %s: %w", firstNode, newVersion, err)
 		}
 	}
 

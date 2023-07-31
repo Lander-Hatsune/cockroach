@@ -38,10 +38,10 @@ SELECT * FROM t;
 statement ok
 INSERT INTO t VALUES (1, 2),(5,6),(7,8);
 
-statement error duplicate key value violates unique constraint "t_pkey"
+statement error pgcode 23505 duplicate key value violates unique constraint "t_pkey"
 SELECT f1(1, 11);
 
-statement error duplicate key value violates unique constraint "t_pkey"
+statement error pgcode 23505 duplicate key value violates unique constraint "t_pkey"
 SELECT f1(14, 14);
 
 query II rowsort
@@ -68,8 +68,10 @@ SELECT f2(5,32);
 ----
 (5,32)
 
-statement error pq: multiple modification subqueries of the same table \"t\" are not supported
+query TT
 SELECT f2(5,9), f2(7,11);
+----
+(5,9)  (7,11)
 
 query T nosort
 SELECT f2(x,y) FROM (VALUES (1,16),(1,17)) v(x,y);
@@ -80,10 +82,10 @@ SELECT f2(x,y) FROM (VALUES (1,16),(1,17)) v(x,y);
 query II rowsort
 SELECT * FROM t;
 ----
-1 17
-3 4
-5 32
-7 8
+1  17
+3  4
+5  9
+7  11
 
 statement ok
 CREATE TABLE t2 (a INT, b INT, c INT);
@@ -104,7 +106,7 @@ SELECT * FROM f3(3, 3, 7) AS foo(a INT, b INT, c INT);
 statement ok
 CREATE TABLE t3(a) AS SELECT 1::INT;
 
-statement error aggregate functions are not allowed in UPDATE SET
+statement error pgcode 42803 aggregate functions are not allowed in UPDATE SET
 CREATE FUNCTION f4() RETURNS RECORD AS
 $$
   UPDATE t3 SET a = count(a);
@@ -121,6 +123,7 @@ query I
 SELECT f5(count(a)) FROM t3;
 ----
 1
+
 
 subtest constraints
 
@@ -146,10 +149,14 @@ SELECT f_check1(0.5);
 ----
 (1)
 
-statement error pq: failed to satisfy CHECK constraint \(x >= 1:::DECIMAL\)
+statement error pgcode 23514 pq: failed to satisfy CHECK constraint \(x >= 1:::DECIMAL\)
 SELECT f_check1(0);
 
-# subtest generated_as_identity
+
+subtest end
+
+subtest generated_as_identity
+
 statement ok
 CREATE TABLE generated_as_id_t (
   a INT UNIQUE,
@@ -160,7 +167,8 @@ CREATE TABLE generated_as_id_t (
 statement ok
 INSERT INTO generated_as_id_t (a) VALUES (7), (8), (9);
 
-statement error column "b" can only be updated to DEFAULT
+# TODO(107369): This error code does not have a name associated with it.
+statement error pgcode 428C9 column "b" can only be updated to DEFAULT
 CREATE FUNCTION f_err(i INT, j INT) RETURNS RECORD AS
 $$
   UPDATE generated_as_id_t SET b=i, c=j WHERE a > 6 RETURNING *;
@@ -190,6 +198,8 @@ SELECT * FROM generated_as_id_t ORDER BY a;
 9  6  2
 
 
+subtest end
+
 subtest repro_103693
 
 statement ok
@@ -209,3 +219,5 @@ query I
 SELECT f_103693(k2, v2) FROM t1_103693 INNER LOOKUP JOIN t2_103693 ON k1 = k2;
 ----
 1
+
+subtest end

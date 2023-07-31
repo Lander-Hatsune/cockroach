@@ -144,7 +144,7 @@ func restoreOldVersionClusterTest(exportDir string) func(t *testing.T) {
 			ServerArgs: base.TestServerArgs{
 				// Disabling the test tenant due to test failures. More
 				// investigation is required. Tracked with #76378.
-				DefaultTestTenant: base.TestTenantDisabled,
+				DefaultTestTenant: base.TODOTestTenantDisabled,
 				ExternalIODir:     externalDir,
 			},
 		})
@@ -265,7 +265,7 @@ func TestRestoreWithDroppedSchemaCorruption(t *testing.T) {
 		// reference a nil pointer below where we're expecting a database
 		// descriptor to exist. More investigation is required.
 		// Tracked with #76378.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 	}
 	s, sqlDB, _ := serverutils.StartServer(t, args)
 	tdb := sqlutils.MakeSQLRunner(sqlDB)
@@ -471,7 +471,7 @@ func fullClusterRestoreWithTenants(exportDir string) func(t *testing.T) {
 		sqlDB.CheckQueryResults(t, fmt.Sprintf("SELECT count(*) FROM [SHOW BACKUP LATEST IN '%s'] WHERE object_type = 'TENANT'", localFoo), [][]string{
 			{"2"},
 		})
-		sqlDB.Exec(t, fmt.Sprintf("RESTORE FROM LATEST IN '%s' WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION, include_all_secondary_tenants", localFoo))
+		sqlDB.Exec(t, fmt.Sprintf("RESTORE FROM LATEST IN '%s' WITH UNSAFE_RESTORE_INCOMPATIBLE_VERSION, include_all_virtual_clusters", localFoo))
 		sqlDB.CheckQueryResults(t, "SHOW TENANTS", [][]string{
 			{"1", "system", "ready", "shared"},
 			{"5", "tenant-5", "ready", "none"},

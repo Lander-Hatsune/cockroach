@@ -447,7 +447,7 @@ vectorized: true
         │       │                           └── • render
         │       │                               │
         │       │                               └── • filter
-        │       │                                   │ filter: classoid = 4294967100
+        │       │                                   │ filter: classoid = 4294967099
         │       │                                   │
         │       │                                   └── • virtual table
         │       │                                         table: kv_catalog_comments@primary
@@ -2227,6 +2227,9 @@ vectorized: <hidden>
 maximum memory usage: <hidden>
 network usage: <hidden>
 regions: <hidden>
+isolation level: serializable
+priority: normal
+quality of service: regular
 ·
 • values
   nodes: <hidden>

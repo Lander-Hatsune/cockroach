@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
@@ -254,7 +255,9 @@ func (a *applyJoinNode) runNextRightSideIteration(params runParams, leftRow tree
 	}
 	plan := p.(*planComponents)
 	rowResultWriter := NewRowResultWriter(&a.run.rightRows)
-	if err := runPlanInsidePlan(ctx, params, plan, rowResultWriter); err != nil {
+	if err := runPlanInsidePlan(
+		ctx, params, plan, rowResultWriter, nil, /* deferredRoutineSender */
+	); err != nil {
 		return err
 	}
 	a.run.rightRowsIterator = newRowContainerIterator(ctx, a.run.rightRows)
@@ -264,7 +267,11 @@ func (a *applyJoinNode) runNextRightSideIteration(params runParams, leftRow tree
 // runPlanInsidePlan is used to run a plan and gather the results in the
 // resultWriter, as part of the execution of an "outer" plan.
 func runPlanInsidePlan(
-	ctx context.Context, params runParams, plan *planComponents, resultWriter rowResultWriter,
+	ctx context.Context,
+	params runParams,
+	plan *planComponents,
+	resultWriter rowResultWriter,
+	deferredRoutineSender eval.DeferredRoutineSender,
 ) error {
 	defer plan.close(ctx)
 	execCfg := params.ExecCfg()
@@ -277,6 +284,24 @@ func runPlanInsidePlan(
 	)
 	defer recv.Release()
 
+	plannerCopy := *params.p
+	plannerCopy.curPlan.planComponents = *plan
+	// "Pausable portal" execution model is only applicable to the outer
+	// statement since we actually need to execute all inner plans to completion
+	// before we can produce any "outer" rows to be returned to the client, so
+	// we make sure to unset pausablePortal field on the planner.
+	plannerCopy.pausablePortal = nil
+	evalCtxFactory := func() *extendedEvalContext {
+		plannerCopy.extendedEvalCtx = *params.p.ExtendedEvalContextCopy()
+		evalCtx := &plannerCopy.extendedEvalCtx
+		evalCtx.Planner = &plannerCopy
+		evalCtx.StreamManagerFactory = &plannerCopy
+		if deferredRoutineSender != nil {
+			evalCtx.RoutineSender = deferredRoutineSender
+		}
+		return evalCtx
+	}
+
 	if len(plan.subqueryPlans) != 0 {
 		// We currently don't support cases when both the "inner" and the
 		// "outer" plans have subqueries due to limitations of how we're
@@ -287,17 +312,6 @@ func runPlanInsidePlan(
 		if len(params.p.curPlan.subqueryPlans) != 0 {
 			return unimplemented.NewWithIssue(66447, `apply joins with subqueries in the "inner" and "outer" contexts are not supported`)
 		}
-		// Right now curPlan.subqueryPlans are the subqueries from the "outer"
-		// plan (and we know there are none given the check above). If parts of
-		// the "inner" plan refer to the subqueries, we know that they must
-		// refer to the "inner" subqueries. To allow for that to happen we have
-		// to manually replace the subqueries on the planner's curPlan and
-		// restore the original state before exiting.
-		oldSubqueries := params.p.curPlan.subqueryPlans
-		params.p.curPlan.subqueryPlans = plan.subqueryPlans
-		defer func() {
-			params.p.curPlan.subqueryPlans = oldSubqueries
-		}()
 		// Create a separate memory account for the results of the subqueries.
 		// Note that we intentionally defer the closure of the account until we
 		// return from this method (after the main query is executed).
@@ -305,8 +319,8 @@ func runPlanInsidePlan(
 		defer subqueryResultMemAcc.Close(ctx)
 		if !execCfg.DistSQLPlanner.PlanAndRunSubqueries(
 			ctx,
-			params.p,
-			params.extendedEvalCtx.copy,
+			&plannerCopy,
+			evalCtxFactory,
 			plan.subqueryPlans,
 			recv,
 			&subqueryResultMemAcc,
@@ -315,15 +329,12 @@ func runPlanInsidePlan(
 		) {
 			return resultWriter.Err()
 		}
+	} else {
+		// We don't have "inner" subqueries, so the apply join can only refer to
+		// the "outer" ones.
+		plannerCopy.curPlan.subqueryPlans = params.p.curPlan.subqueryPlans
 	}
 
-	// Make a copy of the EvalContext so it can be safely modified.
-	evalCtx := params.p.ExtendedEvalContextCopy()
-	plannerCopy := *params.p
-	// If we reach this part when re-executing a pausable portal, we won't want to
-	// resume the flow bound to it. The inner-plan should have its own lifecycle
-	// for its flow.
-	plannerCopy.pausablePortal = nil
 	distributePlan := getPlanDistribution(
 		ctx, plannerCopy.Descriptors().HasUncommittedTypes(),
 		plannerCopy.SessionData().DistSQLMode, plan.main,
@@ -332,10 +343,8 @@ func runPlanInsidePlan(
 	if distributePlan.WillDistribute() {
 		distributeType = DistributionTypeAlways
 	}
+	evalCtx := evalCtxFactory()
 	planCtx := execCfg.DistSQLPlanner.NewPlanningCtx(ctx, evalCtx, &plannerCopy, plannerCopy.txn, distributeType)
-	planCtx.planner.curPlan.planComponents = *plan
-	planCtx.ExtendedEvalCtx.Planner = &plannerCopy
-	planCtx.ExtendedEvalCtx.StreamManagerFactory = &plannerCopy
 	planCtx.stmtType = recv.stmtType
 	planCtx.mustUseLeafTxn = atomic.LoadUint32(&params.p.atomic.innerPlansMustUseLeafTxn) == 1
 

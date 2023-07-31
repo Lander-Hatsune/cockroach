@@ -477,7 +477,7 @@ func (b *Builder) resolveSchemaForCreateTable(name *tree.TableName) (cat.Schema,
 // resolveSchemaForCreateFunction is the same as resolveSchemaForCreate but
 // specific for functions.
 func (b *Builder) resolveSchemaForCreateFunction(
-	name *tree.FunctionName,
+	name *tree.RoutineName,
 ) (cat.Schema, cat.SchemaName) {
 	return b.resolveSchemaForCreate(&name.ObjectNamePrefix, name)
 }
@@ -512,24 +512,14 @@ func (b *Builder) resolveSchemaForCreate(
 	return sch, resName
 }
 
-func (b *Builder) checkMultipleMutations(tab cat.Table, simpleInsert bool) {
-	if b.areAllTableMutationsSimpleInserts == nil {
-		b.areAllTableMutationsSimpleInserts = make(map[cat.StableID]bool)
-	}
-	allSimpleInserts, prevMutations := b.areAllTableMutationsSimpleInserts[tab.ID()]
-	if !prevMutations {
-		b.areAllTableMutationsSimpleInserts[tab.ID()] = simpleInsert
-		return
-	}
-	allSimpleInserts = allSimpleInserts && simpleInsert
-	b.areAllTableMutationsSimpleInserts[tab.ID()] = allSimpleInserts
-	if !allSimpleInserts &&
+func (b *Builder) checkMultipleMutations(tab cat.Table, typ mutationType) {
+	if !b.stmtTree.CanMutateTable(tab.ID(), typ) &&
 		!multipleModificationsOfTableEnabled.Get(&b.evalCtx.Settings.SV) &&
 		!b.evalCtx.SessionData().MultipleModificationsOfTable {
 		panic(pgerror.Newf(
 			pgcode.FeatureNotSupported,
-			"multiple modification subqueries of the same table %q are not supported unless "+
-				"they all use INSERT without ON CONFLICT; this is to prevent data corruption, see "+
+			"multiple mutations of the same table %q are not supported unless they all "+
+				"use INSERT without ON CONFLICT; this is to prevent data corruption, see "+
 				"documentation of sql.multiple_modifications_of_table.enabled", tab.Name(),
 		))
 	}

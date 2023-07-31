@@ -218,17 +218,21 @@ func hbaRunTest(t *testing.T, insecure bool) {
 		defer cleanup()
 
 		s, conn, _ := serverutils.StartServer(t,
-			base.TestServerArgs{Insecure: insecure, SocketFile: maybeSocketFile})
+			base.TestServerArgs{
+				DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(107310),
+				Insecure:          insecure,
+				SocketFile:        maybeSocketFile,
+			})
 		defer s.Stopper().Stop(context.Background())
 
 		// Enable conn/auth logging.
 		// We can't use the cluster settings to do this, because
 		// cluster settings propagate asynchronously.
 		testServer := s.(*server.TestServer)
-		pgServer := testServer.PGServer().(*pgwire.Server)
+		pgServer := s.ApplicationLayer().PGServer().(*pgwire.Server)
 		pgServer.TestingEnableConnLogging()
 		pgServer.TestingEnableAuthLogging()
-		testServer.PGPreServer().TestingAcceptSystemIdentityOption(true)
+		s.ApplicationLayer().PGPreServer().(*pgwire.PreServeConnHandler).TestingAcceptSystemIdentityOption(true)
 
 		httpClient, err := s.GetAdminHTTPClient()
 		if err != nil {
@@ -484,7 +488,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 					// We want the certs to be present in the filesystem for this test.
 					// However, certs are only generated for users "root" and "testuser" specifically.
 					sqlURL, cleanupFn := sqlutils.PGUrlWithOptionalClientCerts(
-						t, s.ServingSQLAddr(), t.Name(), url.User(systemIdentity),
+						t, s.AdvSQLAddr(), t.Name(), url.User(systemIdentity),
 						forceCerts ||
 							systemIdentity == username.RootUser ||
 							systemIdentity == username.TestUser /* withClientCerts */)
@@ -492,7 +496,7 @@ func hbaRunTest(t *testing.T, insecure bool) {
 
 					var host, port string
 					if td.Cmd == "connect" {
-						host, port, err = net.SplitHostPort(s.ServingSQLAddr())
+						host, port, err = net.SplitHostPort(s.AdvSQLAddr())
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -602,6 +606,13 @@ func fmtErr(err error) string {
 			}
 			if pqErr.Hint != "" {
 				hint := strings.Replace(pqErr.Hint, stdstrings.IssueReferral, "<STANDARD REFERRAL>", 1)
+				if strings.Contains(hint, "Supported methods:") {
+					// Depending on whether the test is running on linux or not
+					// (or, more specifically, whether gss build tag is set),
+					// "gss" method might not be included, so we remove it here
+					// and not include into the expected output.
+					hint = strings.Replace(hint, "gss, ", "", 1)
+				}
 				errStr += "\nHINT: " + hint
 			}
 			if pqErr.Detail != "" {
@@ -628,7 +639,7 @@ func TestClientAddrOverride(t *testing.T) {
 	defer s.Stopper().Stop(ctx)
 
 	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "testClientAddrOverride" /* prefix */, url.User(username.TestUser),
+		t, s.AdvSQLAddr(), "testClientAddrOverride" /* prefix */, url.User(username.TestUser),
 	)
 	defer cleanupFunc()
 
@@ -640,10 +651,9 @@ func TestClientAddrOverride(t *testing.T) {
 	// Enable conn/auth logging.
 	// We can't use the cluster settings to do this, because
 	// cluster settings for booleans propagate asynchronously.
-	testServer := s.(*server.TestServer)
-	pgServer := testServer.PGServer().(*pgwire.Server)
+	pgServer := s.ApplicationLayer().PGServer().(*pgwire.Server)
 	pgServer.TestingEnableAuthLogging()
-	pgPreServer := testServer.PGPreServer()
+	pgPreServer := s.ApplicationLayer().PGPreServer().(*pgwire.PreServeConnHandler)
 
 	testCases := []struct {
 		specialAddr string
@@ -783,7 +793,9 @@ func TestSSLSessionVar(t *testing.T) {
 	defer sc.Close(t)
 
 	// Start a server.
-	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(107310),
+	})
 	s.(*server.TestServer).Cfg.AcceptSQLWithoutTLS = true
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
@@ -794,12 +806,12 @@ func TestSSLSessionVar(t *testing.T) {
 	}
 
 	pgURLWithCerts, cleanupFuncCerts := sqlutils.PGUrlWithOptionalClientCerts(
-		t, s.ServingSQLAddr(), "TestSSLSessionVarCerts" /* prefix */, url.User(username.TestUser), true,
+		t, s.AdvSQLAddr(), "TestSSLSessionVarCerts" /* prefix */, url.User(username.TestUser), true,
 	)
 	defer cleanupFuncCerts()
 
 	pgURLWithoutCerts, cleanupFuncWithoutCerts := sqlutils.PGUrlWithOptionalClientCerts(
-		t, s.ServingSQLAddr(), "TestSSLSessionVarNoCerts" /* prefix */, url.UserPassword(username.TestUser, "abc"), false,
+		t, s.AdvSQLAddr(), "TestSSLSessionVarNoCerts" /* prefix */, url.UserPassword(username.TestUser, "abc"), false,
 	)
 	defer cleanupFuncWithoutCerts()
 	q := pgURLWithoutCerts.Query()

@@ -185,7 +185,7 @@ func NewStreamingKVFetcher(
 		stopper,
 		txn,
 		st,
-		getWaitPolicy(lockWaitPolicy),
+		GetWaitPolicy(lockWaitPolicy),
 		streamerBudgetLimit,
 		streamerBudgetAcc,
 		&kvPairsRead,
@@ -336,6 +336,10 @@ func (f *KVFetcher) SetupNextFetch(
 	return f.KVBatchFetcher.SetupNextFetch(
 		ctx, spans, spanIDs, batchBytesLimit, firstBatchKeyLimit, spansCanOverlap,
 	)
+}
+
+func (f *KVFetcher) reset(b KVBatchFetcher) {
+	*f = KVFetcher{KVBatchFetcher: b}
 }
 
 // KVProvider is a KVBatchFetcher that returns a set slice of kvs.

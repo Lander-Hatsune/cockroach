@@ -68,12 +68,15 @@ func (b *builderState) Ensure(e scpb.Element, target scpb.TargetStatus, meta scp
 	default:
 		panic(errors.AssertionFailedf("unsupported target %s", target.Status()))
 	}
+
 	if dst == nil {
 		// We're adding both a new element and a target for it.
 		if target == scpb.ToAbsent {
 			// Ignore targets to remove something that doesn't exist yet.
 			return
 		}
+		// Set a target for the element but check for concurrent schema changes.
+		_ = b.checkForConcurrentSchemaChanges(e)
 		b.addNewElementState(elementState{
 			element:  e,
 			initial:  scpb.Status_ABSENT,
@@ -89,6 +92,11 @@ func (b *builderState) Ensure(e scpb.Element, target scpb.TargetStatus, meta scp
 		return
 	}
 
+	// Check that there are no concurrent schema changes on the descriptors
+	// referenced by this element. Re-assign dst because of potential
+	// re-allocations.
+	dst = b.checkForConcurrentSchemaChanges(e)
+
 	// We were about to overwrite an element's target and metadata. Assert one
 	// disallowed case: reviving a "ghost" element, that is, add an element that
 	// was previously added and then dropped. This assertion is artificial per se
@@ -102,7 +110,7 @@ func (b *builderState) Ensure(e scpb.Element, target scpb.TargetStatus, meta scp
 	if dst.current == scpb.Status_ABSENT &&
 		dst.target == scpb.ToAbsent &&
 		(target == scpb.ToPublic || target == scpb.Transient) &&
-		dst.metadata.TargetIsLinkedToSchemaChange() {
+		dst.metadata.IsLinkedToSchemaChange() {
 		panic(scerrors.NotImplementedErrorf(nil, "attempt to revive a ghost element:"+
 			" [elem=%v],[current=ABSENT],[target=ToAbsent],[newTarget=%v]", dst.element.String(), target.Status()))
 	}
@@ -167,6 +175,32 @@ func (b *builderState) Ensure(e scpb.Element, target scpb.TargetStatus, meta scp
 		return
 	}
 	panic(errors.AssertionFailedf("unsupported incumbent target %s", oldTarget.Status()))
+}
+
+func (b *builderState) checkForConcurrentSchemaChanges(e scpb.Element) *elementState {
+	b.ensureDescriptors(e)
+	// Check that there are no descriptors which are undergoing a concurrent
+	// schema change which might interfere with this one.
+	screl.AllTargetDescIDs(e).ForEach(func(id descpb.ID) {
+		if c := b.descCache[id]; c != nil && c.desc != nil && c.desc.HasConcurrentSchemaChanges() {
+			panic(scerrors.ConcurrentSchemaChangeError(c.desc))
+		}
+	})
+	// We may have mutated the builder state for this element.
+	// Specifically, the output slice might have grown and have been realloc'ed.
+	return b.getExistingElementState(e)
+}
+
+// ensureDescriptors ensures the presence of all elements for all
+// descriptors referenced inside the element.
+//
+// This provides us with all of the ID -> name mappings required to
+// comprehensively decorate any EXPLAIN (DDL) output.
+func (b *builderState) ensureDescriptors(e scpb.Element) {
+	_ = screl.WalkDescIDs(e, func(id *catid.DescID) error {
+		b.ensureDescriptor(*id)
+		return nil
+	})
 }
 
 func (b *builderState) upsertElementState(es elementState) {
@@ -835,11 +869,25 @@ func (b *builderState) ResolveSchema(
 	return b.QueryByID(sc.GetID())
 }
 
-// ResolvePrefix implements the scbuildstmt.NameResolver interface.
-func (b *builderState) ResolvePrefix(
-	prefix tree.ObjectNamePrefix, requiredSchemaPriv privilege.Kind,
+// ResolveTargetObject implements the scbuildstmt.NameResolver interface.
+func (b *builderState) ResolveTargetObject(
+	name *tree.UnresolvedObjectName, requiredSchemaPriv privilege.Kind,
 ) (dbElts scbuildstmt.ElementResultSet, scElts scbuildstmt.ElementResultSet) {
-	db, sc := b.cr.MustResolvePrefix(b.ctx, prefix)
+	objName := name.ToTableName()
+	db, sc := b.cr.MayResolvePrefix(b.ctx, objName.ObjectNamePrefix)
+	// If the database or schema are not found during resolution,
+	// then generate an appropriate error.
+	if db == nil || sc == nil {
+		if !objName.ExplicitSchema && !objName.ExplicitCatalog {
+			panic(
+				pgerror.New(pgcode.InvalidName, "no database specified"),
+			)
+		}
+		panic(errors.WithHint(pgerror.Newf(pgcode.InvalidSchemaName,
+			"cannot create %q because the target database or schema does not exist",
+			tree.ErrString(&objName)),
+			"verify that the current database and search_path are valid and/or the target database exists"))
+	}
 	b.ensureDescriptor(db.GetID())
 	if sc.SchemaKind() == catalog.SchemaVirtual {
 		panic(sqlerrors.NewCannotModifyVirtualSchemaError(sc.GetName()))
@@ -848,7 +896,7 @@ func (b *builderState) ResolvePrefix(
 		panic(unimplemented.NewWithIssue(104687, "cannot create UDFs under a temporary schema"))
 	}
 	b.ensureDescriptor(sc.GetID())
-	b.checkOwnershipOrPrivilegesOnSchemaDesc(prefix, sc, scbuildstmt.ResolveParams{RequiredPrivilege: requiredSchemaPriv})
+	b.checkOwnershipOrPrivilegesOnSchemaDesc(objName.ObjectNamePrefix, sc, scbuildstmt.ResolveParams{RequiredPrivilege: requiredSchemaPriv})
 	return b.QueryByID(db.GetID()), b.QueryByID(sc.GetID())
 }
 
@@ -1541,6 +1589,20 @@ func (b *builderState) serializeUserDefinedTypes(queryStr string) string {
 			innerExpr = n.Expr
 			typRef = n.Type
 		default:
+			return true, expr, nil
+		}
+		// We cannot type-check subqueries without using optbuilder, and there
+		// is no need to because we only need to rewrite string values that are
+		// directly cast to enums. For example, we must rewrite the 'foo' in:
+		//
+		//   SELECT 'foo'::myenum
+		//
+		// We don't need to rewrite the 'foo' in the query below, which can be
+		// corrupted by renaming the 'foo' value in the myenum type.
+		//
+		//   SELECT (SELECT 'foo')::myenum
+		//
+		if _, ok := innerExpr.(*tree.Subquery); ok {
 			return true, expr, nil
 		}
 		var typ *types.T

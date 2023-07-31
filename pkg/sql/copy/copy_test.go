@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
@@ -48,6 +49,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/datadriven"
 	"github.com/cockroachdb/errors"
 	"github.com/jackc/pgconn"
@@ -95,12 +97,12 @@ func TestDataDriven(t *testing.T) {
 		for _, atomic := range []string{"on", "off"} {
 			for _, fastPath := range []string{"on", "off"} {
 				datadriven.Walk(t, datapathutils.TestDataPath(t), func(t *testing.T, path string) {
-					s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+					s := serverutils.StartServerOnly(t, base.TestServerArgs{
 						Settings: cluster.MakeTestingClusterSettings(),
 					})
 					defer s.Stopper().Stop(ctx)
 
-					url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+					url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 					defer cleanup()
 					var sqlConnCtx clisqlclient.Context
 					conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
@@ -125,8 +127,17 @@ func TestDataDriven(t *testing.T) {
 						case "copy-from", "copy-from-error", "copy-from-kvtrace":
 							kvtrace := d.Cmd == "copy-from-kvtrace"
 							lines := strings.Split(d.Input, "\n")
+							expectedRows := len(lines) - 1
 							stmt := lines[0]
 							data := strings.Join(lines[1:], "\n")
+							st, err := parser.ParseOne(stmt)
+							require.NoError(t, err)
+							if copy, ok := st.AST.(*tree.CopyFrom); ok {
+								if copy.Options.HasHeader {
+									expectedRows--
+								}
+							}
+
 							if kvtrace {
 								err := conn.Exec(ctx, "SET TRACING=on,kv")
 								require.NoError(t, err)
@@ -139,7 +150,7 @@ func TestDataDriven(t *testing.T) {
 							switch d.Cmd {
 							case "copy-from":
 								require.NoError(t, err, "%s\n%s\n", d.Cmd, d.Input)
-								require.Equal(t, int(rows), len(lines)-1, "Not all rows were inserted")
+								require.Equal(t, int(rows), expectedRows, "Not all rows were inserted")
 								return fmt.Sprintf("%d", rows)
 							case "copy-from-error":
 								require.Error(t, err, "copy-from-error didn't return and error!")
@@ -238,7 +249,7 @@ func TestCopyFromTransaction(t *testing.T) {
 	ctx := context.Background()
 
 	testutils.RunTrueAndFalse(t, "disableAutoCommitDuringExec", func(t *testing.T, b bool) {
-		s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+		s := serverutils.StartServerOnly(t, base.TestServerArgs{
 			Settings: cluster.MakeTestingClusterSettings(),
 			Knobs: base.TestingKnobs{
 				SQLExecutor: &sql.ExecutorTestingKnobs{
@@ -248,7 +259,7 @@ func TestCopyFromTransaction(t *testing.T) {
 		})
 		defer s.Stopper().Stop(ctx)
 
-		url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+		url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "copytest", url.User(username.RootUser))
 		defer cleanup()
 		var sqlConnCtx clisqlclient.Context
 
@@ -390,12 +401,12 @@ func TestCopyFromTimeout(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	pgURL, cleanup := sqlutils.PGUrl(
 		t,
-		s.ServingSQLAddr(),
+		s.AdvSQLAddr(),
 		"TestCopyFromTimeout",
 		url.User(username.RootUser),
 	)
@@ -456,12 +467,12 @@ func TestShowQueriesIncludesCopy(t *testing.T) {
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
 	pgURL, cleanup := sqlutils.PGUrl(
 		t,
-		s.ServingSQLAddr(),
+		s.AdvSQLAddr(),
 		"TestShowQueriesIncludesCopy",
 		url.User(username.RootUser),
 	)
@@ -555,10 +566,10 @@ func TestLargeDynamicRows(t *testing.T) {
 			return nil
 		},
 	}
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "copytest", url.User(username.RootUser))
 	defer cleanup()
 	var sqlConnCtx clisqlclient.Context
 	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
@@ -609,10 +620,10 @@ func TestTinyRows(t *testing.T) {
 	ctx := context.Background()
 
 	params, _ := tests.CreateTestServerParams()
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(ctx)
 
-	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "copytest", url.User(username.RootUser))
 	defer cleanup()
 	var sqlConnCtx clisqlclient.Context
 	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
@@ -667,7 +678,7 @@ func TestLargeCopy(t *testing.T) {
 	s, _, kvdb := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	url, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), "copytest", url.User(username.RootUser))
+	url, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), "copytest", url.User(username.RootUser))
 	defer cleanup()
 	var sqlConnCtx clisqlclient.Context
 	conn := sqlConnCtx.MakeSQLConn(io.Discard, io.Discard, url.String())
@@ -769,4 +780,58 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func BenchmarkCopyCSVEndToEnd(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
+	ctx := context.Background()
+	s, db, _ := serverutils.StartServer(b, base.TestServerArgs{
+		DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(83461),
+	})
+	defer s.Stopper().Stop(ctx)
+
+	pgURL, cleanup, err := sqlutils.PGUrlE(
+		s.AdvSQLAddr(),
+		"BenchmarkCopyEndToEnd", /* prefix */
+		url.User(username.RootUser),
+	)
+	require.NoError(b, err)
+	s.Stopper().AddCloser(stop.CloserFn(cleanup))
+
+	_, err = db.Exec("CREATE TABLE t (i INT PRIMARY KEY, s STRING)")
+	require.NoError(b, err)
+
+	conn, err := pgx.Connect(ctx, pgURL.String())
+	require.NoError(b, err)
+
+	rng, _ := randutil.NewTestRand()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		// Create an input of 1_000_000 rows.
+		buf := &bytes.Buffer{}
+		for j := 0; j < 1_000_000; j++ {
+			buf.WriteString(strconv.Itoa(j))
+			buf.WriteString(",")
+			str := randutil.RandString(rng, rng.Intn(50), "abc123\n")
+			buf.WriteString("\"")
+			buf.WriteString(str)
+			buf.WriteString("\"\n")
+		}
+		b.StartTimer()
+
+		// Run the COPY.
+		_, err = conn.PgConn().CopyFrom(ctx, buf, "COPY t FROM STDIN CSV")
+		require.NoError(b, err)
+
+		// Verify that the data was inserted.
+		b.StopTimer()
+		var count int
+		err = db.QueryRow("SELECT count(*) FROM t").Scan(&count)
+		require.NoError(b, err)
+		require.Equal(b, 1_000_000, count)
+		b.StartTimer()
+	}
 }

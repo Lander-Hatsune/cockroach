@@ -88,6 +88,13 @@ func TestDockerCLI_test_copy(t *testing.T) {
 	runTestDockerCLI(t, "test_copy", "../cli/interactive_tests/test_copy.tcl")
 }
 
+func TestDockerCLI_test_demo(t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
+	runTestDockerCLI(t, "test_demo", "../cli/interactive_tests/test_demo.tcl")
+}
+
 func TestDockerCLI_test_demo_changefeeds(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
@@ -128,6 +135,13 @@ func TestDockerCLI_test_demo_memory_warning(t *testing.T) {
 	defer s.Close(t)
 
 	runTestDockerCLI(t, "test_demo_memory_warning", "../cli/interactive_tests/test_demo_memory_warning.tcl")
+}
+
+func TestDockerCLI_test_demo_networking(t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
+	runTestDockerCLI(t, "test_demo_networking", "../cli/interactive_tests/test_demo_networking.tcl")
 }
 
 func TestDockerCLI_test_demo_node_cmds(t *testing.T) {
@@ -291,13 +305,6 @@ func TestDockerCLI_test_multiline_statements(t *testing.T) {
 	runTestDockerCLI(t, "test_multiline_statements", "../cli/interactive_tests/test_multiline_statements.tcl")
 }
 
-func TestDockerCLI_test_multiline_statements_libedit(t *testing.T) {
-	s := log.Scope(t)
-	defer s.Close(t)
-
-	runTestDockerCLI(t, "test_multiline_statements_libedit", "../cli/interactive_tests/test_multiline_statements_libedit.tcl")
-}
-
 func TestDockerCLI_test_multiple_nodes(t *testing.T) {
 	s := log.Scope(t)
 	defer s.Close(t)
@@ -380,6 +387,13 @@ func TestDockerCLI_test_sql_demo_node_cmds(t *testing.T) {
 	defer s.Close(t)
 
 	runTestDockerCLI(t, "test_sql_demo_node_cmds", "../cli/interactive_tests/test_sql_demo_node_cmds.tcl")
+}
+
+func TestDockerCLI_test_sql_mem_monitor(t *testing.T) {
+	s := log.Scope(t)
+	defer s.Close(t)
+
+	runTestDockerCLI(t, "test_sql_mem_monitor", "../cli/interactive_tests/test_sql_mem_monitor.tcl")
 }
 
 func TestDockerCLI_test_sql_safe_updates(t *testing.T) {

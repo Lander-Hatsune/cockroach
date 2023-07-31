@@ -31,10 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -53,7 +51,7 @@ func TestAlterChangefeedAddTargetPrivileges(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		Knobs: base.TestingKnobs{
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 			DistSQL: &execinfra.TestingKnobs{
@@ -662,10 +660,9 @@ func TestAlterChangefeedPersistSinkURI(t *testing.T) {
 
 	const unredactedSinkURI = "null://blah?AWS_ACCESS_KEY_ID=the_secret"
 
-	params, _ := tests.CreateTestServerParams()
-	s, rawSQLDB, _ := serverutils.StartServer(t, params)
+	s, rawSQLDB, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
-	registry := s.JobRegistry().(*jobs.Registry)
+	registry := s.ApplicationLayer().JobRegistry().(*jobs.Registry)
 	ctx := context.Background()
 	defer s.Stopper().Stop(ctx)
 
@@ -868,19 +865,13 @@ func TestAlterChangefeedDatabaseQualifiedNames(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 83946)
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sqlDB.Exec(t, `CREATE DATABASE movr`)
-		sqlDB.Exec(t, `CREATE TABLE movr.drivers (id INT PRIMARY KEY, name STRING)`)
-		sqlDB.Exec(t, `CREATE TABLE movr.users (id INT PRIMARY KEY, name STRING)`)
-		sqlDB.Exec(t,
-			`INSERT INTO movr.drivers VALUES (1, 'Alice')`,
-		)
-		sqlDB.Exec(t,
-			`INSERT INTO movr.users VALUES (1, 'Bob')`,
-		)
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR movr.drivers WITH resolved = '100ms', diff`)
+		sqlDB.Exec(t, `CREATE TABLE d.drivers (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t, `CREATE TABLE d.users (id INT PRIMARY KEY, name STRING)`)
+		sqlDB.Exec(t, `INSERT INTO d.drivers VALUES (1, 'Alice')`)
+		sqlDB.Exec(t, `INSERT INTO d.users VALUES (1, 'Bob')`)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR d.drivers WITH resolved = '100ms', diff`)
 		defer closeFeed(t, testFeed)
 
 		assertPayloads(t, testFeed, []string{
@@ -894,7 +885,7 @@ func TestAlterChangefeedDatabaseQualifiedNames(t *testing.T) {
 
 		require.NoError(t, feed.Pause())
 
-		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD movr.users WITH initial_scan UNSET diff`, feed.JobID()))
+		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d ADD d.users WITH initial_scan UNSET diff`, feed.JobID()))
 
 		require.NoError(t, feed.Resume())
 
@@ -902,9 +893,7 @@ func TestAlterChangefeedDatabaseQualifiedNames(t *testing.T) {
 			`users: [1]->{"after": {"id": 1, "name": "Bob"}}`,
 		})
 
-		sqlDB.Exec(t,
-			`INSERT INTO movr.drivers VALUES (3, 'Carol')`,
-		)
+		sqlDB.Exec(t, `INSERT INTO d.drivers VALUES (3, 'Carol')`)
 
 		assertPayloads(t, testFeed, []string{
 			`drivers: [3]->{"after": {"id": 3, "name": "Carol"}}`,
@@ -1156,17 +1145,9 @@ func TestAlterChangefeedAddTargetsDuringSchemaChangeError(t *testing.T) {
 			_ = g.Wait()
 		}()
 
-		// Helper to read job progress
-		loadProgress := func() jobspb.Progress {
-			jobID := jobFeed.JobID()
-			job, err := jobRegistry.LoadJob(context.Background(), jobID)
-			require.NoError(t, err)
-			return job.Progress()
-		}
-
 		// Ensure initial backfill completes
 		testutils.SucceedsSoon(t, func() error {
-			prog := loadProgress()
+			prog := loadProgress(t, jobFeed, jobRegistry)
 			if p := prog.GetHighWater(); p != nil && !p.IsEmpty() {
 				return nil
 			}
@@ -1210,7 +1191,7 @@ func TestAlterChangefeedAddTargetsDuringSchemaChangeError(t *testing.T) {
 			}
 
 			// Check if we've set a checkpoint yet
-			progress := loadProgress()
+			progress := loadProgress(t, jobFeed, jobRegistry)
 			if p := progress.GetChangefeed(); p != nil && p.Checkpoint != nil && len(p.Checkpoint.Spans) > 0 {
 				initialCheckpoint.Add(p.Checkpoint.Spans...)
 				atomic.StoreInt32(&foundCheckpoint, 1)
@@ -1238,7 +1219,10 @@ func TestAlterChangefeedAddTargetsDuringSchemaChangeError(t *testing.T) {
 			if atomic.LoadInt32(&foundCheckpoint) != 0 {
 				return nil
 			}
-			return errors.New("waiting for checkpoint")
+			if err := jobFeed.FetchTerminalJobErr(); err != nil {
+				return err
+			}
+			return errors.Newf("waiting for checkpoint")
 		})
 
 		require.NoError(t, jobFeed.Pause())
@@ -1339,16 +1323,10 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 		}()
 
 		jobFeed := testFeed.(cdctest.EnterpriseTestFeed)
-		loadProgress := func() jobspb.Progress {
-			jobID := jobFeed.JobID()
-			job, err := registry.LoadJob(context.Background(), jobID)
-			require.NoError(t, err)
-			return job.Progress()
-		}
 
 		// Wait for non-nil checkpoint.
 		testutils.SucceedsSoon(t, func() error {
-			progress := loadProgress()
+			progress := loadProgress(t, jobFeed, registry)
 			if p := progress.GetChangefeed(); p != nil && p.Checkpoint != nil && len(p.Checkpoint.Spans) > 0 {
 				return nil
 			}
@@ -1357,7 +1335,7 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 
 		// Pause the job and read and verify the latest checkpoint information.
 		require.NoError(t, jobFeed.Pause())
-		progress := loadProgress()
+		progress := loadProgress(t, jobFeed, registry)
 		require.NotNil(t, progress.GetChangefeed())
 		h := progress.GetHighWater()
 		noHighWater := h == nil || h.IsEmpty()
@@ -1385,7 +1363,7 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 
 		// Wait for the high water mark to be non-zero.
 		testutils.SucceedsSoon(t, func() error {
-			prog := loadProgress()
+			prog := loadProgress(t, jobFeed, registry)
 			if p := prog.GetHighWater(); p != nil && !p.IsEmpty() {
 				return nil
 			}
@@ -1393,7 +1371,7 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 		})
 
 		// At this point, highwater mark should be set, and previous checkpoint should be gone.
-		progress = loadProgress()
+		progress = loadProgress(t, jobFeed, registry)
 		require.NotNil(t, progress.GetChangefeed())
 		require.Equal(t, 0, len(progress.GetChangefeed().Checkpoint.Spans))
 
@@ -1408,89 +1386,9 @@ func TestAlterChangefeedAddTargetsDuringBackfill(t *testing.T) {
 	cdcTestWithSystem(t, testFn, feedTestEnterpriseSinks, feedTestNoExternalConnection, feedTestNoForcedSyntheticTimestamps)
 }
 
-func TestAlterChangefeedUpdateFilter(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	// Skip this test for now.  It used to test alter changefeed with
-	// now deprecated and removed 'primary_key_filter' option.
-	// Since predicates and projections are no longer a "string" option,
-	// alter statement implementation (and grammar) needs to be updated, and
-	// this test modified and re-enabled.
-	skip.WithIssue(t, 82491)
-
-	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
-		sqlDB := sqlutils.MakeSQLRunner(s.DB)
-		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
-
-		testFeed := feed(t, f, `CREATE CHANGEFEED FOR foo`)
-		defer closeFeed(t, testFeed)
-
-		sqlDB.Exec(t, `INSERT INTO foo  SELECT *, 'initial' FROM generate_series(1, 5)`)
-		assertPayloads(t, testFeed, []string{
-			`foo: [1]->{"after": {"a": 1, "b": "initial"}}`,
-			`foo: [2]->{"after": {"a": 2, "b": "initial"}}`,
-			`foo: [3]->{"after": {"a": 3, "b": "initial"}}`,
-			`foo: [4]->{"after": {"a": 4, "b": "initial"}}`,
-			`foo: [5]->{"after": {"a": 5, "b": "initial"}}`,
-		})
-
-		feed, ok := testFeed.(cdctest.EnterpriseTestFeed)
-		require.True(t, ok)
-
-		require.NoError(t, feed.TickHighWaterMark(s.Server.Clock().Now()))
-		require.NoError(t, feed.Pause())
-
-		// Try to set an invalid filter (column b is not part of primary key).
-		sqlDB.ExpectErr(t, "cannot be fully constrained",
-			fmt.Sprintf(`ALTER CHANGEFEED %d SET schema_change_policy='stop', primary_key_filter='b IS NULL'`, feed.JobID()))
-
-		// Set filter to emit a > 4.  We expect to see update row 5, and onward.
-		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d SET schema_change_policy='stop', primary_key_filter='a > 4'`, feed.JobID()))
-		require.NoError(t, feed.Resume())
-
-		// Upsert 10 new values -- we expect to see only 5-10
-		sqlDB.Exec(t, `UPSERT INTO foo  SELECT *, 'updated' FROM generate_series(1, 10)`)
-		assertPayloads(t, testFeed, []string{
-			`foo: [5]->{"after": {"a": 5, "b": "updated"}}`,
-			`foo: [6]->{"after": {"a": 6, "b": "updated"}}`,
-			`foo: [7]->{"after": {"a": 7, "b": "updated"}}`,
-			`foo: [8]->{"after": {"a": 8, "b": "updated"}}`,
-			`foo: [9]->{"after": {"a": 9, "b": "updated"}}`,
-			`foo: [10]->{"after": {"a": 10, "b": "updated"}}`,
-		})
-
-		// Pause again, clear out filter and verify we get expected values.
-		require.NoError(t, feed.TickHighWaterMark(s.Server.Clock().Now()))
-		require.NoError(t, feed.Pause())
-
-		// Set filter to emit a > 4.  We expect to see update row 5, and onward.
-		sqlDB.Exec(t, fmt.Sprintf(`ALTER CHANGEFEED %d UNSET primary_key_filter`, feed.JobID()))
-		require.NoError(t, feed.Resume())
-
-		sqlDB.Exec(t, `UPSERT INTO foo  SELECT *, 'new value' FROM generate_series(1, 10)`)
-		assertPayloads(t, testFeed, []string{
-			`foo: [1]->{"after": {"a": 1, "b": "new value"}}`,
-			`foo: [2]->{"after": {"a": 2, "b": "new value"}}`,
-			`foo: [3]->{"after": {"a": 3, "b": "new value"}}`,
-			`foo: [4]->{"after": {"a": 4, "b": "new value"}}`,
-			`foo: [5]->{"after": {"a": 5, "b": "new value"}}`,
-			`foo: [6]->{"after": {"a": 6, "b": "new value"}}`,
-			`foo: [7]->{"after": {"a": 7, "b": "new value"}}`,
-			`foo: [8]->{"after": {"a": 8, "b": "new value"}}`,
-			`foo: [9]->{"after": {"a": 9, "b": "new value"}}`,
-			`foo: [10]->{"after": {"a": 10, "b": "new value"}}`,
-		})
-	}
-
-	cdcTest(t, testFn, feedTestEnterpriseSinks, feedTestNoExternalConnection)
-}
-
 func TestAlterChangefeedInitialScan(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-
-	skip.WithIssue(t, 83946)
 
 	testFn := func(initialScanOption string) cdcTestFn {
 		return func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
@@ -1569,14 +1467,8 @@ func TestAlterChangefeedWithOldCursorFromCreateChangefeed(t *testing.T) {
 		castedFeed, ok := testFeed.(cdctest.EnterpriseTestFeed)
 		require.True(t, ok)
 
-		loadProgress := func() jobspb.Progress {
-			job, err := registry.LoadJob(context.Background(), castedFeed.JobID())
-			require.NoError(t, err)
-			return job.Progress()
-		}
-
 		testutils.SucceedsSoon(t, func() error {
-			progress := loadProgress()
+			progress := loadProgress(t, castedFeed, registry)
 			if hw := progress.GetHighWater(); hw != nil && cursor.LessEq(*hw) {
 				return nil
 			}

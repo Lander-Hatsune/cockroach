@@ -478,7 +478,7 @@ AND info NOT LIKE '%sql.stats%'
 ORDER BY "timestamp", info
 ----
 1  {"ApplicationName": "$ internal-optInToDiagnosticsStatReporting", "EventType": "set_cluster_setting", "SettingName": "diagnostics.reporting.enabled", "Statement": "SET CLUSTER SETTING \"diagnostics.reporting.enabled\" = true", "Tag": "SET CLUSTER SETTING", "User": "root", "Value": "true"}
-1  {"EventType": "set_cluster_setting", "SettingName": "kv.range_merge.queue_enabled", "Statement": "SET CLUSTER SETTING \"kv.range_merge.queue_enabled\" = false", "Tag": "SET CLUSTER SETTING", "User": "root", "Value": "false"}
+1  {"ApplicationName": "$ internal-enable-merge-queue", "EventType": "set_cluster_setting", "SettingName": "kv.range_merge.queue_enabled", "Statement": "SET CLUSTER SETTING \"kv.range_merge.queue_enabled\" = false", "Tag": "SET CLUSTER SETTING", "User": "root", "Value": "false"}
 1  {"EventType": "set_cluster_setting", "SettingName": "sql.crdb_internal.table_row_statistics.as_of_time", "Statement": "SET CLUSTER SETTING \"sql.crdb_internal.table_row_statistics.as_of_time\" = e'-1\\u00B5s'", "Tag": "SET CLUSTER SETTING", "User": "root", "Value": "-00:00:00.000001"}
 1  {"EventType": "set_cluster_setting", "SettingName": "kv.allocator.load_based_lease_rebalancing.enabled", "Statement": "SET CLUSTER SETTING \"kv.allocator.load_based_lease_rebalancing.enabled\" = false", "Tag": "SET CLUSTER SETTING", "User": "root", "Value": "false"}
 1  {"EventType": "set_cluster_setting", "SettingName": "kv.allocator.load_based_lease_rebalancing.enabled", "Statement": "SET CLUSTER SETTING \"kv.allocator.load_based_lease_rebalancing.enabled\" = DEFAULT", "Tag": "SET CLUSTER SETTING", "User": "root", "Value": "DEFAULT"}
@@ -578,7 +578,7 @@ SELECT "eventType", "reportingID", info::JSONB - 'Timestamp' - 'DescriptorID'
  WHERE "eventType" in ('create_view', 'drop_view')
 ORDER BY "timestamp", info
 ----
-create_view  1  {"EventType": "create_view", "Statement": "CREATE VIEW \"\".\"\".v AS SELECT 1", "Tag": "CREATE VIEW", "User": "root", "ViewName": "test.public.v", "ViewQuery": "SELECT 1"}
+create_view  1  {"EventType": "create_view", "Statement": "CREATE VIEW test.public.v AS SELECT 1", "Tag": "CREATE VIEW", "User": "root", "ViewName": "test.public.v", "ViewQuery": "SELECT 1"}
 drop_view    1  {"EventType": "drop_view", "Statement": "DROP VIEW test.public.v", "Tag": "DROP VIEW", "User": "root", "ViewName": "test.public.v"}
 
 

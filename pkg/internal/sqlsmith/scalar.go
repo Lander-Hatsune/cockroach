@@ -233,6 +233,9 @@ func getColRef(s *Smither, typ *types.T, refs colRefs) (tree.TypedExpr, *colRef,
 	if s.disableDecimals && col.typ.Family() == types.DecimalFamily {
 		return nil, nil, false
 	}
+	if s.disableOIDs && col.typ.Family() == types.OidFamily {
+		return nil, nil, false
+	}
 	return col.typedExpr(), col, true
 }
 
@@ -410,7 +413,9 @@ func makeFunc(s *Smither, ctx Context, typ *types.T, refs colRefs) (tree.TypedEx
 	if class == tree.WindowClass && s.d6() != 1 {
 		class = tree.NormalClass
 	}
-	fns := functions[class][typ.Oid()]
+	functions.Lock()
+	fns := functions.fns[class][typ.Oid()]
+	functions.Unlock()
 	if len(fns) == 0 {
 		return nil, false
 	}

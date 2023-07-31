@@ -246,6 +246,10 @@ type Descriptor interface {
 	// in progress, either legacy or declarative.
 	HasConcurrentSchemaChanges() bool
 
+	// ConcurrentSchemaChangeJobIDs returns all in-progress schema change
+	// jobs, either legacy or declarative.
+	ConcurrentSchemaChangeJobIDs() []catpb.JobID
+
 	// SkipNamespace is true when a descriptor should not have a namespace record.
 	SkipNamespace() bool
 
@@ -972,7 +976,7 @@ type FunctionDescriptor interface {
 
 	// ToCreateExpr converts a function descriptor back to a CREATE FUNCTION
 	// statement. This is mainly used for formatting, e.g. SHOW CREATE FUNCTION.
-	ToCreateExpr() (*tree.CreateFunction, error)
+	ToCreateExpr() (*tree.CreateRoutine, error)
 }
 
 // FilterDroppedDescriptor returns an error if the descriptor state is DROP.

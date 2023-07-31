@@ -11,15 +11,12 @@
 package jobs_test
 
 import (
-	"archive/zip"
 	"context"
 	gosql "database/sql"
 	"fmt"
-	"os"
 	"path/filepath"
 	"reflect"
 	"runtime/pprof"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -33,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprotectedts"
 	"github.com/cockroachdb/cockroach/pkg/keyvisualizer"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -47,7 +43,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -1032,6 +1027,7 @@ func TestRegistryLifecycle(t *testing.T) {
 	})
 
 	t.Run("dump traces on pause-unpause-success", func(t *testing.T) {
+		ctx := context.Background()
 		completeCh := make(chan struct{})
 		rts := registryTestSuite{traceRealSpan: true, afterJobStateMachine: func() {
 			completeCh <- struct{}{}
@@ -1054,7 +1050,7 @@ func TestRegistryLifecycle(t *testing.T) {
 			rts.check(t, jobs.StatusPaused)
 
 			<-completeCh
-			checkTraceFiles(t, rts.registry, expectedNumFiles)
+			checkTraceFiles(ctx, t, expectedNumFiles, j.ID(), rts.s)
 
 			rts.sqlDB.Exec(t, "RESUME JOB $1", j.ID())
 
@@ -1068,19 +1064,13 @@ func TestRegistryLifecycle(t *testing.T) {
 			rts.check(t, jobs.StatusSucceeded)
 
 			<-completeCh
-			checkTraceFiles(t, rts.registry, expectedNumFiles)
+			checkTraceFiles(ctx, t, expectedNumFiles+2, j.ID(), rts.s)
 		}
-		rts.sqlDB.Exec(t, `SET CLUSTER SETTING jobs.trace.force_dump_mode='never'`)
-		pauseUnpauseJob(0)
-
-		rts.sqlDB.Exec(t, `SET CLUSTER SETTING jobs.trace.force_dump_mode='onFail'`)
-		pauseUnpauseJob(0)
-
-		rts.sqlDB.Exec(t, `SET CLUSTER SETTING jobs.trace.force_dump_mode='onStop'`)
-		pauseUnpauseJob(1)
+		pauseUnpauseJob(2)
 	})
 
 	t.Run("dump traces on fail", func(t *testing.T) {
+		ctx := context.Background()
 		completeCh := make(chan struct{})
 		rts := registryTestSuite{traceRealSpan: true, afterJobStateMachine: func() {
 			completeCh <- struct{}{}
@@ -1089,7 +1079,7 @@ func TestRegistryLifecycle(t *testing.T) {
 		defer rts.tearDown()
 
 		runJobAndFail := func(expectedNumFiles int) {
-			j, err := jobs.TestingCreateAndStartJob(context.Background(), rts.registry, rts.idb(), rts.mockJob)
+			j, err := jobs.TestingCreateAndStartJob(ctx, rts.registry, rts.idb(), rts.mockJob)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1110,17 +1100,10 @@ func TestRegistryLifecycle(t *testing.T) {
 			rts.check(t, jobs.StatusFailed)
 
 			<-completeCh
-			checkTraceFiles(t, rts.registry, expectedNumFiles)
+			checkTraceFiles(ctx, t, expectedNumFiles, j.ID(), rts.s)
 		}
 
-		rts.sqlDB.Exec(t, `SET CLUSTER SETTING jobs.trace.force_dump_mode='never'`)
-		runJobAndFail(0)
-
-		rts.sqlDB.Exec(t, `SET CLUSTER SETTING jobs.trace.force_dump_mode='onFail'`)
-		runJobAndFail(1)
-
-		rts.sqlDB.Exec(t, `SET CLUSTER SETTING jobs.trace.force_dump_mode='onStop'`)
-		runJobAndFail(1)
+		runJobAndFail(2)
 	})
 
 	t.Run("dump traces on cancel", func(t *testing.T) {
@@ -1130,7 +1113,6 @@ func TestRegistryLifecycle(t *testing.T) {
 		}}
 		rts.setUp(t)
 		defer rts.tearDown()
-		rts.sqlDB.Exec(t, `SET CLUSTER SETTING jobs.trace.force_dump_mode='onStop'`)
 		j, err := jobs.TestingCreateAndStartJob(rts.ctx, rts.registry, rts.idb(), rts.mockJob)
 		if err != nil {
 			t.Fatal(err)
@@ -1144,7 +1126,7 @@ func TestRegistryLifecycle(t *testing.T) {
 		rts.sqlDB.Exec(t, "CANCEL JOB $1", j.ID())
 
 		<-completeCh
-		checkTraceFiles(t, rts.registry, 1)
+		checkTraceFiles(rts.ctx, t, 2, j.ID(), rts.s)
 
 		rts.mu.e.OnFailOrCancelStart = true
 		rts.check(t, jobs.StatusReverting)
@@ -1198,28 +1180,35 @@ func TestRegistryLifecycle(t *testing.T) {
 	})
 }
 
-func checkTraceFiles(t *testing.T, registry *jobs.Registry, expectedNumFiles int) {
+func checkTraceFiles(
+	ctx context.Context,
+	t *testing.T,
+	expectedNumFiles int,
+	jobID jobspb.JobID,
+	s serverutils.TestServerInterface,
+) {
 	t.Helper()
-	// Check the configured inflight trace dir for dumped zip files.
-	expList := []string{"node1-trace.txt", "node1-jaeger.json"}
-	traceDumpDir := jobs.TestingGetTraceDumpDir(registry)
-	files := make([]string, 0)
-	require.NoError(t, filepath.Walk(traceDumpDir, func(path string, info os.FileInfo, err error) error {
-		if info.IsDir() {
-			return nil
+
+	recordings := make([][]byte, 0)
+	execCfg := s.ApplicationLayer().ExecutorConfig().(sql.ExecutorConfig)
+	edFiles, err := jobs.ListExecutionDetailFiles(ctx, execCfg.InternalDB, jobID)
+	require.NoError(t, err)
+	require.Len(t, edFiles, expectedNumFiles)
+
+	for _, f := range edFiles {
+		data, err := jobs.ReadExecutionDetailFile(ctx, f, execCfg.InternalDB, jobID)
+		require.NoError(t, err)
+		// Trace files are dumped in `binpb` and `binpb.txt` format. The former
+		// should be unmarshal-able.
+		if strings.HasSuffix(f, "binpb") {
+			td := jobspb.TraceData{}
+			require.NoError(t, protoutil.Unmarshal(data, &td))
+			require.NotEmpty(t, td.CollectedSpans)
 		}
-		files = append(files, path)
-		return nil
-	}))
-
-	require.Equal(t, expectedNumFiles, len(files))
-	for _, file := range files {
-		checkBundle(t, file, expList)
+		recordings = append(recordings, data)
 	}
-
-	// Cleanup files for next iteration of the test.
-	for _, file := range files {
-		require.NoError(t, os.Remove(file))
+	if len(recordings) != expectedNumFiles {
+		t.Fatalf("expected %d entries but found %d", expectedNumFiles, len(recordings))
 	}
 }
 
@@ -1234,10 +1223,11 @@ func TestJobLifecycle(t *testing.T) {
 
 	ctx := context.Background()
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
 	params.Knobs.JobsTestingKnobs = &jobs.TestingKnobs{DisableRegistryLifecycleManagent: true}
-	s, sqlDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, sqlDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
 
 	registry := s.JobRegistry().(*jobs.Registry)
 
@@ -1815,7 +1805,7 @@ func TestShowJobs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 	s, rawSQLDB, _ := serverutils.StartServer(t, params)
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
@@ -1967,7 +1957,7 @@ func TestShowAutomaticJobs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
 	params.Knobs.KeyVisualizer = &keyvisualizer.TestingKnobs{
 		SkipJobBootstrap: true,
 	}
@@ -1977,7 +1967,7 @@ func TestShowAutomaticJobs(t *testing.T) {
 	params.Knobs.UpgradeManager = &upgradebase.TestingKnobs{DontUseJobs: true}
 	s, rawSQLDB, _ := serverutils.StartServer(t, params)
 	ctx := context.Background()
-	r := s.JobRegistry().(*jobs.Registry)
+	r := s.ApplicationLayer().JobRegistry().(*jobs.Registry)
 	sqlDB := sqlutils.MakeSQLRunner(rawSQLDB)
 	defer s.Stopper().Stop(context.Background())
 
@@ -2097,7 +2087,7 @@ func TestShowJobsWithError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
 	params.Knobs.UpgradeManager = &upgradebase.TestingKnobs{
 		DontUseJobs:                       true,
 		SkipJobMetricsPollingJobBootstrap: true,
@@ -2125,7 +2115,7 @@ SELECT id, payload, progress FROM "".crdb_internal.system_jobs ORDER BY id DESC 
 	}
 
 	// Create 3 rows from the valid row, one of which is corrupted.
-	createJob(context.Background(), t, s.JobRegistry().(*jobs.Registry), jobID+1, payload, progress)
+	createJob(context.Background(), t, s.ApplicationLayer().JobRegistry().(*jobs.Registry), jobID+1, payload, progress)
 
 	// Create the second row with a corrupted progress field.
 	if _, err := sqlDB.Exec(`
@@ -2568,7 +2558,7 @@ func TestStartableJob(t *testing.T) {
 	defer jobs.ResetConstructors()()
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	jr := s.JobRegistry().(*jobs.Registry)
 	var resumeFunc atomic.Value
@@ -2758,24 +2748,12 @@ func TestStartableJobTxnRetry(t *testing.T) {
 	ctx := context.Background()
 
 	const txnName = "create job"
-	haveInjectedRetry := false
 	params := base.TestServerArgs{}
+	requestFilter, verifyFunc := testutils.TestingRequestFilterRetryTxnWithPrefix(t, txnName, 1)
 	params.Knobs.Store = &kvserver.StoreTestingKnobs{
-		TestingRequestFilter: func(ctx context.Context, r *kvpb.BatchRequest) *kvpb.Error {
-			if r.Txn == nil || r.Txn.Name != txnName {
-				return nil
-			}
-			if _, ok := r.GetArg(kvpb.EndTxn); ok {
-				if !haveInjectedRetry {
-					haveInjectedRetry = true
-					// Force a retry error the first time.
-					return kvpb.NewError(kvpb.NewTransactionRetryError(kvpb.RETRY_REASON_UNKNOWN, "injected error"))
-				}
-			}
-			return nil
-		},
+		TestingRequestFilter: requestFilter,
 	}
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(ctx)
 	jr := s.JobRegistry().(*jobs.Registry)
 	jobs.RegisterConstructor(jobspb.TypeRestore, func(job *jobs.Job, settings *cluster.Settings) jobs.Resumer {
@@ -2794,7 +2772,7 @@ func TestStartableJobTxnRetry(t *testing.T) {
 		txn.KV().SetDebugName(txnName)
 		return jr.CreateStartableJobWithTxn(ctx, &sj, jobID, txn, rec)
 	}))
-	require.True(t, haveInjectedRetry)
+	verifyFunc()
 	require.NoError(t, sj.Start(ctx))
 }
 
@@ -2805,7 +2783,7 @@ func TestRegistryTestingNudgeAdoptionQueue(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
 
@@ -3125,7 +3103,7 @@ func TestLoseLeaseDuringExecution(t *testing.T) {
 
 	ctx := context.Background()
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{Knobs: knobs})
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{Knobs: knobs})
 	defer s.Stopper().Stop(ctx)
 	registry := s.JobRegistry().(*jobs.Registry)
 
@@ -3162,25 +3140,6 @@ func TestLoseLeaseDuringExecution(t *testing.T) {
 	require.NoError(t, err)
 	registry.TestingNudgeAdoptionQueue()
 	require.Regexp(t, `expected session "\w+" but found NULL`, <-resumed)
-}
-
-func checkBundle(t *testing.T, zipFile string, expectedFiles []string) {
-	t.Helper()
-	r, err := zip.OpenReader(zipFile)
-	defer func() { _ = r.Close() }()
-	require.NoError(t, err)
-
-	// Make sure the bundle contains the expected list of files.
-	filesInZip := make([]string, 0)
-	for _, f := range r.File {
-		if f.UncompressedSize64 == 0 {
-			t.Fatalf("file %s is empty", f.Name)
-		}
-		filesInZip = append(filesInZip, f.Name)
-	}
-	sort.Strings(filesInZip)
-	sort.Strings(expectedFiles)
-	require.Equal(t, expectedFiles, filesInZip)
 }
 
 type resumeStartedSignaler struct {

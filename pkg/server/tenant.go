@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptprovider"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts/ptreconcile"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/multitenantcpu"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitiesauthorizer"
@@ -46,7 +47,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
+	"github.com/cockroachdb/cockroach/pkg/server/apiutil"
+	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
+	"github.com/cockroachdb/cockroach/pkg/server/privchecker"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/structlogging"
@@ -66,6 +70,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/logmetrics"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/netutil"
 	"github.com/cockroachdb/cockroach/pkg/util/schedulerlatency"
@@ -100,11 +105,11 @@ type SQLServerWrapper struct {
 	runtime    *status.RuntimeStatSampler
 
 	http            *httpServer
-	adminAuthzCheck *adminPrivilegeChecker
+	adminAuthzCheck privchecker.CheckerForRPCHandlers
 	tenantAdmin     *adminServer
 	tenantStatus    *statusServer
 	drainServer     *drainServer
-	authentication  *authenticationServer
+	authentication  authserver.Server
 	// eventsExporter exports data to the Observability Service.
 	eventsExporter obs.EventsExporterInterface
 	stopper        *stop.Stopper
@@ -192,7 +197,7 @@ func NewSeparateProcessTenantServer(
 		},
 	}
 
-	return newTenantServer(ctx, stopper, baseCfg, sqlCfg, tenantNameContainer, deps)
+	return newTenantServer(ctx, stopper, baseCfg, sqlCfg, tenantNameContainer, deps, mtinfopb.ServiceModeExternal)
 }
 
 // newSharedProcessTenantServer creates a tenant-specific, SQL-only
@@ -226,7 +231,7 @@ func newSharedProcessTenantServer(
 			return spanconfiglimiter.NoopLimiter{}
 		},
 	}
-	return newTenantServer(ctx, stopper, baseCfg, sqlCfg, tenantNameContainer, deps)
+	return newTenantServer(ctx, stopper, baseCfg, sqlCfg, tenantNameContainer, deps, mtinfopb.ServiceModeShared)
 }
 
 // newTenantServer constructs a SQLServerWrapper.
@@ -239,6 +244,7 @@ func newTenantServer(
 	sqlCfg SQLConfig,
 	tenantNameContainer *roachpb.TenantNameContainer,
 	deps tenantServerDeps,
+	serviceMode mtinfopb.TenantServiceMode,
 ) (*SQLServerWrapper, error) {
 	// TODO(knz): Make the license application a per-server thing
 	// instead of a global thing.
@@ -250,7 +256,7 @@ func newTenantServer(
 	// Inform the server identity provider that we're operating
 	// for a tenant server.
 	baseCfg.idProvider.SetTenant(sqlCfg.TenantID)
-	args, err := makeTenantSQLServerArgs(ctx, stopper, baseCfg, sqlCfg, tenantNameContainer, deps)
+	args, err := makeTenantSQLServerArgs(ctx, stopper, baseCfg, sqlCfg, tenantNameContainer, deps, serviceMode)
 	if err != nil {
 		return nil, err
 	}
@@ -264,11 +270,7 @@ func newTenantServer(
 	// Instantiate the API privilege checker.
 	//
 	// TODO(tbg): give adminServer only what it needs (and avoid circular deps).
-	adminAuthzCheck := &adminPrivilegeChecker{
-		ie:          args.circularInternalExecutor,
-		st:          args.Settings,
-		makePlanner: nil,
-	}
+	adminAuthzCheck := privchecker.NewChecker(args.circularInternalExecutor, args.Settings)
 
 	// Instantiate the HTTP server.
 	// These callbacks help us avoid a dependency on gossip in httpServer.
@@ -360,11 +362,11 @@ func newTenantServer(
 	sqlServer.migrationServer = tms // only for testing via TestTenant
 
 	// Tell the authz server how to connect to SQL.
-	adminAuthzCheck.makePlanner = func(opName string) (interface{}, func()) {
+	adminAuthzCheck.SetAuthzAccessorFactory(func(opName string) (sql.AuthorizationAccessor, func()) {
 		// This is a hack to get around a Go package dependency cycle. See comment
 		// in sql/jobs/registry.go on planHookMaker.
 		txn := args.db.NewTxn(ctx, "check-system-privilege")
-		return sql.NewInternalPlanner(
+		p, cleanup := sql.NewInternalPlanner(
 			opName,
 			txn,
 			username.RootUserName(),
@@ -372,10 +374,11 @@ func newTenantServer(
 			sqlServer.execCfg,
 			sql.NewInternalSessionData(ctx, sqlServer.execCfg.Settings, opName),
 		)
-	}
+		return p.(sql.AuthorizationAccessor), cleanup
+	})
 
 	// Create the authentication RPC server (login/logout).
-	sAuth := newAuthenticationServer(baseCfg.Config, sqlServer)
+	sAuth := authserver.NewServer(baseCfg.Config, sqlServer)
 
 	// Create a drain server.
 	drainServer := newDrainServer(baseCfg, args.stopper, args.stopTrigger, args.grpc, sqlServer)
@@ -403,13 +406,15 @@ func newTenantServer(
 	}
 
 	// Tell the status/admin servers how to access SQL structures.
-	//
-	// TODO(knz): If/when we want to support statement diagnostic requests
-	// in secondary tenants, this is where we would call setStmtDiagnosticsRequester(),
-	// like in NewServer().
+	sStatus.setStmtDiagnosticsRequester(sqlServer.execCfg.StmtDiagnosticsRecorder)
 	serverIterator.sqlServer = sqlServer
 	sStatus.baseStatusServer.sqlServer = sqlServer
 	sAdmin.sqlServer = sqlServer
+
+	var processCapAuthz tenantcapabilities.Authorizer = &tenantcapabilitiesauthorizer.AllowEverythingAuthorizer{}
+	if lsi := sqlCfg.LocalKVServerInfo; lsi != nil {
+		processCapAuthz = lsi.SameProcessCapabilityAuthorizer
+	}
 
 	// Create the debug API server.
 	debugServer := debug.NewServer(
@@ -418,6 +423,8 @@ func newTenantServer(
 		sqlServer.pgServer.HBADebugFn(),
 		sqlServer.execCfg.SQLStatusServer,
 		nil, /* serverTickleFn */
+		sqlCfg.TenantID,
+		processCapAuthz,
 	)
 
 	return &SQLServerWrapper{
@@ -635,9 +642,16 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		})
 	})
 
+	// Init a log metrics registry.
+	logRegistry := logmetrics.NewRegistry()
+	if logRegistry == nil {
+		panic(errors.AssertionFailedf("nil log metrics registry at server startup"))
+	}
+
 	// We can now add the node registry.
 	s.recorder.AddNode(
 		s.registry,
+		logRegistry,
 		roachpb.NodeDescriptor{
 			NodeID: s.rpcContext.NodeID.Get(),
 		},
@@ -718,7 +732,7 @@ func (s *SQLServerWrapper) PreStart(ctx context.Context) error {
 		gwMux,             /* handleRequestsUnauthenticated */
 		s.debug,           /* handleDebugUnauthenticated */
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			writeJSONResponse(r.Context(), w, http.StatusNotImplemented, nil)
+			apiutil.WriteJSONResponse(r.Context(), w, http.StatusNotImplemented, nil)
 		}),
 		newAPIV2Server(workersCtx, &apiV2ServerOpts{
 			admin:            s.tenantAdmin,
@@ -826,8 +840,12 @@ func (s *SQLServerWrapper) serveConn(
 	pgServer := s.PGServer()
 	switch status.State {
 	case pgwire.PreServeCancel:
-		pgServer.HandleCancel(ctx, status.CancelKey)
-		return nil
+		// Cancel requests are unauthenticated so run the cancel async to prevent
+		// the client from deriving any info about the cancel based on how long it
+		// takes.
+		return s.stopper.RunAsyncTask(ctx, "cancel", func(ctx context.Context) {
+			pgServer.HandleCancel(ctx, status.CancelKey)
+		})
 	case pgwire.PreServeReady:
 		return pgServer.ServeConn(ctx, conn, status)
 	default:
@@ -951,6 +969,7 @@ func makeTenantSQLServerArgs(
 	sqlCfg SQLConfig,
 	tenantNameContainer *roachpb.TenantNameContainer,
 	deps tenantServerDeps,
+	serviceMode mtinfopb.TenantServiceMode,
 ) (sqlServerArgs, error) {
 	st := baseCfg.Settings
 
@@ -967,8 +986,10 @@ func makeTenantSQLServerArgs(
 	promRuleExporter := metric.NewPrometheusRuleExporter(ruleRegistry)
 
 	var rpcTestingKnobs rpc.ContextTestingKnobs
+	var testingKnobShutdownTenantConnectorEarlyIfNoRecordPresent bool
 	if p, ok := baseCfg.TestingKnobs.Server.(*TestingKnobs); ok {
 		rpcTestingKnobs = p.ContextTestingKnobs
+		testingKnobShutdownTenantConnectorEarlyIfNoRecordPresent = p.ShutdownTenantConnectorEarlyIfNoRecordPresent
 	}
 
 	// This tenant's SQL server only serves SQL connections and SQL-to-SQL
@@ -1033,6 +1054,8 @@ func makeTenantSQLServerArgs(
 		RPCContext:        rpcContext,
 		RPCRetryOptions:   rpcRetryOptions,
 		DefaultZoneConfig: &baseCfg.DefaultZoneConfig,
+
+		ShutdownTenantConnectorEarlyIfNoRecordPresent: testingKnobShutdownTenantConnectorEarlyIfNoRecordPresent,
 	}
 	kvAddressConfig := kvtenant.KVAddressConfig{RemoteAddresses: sqlCfg.TenantKVAddrs, LoopbackAddress: sqlCfg.TenantLoopbackAddr}
 	tenantConnect, err := kvtenant.Factory.NewConnector(tcCfg, kvAddressConfig)
@@ -1212,6 +1235,7 @@ func makeTenantSQLServerArgs(
 		sqlServerOptionalTenantArgs: sqlServerOptionalTenantArgs{
 			spanLimiterFactory: deps.spanLimiterFactory,
 			tenantConnect:      tenantConnect,
+			serviceMode:        serviceMode,
 			promRuleExporter:   promRuleExporter,
 		},
 		SQLConfig:                &sqlCfg,

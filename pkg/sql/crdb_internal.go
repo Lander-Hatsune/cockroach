@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsauth"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
@@ -97,7 +96,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
-	"github.com/cockroachdb/cockroach/pkg/util/tracing/collector"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
@@ -216,6 +214,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalKVFlowHandlesID:                    crdbInternalKVFlowHandles,
 		catconstants.CrdbInternalKVFlowControllerID:                 crdbInternalKVFlowController,
 		catconstants.CrdbInternalKVFlowTokenDeductions:              crdbInternalKVFlowTokenDeductions,
+		catconstants.CrdbInternalRepairableCatalogCorruptionsViewID: crdbInternalRepairableCatalogCorruptions,
 	},
 	validWithNoDatabaseContext: true,
 }
@@ -1070,7 +1069,7 @@ func populateSystemJobsTableRows(
 		params...,
 	)
 	if err != nil {
-		return matched, err
+		return matched, jobs.MaybeGenerateForcedRetryableError(ctx, p.Txn(), err)
 	}
 
 	cleanup := func(ctx context.Context) {
@@ -1083,7 +1082,7 @@ func populateSystemJobsTableRows(
 	for {
 		hasNext, err := it.Next(ctx)
 		if !hasNext || err != nil {
-			return matched, err
+			return matched, jobs.MaybeGenerateForcedRetryableError(ctx, p.Txn(), err)
 		}
 
 		currentRow := it.Cur()
@@ -1516,12 +1515,24 @@ CREATE TABLE crdb_internal.node_statement_statistics (
   latency_seconds_p99 FLOAT
 )`,
 	populate: func(ctx context.Context, p *planner, _ catalog.DatabaseDescriptor, addRow func(...tree.Datum) error) error {
-		hasViewActivityOrViewActivityRedacted, err := p.HasViewActivityOrViewActivityRedactedRole(ctx)
-		if err != nil {
+		shouldRedactError := false
+		// Check if the user is admin.
+		if isAdmin, err := p.HasAdminRole(ctx); err != nil {
 			return err
-		}
-		if !hasViewActivityOrViewActivityRedacted {
-			return noViewActivityOrViewActivityRedactedRoleError(p.User())
+		} else if !isAdmin {
+			// If the user is not admin, check the individual VIEWACTIVITY and VIEWACTIVITYREDACTED
+			// privileges.
+			if hasViewActivityRedacted, err := p.HasViewActivityRedacted(ctx); err != nil {
+				return err
+			} else if hasViewActivityRedacted {
+				shouldRedactError = true
+			} else if hasViewActivity, err := p.HasViewActivity(ctx); err != nil {
+				return err
+			} else if !hasViewActivity {
+				// If the user is not admin and does not have VIEWACTIVITY or VIEWACTIVITYREDACTED,
+				// return insufficient privileges error.
+				return noViewActivityOrViewActivityRedactedRoleError(p.User())
+			}
 		}
 
 		var alloc tree.DatumAlloc
@@ -1530,8 +1541,12 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 
 		statementVisitor := func(_ context.Context, stats *appstatspb.CollectedStatementStatistics) error {
 			errString := tree.DNull
-			if stats.Stats.SensitiveInfo.LastErr != "" {
-				errString = alloc.NewDString(tree.DString(stats.Stats.SensitiveInfo.LastErr))
+			if shouldRedactError {
+				errString = alloc.NewDString(tree.DString("<redacted>"))
+			} else {
+				if stats.Stats.SensitiveInfo.LastErr != "" {
+					errString = alloc.NewDString(tree.DString(stats.Stats.SensitiveInfo.LastErr))
+				}
 			}
 
 			errCode := tree.DNull
@@ -1659,7 +1674,7 @@ CREATE TABLE crdb_internal.node_statement_statistics (
 			return nil
 		}
 
-		return sqlStats.GetLocalMemProvider().IterateStatementStats(ctx, &sqlstats.IteratorOptions{
+		return sqlStats.GetLocalMemProvider().IterateStatementStats(ctx, sqlstats.IteratorOptions{
 			SortedAppNames: true,
 			SortedKey:      true,
 		}, statementVisitor)
@@ -1817,7 +1832,7 @@ CREATE TABLE crdb_internal.node_transaction_statistics (
 			return nil
 		}
 
-		return sqlStats.GetLocalMemProvider().IterateTransactionStats(ctx, &sqlstats.IteratorOptions{
+		return sqlStats.GetLocalMemProvider().IterateTransactionStats(ctx, sqlstats.IteratorOptions{
 			SortedAppNames: true,
 			SortedKey:      true,
 		}, transactionVisitor)
@@ -1857,7 +1872,7 @@ CREATE TABLE crdb_internal.node_txn_stats (
 			)
 		}
 
-		return sqlStats.IterateAggregatedTransactionStats(ctx, &sqlstats.IteratorOptions{
+		return sqlStats.IterateAggregatedTransactionStats(ctx, sqlstats.IteratorOptions{
 			SortedAppNames: true,
 		}, appTxnStatsVisitor)
 	},
@@ -1943,8 +1958,11 @@ CREATE TABLE crdb_internal.cluster_inflight_traces (
 		}
 
 		traceCollector := p.ExecCfg().TraceCollector
-		var iter *collector.Iterator
-		for iter, err = traceCollector.StartIter(ctx, traceID); err == nil && iter.Valid(); iter.Next(ctx) {
+		iter, err := traceCollector.StartIter(ctx, traceID)
+		if err != nil {
+			return false, err
+		}
+		for ; iter.Valid(); iter.Next(ctx) {
 			nodeID, recording := iter.Value()
 			traceString := recording.String()
 			traceJaegerJSON, err := recording.ToJaegerJSON("", "", fmt.Sprintf("node %d", nodeID))
@@ -1958,12 +1976,6 @@ CREATE TABLE crdb_internal.cluster_inflight_traces (
 				tree.NewDString(traceJaegerJSON)); err != nil {
 				return false, err
 			}
-		}
-		if err != nil {
-			return false, err
-		}
-		if iter.Error() != nil {
-			return false, iter.Error()
 		}
 
 		return true, nil
@@ -3314,7 +3326,7 @@ CREATE TABLE crdb_internal.create_function_statements (
 				return err
 			}
 			treeNode, err := fnDesc.ToCreateExpr()
-			treeNode.FuncName.ObjectNamePrefix = tree.ObjectNamePrefix{
+			treeNode.Name.ObjectNamePrefix = tree.ObjectNamePrefix{
 				ExplicitSchema: true,
 				SchemaName:     tree.Name(fnIDToScName[fnDesc.GetID()]),
 			}
@@ -3322,7 +3334,7 @@ CREATE TABLE crdb_internal.create_function_statements (
 				return err
 			}
 			for i := range treeNode.Options {
-				if body, ok := treeNode.Options[i].(tree.FunctionBodyStr); ok {
+				if body, ok := treeNode.Options[i].(tree.RoutineBodyStr); ok {
 					typeReplacedBody, err := formatFunctionQueryTypesForDisplay(ctx, &p.semaCtx, p.SessionData(), string(body))
 					if err != nil {
 						return err
@@ -3337,7 +3349,7 @@ CREATE TABLE crdb_internal.create_function_statements (
 					}
 					p := &treeNode.Options[i]
 					// Add two new lines just for better formatting.
-					*p = "\n" + tree.FunctionBodyStr(strings.Join(stmtStrs, "\n")) + "\n"
+					*p = "\n" + tree.RoutineBodyStr(strings.Join(stmtStrs, "\n")) + "\n"
 				}
 			}
 
@@ -4595,6 +4607,7 @@ CREATE TABLE crdb_internal.gossip_nodes (
 			var gossipLiveness livenesspb.Liveness
 			if err := g.GetInfoProto(gossip.MakeNodeLivenessKey(d.NodeID), &gossipLiveness); err == nil {
 				if now.Before(gossipLiveness.Expiration.ToTimestamp().GoTime()) {
+					// TODO(baptist): This isn't the right way to check livenesses.
 					alive[d.NodeID] = true
 				}
 			}
@@ -4702,9 +4715,16 @@ CREATE TABLE crdb_internal.kv_node_liveness (
 			return err
 		}
 
-		livenesses, err := nl.GetLivenessesFromKV(ctx)
+		nodeVitality, err := nl.ScanNodeVitalityFromKV(ctx)
 		if err != nil {
 			return err
+		}
+
+		var livenesses []livenesspb.Liveness
+		for _, v := range nodeVitality {
+			// We want the generated liveness which will simulate the expiration if
+			// the liveness record is not being updated.
+			livenesses = append(livenesses, v.GenLiveness())
 		}
 
 		sort.Slice(livenesses, func(i, j int) bool {
@@ -5807,6 +5827,10 @@ CREATE TABLE crdb_internal.invalid_objects (
 					if dbContext != nil && d.GetParentID() != dbContext.GetID() {
 						return nil
 					}
+				case catalog.FunctionDescriptor:
+					if dbContext != nil && d.GetParentID() != dbContext.GetID() {
+						return nil
+					}
 				default:
 					return nil
 				}
@@ -6114,12 +6138,12 @@ CREATE TABLE crdb_internal.lost_descriptors_with_data (
 		hasData := func(startID, endID descpb.ID) (found bool, _ error) {
 			startPrefix := p.extendedEvalCtx.Codec.TablePrefix(uint32(startID))
 			endPrefix := p.extendedEvalCtx.Codec.TablePrefix(uint32(endID - 1)).PrefixEnd()
-			var b kv.Batch
+			b := p.Txn().NewBatch()
 			b.Header.MaxSpanRequestKeys = 1
 			scanRequest := kvpb.NewScan(startPrefix, endPrefix, false).(*kvpb.ScanRequest)
 			scanRequest.ScanFormat = kvpb.BATCH_RESPONSE
 			b.AddRawRequest(scanRequest)
-			err = p.execCfg.DB.Run(ctx, &b)
+			err = p.execCfg.DB.Run(ctx, b)
 			if err != nil {
 				return false, err
 			}
@@ -6160,6 +6184,84 @@ CREATE TABLE crdb_internal.lost_descriptors_with_data (
 		}
 		return nil
 	},
+}
+
+// crdbInternalRepairableCatalogCorruptions lists all corruptions in the
+// catalog which can be automatically repaired. By type:
+//   - 'descriptor' corruptions denote corruptions in the system.descriptor
+//     table which can be repaired by applying
+//     crdb_internal.unsafe_upsert_descriptor to the output of
+//     crdb_internal.repaired_descriptor,
+//   - 'namespace' corruptions denote corruptions in the system.namespace
+//     table which can be repaired by removing the corresponding record with
+//     crdb_internal.unsafe_delete_namespace_entry.
+var crdbInternalRepairableCatalogCorruptions = virtualSchemaView{
+	comment: "known corruptions in the catalog which can be repaired using builtin functions like " +
+		"crdb_internal.repaired_descriptor",
+	resultColumns: colinfo.ResultColumns{
+		{Name: "parent_id", Typ: types.Int},
+		{Name: "parent_schema_id", Typ: types.Int},
+		{Name: "name", Typ: types.String},
+		{Name: "id", Typ: types.Int},
+		{Name: "corruption", Typ: types.String},
+	},
+	schema: `
+CREATE VIEW crdb_internal.kv_repairable_catalog_corruptions (
+	parent_id,
+	parent_schema_id,
+	name,
+	id,
+	corruption
+) AS
+	WITH
+		data
+			AS (
+				SELECT
+					ns."parentID" AS parent_id,
+					ns."parentSchemaID" AS parent_schema_id,
+					ns.name,
+					COALESCE(ns.id, d.id) AS id,
+					d.descriptor,
+					crdb_internal.descriptor_with_post_deserialization_changes(d.descriptor)
+						AS updated_descriptor,
+					crdb_internal.repaired_descriptor(
+						d.descriptor,
+						(SELECT array_agg(id) AS desc_id_array FROM system.descriptor),
+						(
+							SELECT
+								array_agg(id) AS job_id_array
+							FROM
+								system.jobs
+							WHERE
+								status NOT IN ('failed', 'succeeded', 'canceled', 'revert-failed')
+						)
+					)
+						AS repaired_descriptor
+				FROM
+					system.namespace AS ns FULL JOIN system.descriptor AS d ON ns.id = d.id
+			),
+		diag
+			AS (
+				SELECT
+					*,
+					CASE
+					WHEN descriptor IS NULL AND id != 29 THEN 'namespace'
+					WHEN updated_descriptor != repaired_descriptor THEN 'descriptor'
+					ELSE NULL
+					END
+						AS corruption
+				FROM
+					data
+			)
+	SELECT
+		parent_id, parent_schema_id, name, id, corruption
+	FROM
+		diag
+	WHERE
+		corruption IS NOT NULL
+	ORDER BY
+		parent_id, parent_schema_id, name, id
+`,
 }
 
 var crdbInternalDefaultPrivilegesTable = virtualSchemaTable{
@@ -6269,6 +6371,20 @@ CREATE TABLE crdb_internal.default_privileges (
 									tree.NewDString(privilege.Types.String()),               // object_type
 									tree.NewDString(username.PublicRoleName().Normalized()), // grantee
 									tree.NewDString(privilege.USAGE.String()),               // privilege_type
+									tree.DBoolFalse, // is_grantable
+								); err != nil {
+									return err
+								}
+							}
+							if catprivilege.GetPublicHasExecuteOnFunctions(defaultPrivilegesForRole) {
+								if err := addRow(
+									database,    // database_name
+									schema,      // schema_name
+									role,        // role
+									forAllRoles, // for_all_roles
+									tree.NewDString(privilege.Functions.String()),           // object_type
+									tree.NewDString(username.PublicRoleName().Normalized()), // grantee
+									tree.NewDString(privilege.EXECUTE.String()),             // privilege_type
 									tree.DBoolFalse, // is_grantable
 								); err != nil {
 									return err
@@ -6396,7 +6512,7 @@ CREATE TABLE crdb_internal.cluster_statement_statistics (
 
 		row := make(tree.Datums, 9 /* number of columns for this virtual table */)
 		worker := func(ctx context.Context, pusher rowPusher) error {
-			return memSQLStats.IterateStatementStats(ctx, &sqlstats.IteratorOptions{
+			return memSQLStats.IterateStatementStats(ctx, sqlstats.IteratorOptions{
 				SortedAppNames: true,
 				SortedKey:      true,
 			}, func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
@@ -6798,7 +6914,7 @@ CREATE TABLE crdb_internal.cluster_transaction_statistics (
 
 		row := make(tree.Datums, 5 /* number of columns for this virtual table */)
 		worker := func(ctx context.Context, pusher rowPusher) error {
-			return memSQLStats.IterateTransactionStats(ctx, &sqlstats.IteratorOptions{
+			return memSQLStats.IterateTransactionStats(ctx, sqlstats.IteratorOptions{
 				SortedAppNames: true,
 				SortedKey:      true,
 			}, func(
@@ -7314,6 +7430,7 @@ CREATE TABLE crdb_internal.cluster_locks (
     granted             BOOL,
     contended           BOOL NOT NULL,
     duration            INTERVAL,
+    isolation_level 		STRING NOT NULL,
     INDEX(table_id),
     INDEX(database_name),
     INDEX(table_name),
@@ -7442,7 +7559,7 @@ func genClusterLocksGenerator(
 		var resumeSpan *roachpb.Span
 
 		fetchLocks := func(key, endKey roachpb.Key) error {
-			b := kv.Batch{}
+			b := p.Txn().NewBatch()
 			queryLocksRequest := &kvpb.QueryLocksRequest{
 				RequestHeader: kvpb.RequestHeader{
 					Key:    key,
@@ -7459,7 +7576,7 @@ func genClusterLocksGenerator(
 			b.Header.MaxSpanRequestKeys = int64(rowinfra.ProductionKVBatchSize)
 			b.Header.TargetBytes = int64(rowinfra.GetDefaultBatchBytesLimit(p.extendedEvalCtx.TestingKnobs.ForceProductionValues))
 
-			err := p.txn.Run(ctx, &b)
+			err := p.txn.Run(ctx, b)
 			if err != nil {
 				return err
 			}
@@ -7588,6 +7705,7 @@ func genClusterLocksGenerator(
 				tree.MakeDBool(tree.DBool(granted)),          /* granted */
 				tree.MakeDBool(len(curLock.Waiters) > 0),     /* contended */
 				durationDatum,                                /* duration */
+				tree.NewDString(tree.IsolationLevelFromKVTxnIsolationLevel(curLock.LockHolder.IsoLevel).String()), /* isolation_level */
 			}, nil
 
 		}, nil, nil
@@ -8011,7 +8129,7 @@ func getContentionEventInfo(
 	if err != nil {
 		schName = "[dropped schema]"
 	}
-	if dbDesc != nil {
+	if schemaDesc != nil {
 		schName = schemaDesc.GetName()
 	}
 

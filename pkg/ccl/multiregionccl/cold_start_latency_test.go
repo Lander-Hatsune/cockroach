@@ -78,7 +78,7 @@ func TestColdStartLatency(t *testing.T) {
 	for i := 0; i < numNodes; i++ {
 		i := i
 		args := base.TestServerArgs{
-			DefaultTestTenant: base.TestTenantDisabled,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Locality:          localities[i],
 		}
 		signalAfter[i] = make(chan struct{})
@@ -326,7 +326,7 @@ SELECT checkpoint > extract(epoch from after)
 		require.NoError(t, err)
 		defer tenant.Stopper().Stop(ctx)
 		pgURL, cleanup, err := sqlutils.PGUrlWithOptionalClientCertsE(
-			tenant.SQLAddr(), "tenantdata", url.UserPassword("foo", password),
+			tenant.AdvSQLAddr(), "tenantdata", url.UserPassword("foo", password),
 			false, // withClientCerts
 		)
 		if !assert.NoError(t, err) {

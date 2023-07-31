@@ -27,6 +27,10 @@ type TestingKnobs struct {
 	// for concurrent schema changes to finish.
 	BeforeWaitingForConcurrentSchemaChanges func(stmts []string)
 
+	// WhileWaitingForConcurrentSchemaChanges is called while waiting
+	// for concurrent schema changes to finish.
+	WhileWaitingForConcurrentSchemaChanges func(stmts []string)
+
 	// OnPostCommitPlanError is called whenever the schema changer job returns an
 	// error on building the state or on planning the stages.
 	OnPostCommitPlanError func(err error) error

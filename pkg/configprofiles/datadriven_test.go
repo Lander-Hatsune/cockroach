@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/configprofiles"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -66,20 +65,19 @@ func TestDataDriven(t *testing.T) {
 
 				numExpectedTasks := len(configprofiles.TestingGetProfiles()[setter.String()])
 
-				s, _, _ = serverutils.StartServer(t, base.TestServerArgs{
+				s = serverutils.StartServerOnly(t, base.TestServerArgs{
+					DefaultTestTenant: base.TestControlsTenantsExplicitly,
+
 					AutoConfigProvider: provider,
 					// This test does not exercise security parameters, so we
 					// keep the configuration simpler to keep the test code also
 					// simple.
 					Insecure: true,
-					// The test controls secondary tenants manually.
-					DefaultTestTenant: base.TestTenantDisabled,
 				})
 				// We need to force the connection to the system tenant,
 				// because at least one of the config profiles changes the
 				// default tenant.
-				sysTenantDB := serverutils.OpenDBConn(t, s.SQLAddr(), "cluster:system/defaultdb",
-					true /* insecure */, s.Stopper())
+				sysTenantDB := s.SystemLayer().SQLConn(t, "defaultdb")
 				db = sqlutils.MakeSQLRunner(sysTenantDB)
 				res.WriteString("server started\n")
 
@@ -119,9 +117,8 @@ AND   status = 'succeeded'`).Scan(&numTasksCompleted)
 				if !alreadyStarted {
 					t.Fatalf("%s: must use profile before sql", d.Pos)
 				}
-				sqlAddr := s.(*server.TestServer).SQLAddr()
 				testutils.SucceedsSoon(t, func() error {
-					goDB := serverutils.OpenDBConn(t, sqlAddr, "cluster:"+d.Input+"/defaultdb", true /* insecure */, s.Stopper())
+					goDB := s.SystemLayer().SQLConn(t, "cluster:"+d.Input+"/defaultdb")
 					return goDB.Ping()
 				})
 				return "ok"

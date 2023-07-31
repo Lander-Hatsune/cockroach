@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
@@ -145,7 +146,7 @@ type admitEntHandle struct {
 type singleBatchProposer interface {
 	getReplicaID() roachpb.ReplicaID
 	flowControlHandle(ctx context.Context) kvflowcontrol.Handle
-	onErrProposalDropped([]raftpb.Entry, raft.StateType)
+	onErrProposalDropped([]raftpb.Entry, []*ProposalData, raft.StateType)
 }
 
 // A proposer is an object that uses a propBuf to coordinate Raft proposals.
@@ -203,7 +204,6 @@ type proposerRaft interface {
 	Step(raftpb.Message) error
 	Status() raft.Status
 	BasicStatus() raft.BasicStatus
-	ProposeConfChange(raftpb.ConfChangeI) error
 	Campaign() error
 }
 
@@ -262,13 +262,10 @@ func (b *propBuf) Insert(ctx context.Context, p *ProposalData, tok TrackedReques
 	defer b.p.rlocker().Unlock()
 
 	if p.v2SeenDuringApplication {
-		if useReproposalsV2 {
-			// We should never see a proposal that has already been on the apply loop
-			// passed to `Insert`. The only place where such proposals can be seen is
-			// `ReinsertLocked`.
-			return errors.AssertionFailedf("proposal that was already applied passed to propBuf.Insert: %+v", p)
-		}
-		return nil
+		// We should never see a proposal that has already been on the apply loop
+		// passed to `Insert`. The only place where such proposals can be seen is
+		// `ReinsertLocked`.
+		return errors.AssertionFailedf("proposal that was already applied passed to propBuf.Insert: %+v", p)
 	}
 
 	if filter := b.testing.insertFilter; filter != nil {
@@ -509,7 +506,8 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 		// If this is a reproposal, we don't reassign the LAI. We also don't
 		// reassign the closed timestamp: we could, in principle, but we'd have to
 		// make a copy of the encoded command as to not modify the copy that's
-		// already stored in the local replica's raft entry cache.
+		// already stored in the local replica's raft entry cache. We would rather
+		// have the proposal be immutable.
 		if !reproposal {
 			lai, closedTimestamp, err := b.allocateLAIAndClosedTimestampLocked(ctx, p, closedTSTarget)
 			if err != nil {
@@ -544,7 +542,7 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 			}
 
 			ents = ents[len(ents):]
-			firstProp, nextProp = i, i
+			firstProp, nextProp = i+1, i+1
 			admitHandles = admitHandles[len(admitHandles):]
 
 			confChangeCtx := kvserverpb.ConfChangeContext{
@@ -563,8 +561,21 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 				continue
 			}
 
-			if err := raftGroup.ProposeConfChange(
-				cc,
+			typ, data, err := raftpb.MarshalConfChange(cc)
+			if err != nil {
+				firstErr = err
+				continue
+			}
+			sl := []raftpb.Entry{{Type: typ, Data: data}}
+			// Send config change in a single-element batch. We go through
+			// proposeBatch since there's observability in there.
+			//
+			// TODO(replication): we can construct a proper admitEntHandle here by
+			// pulling the initialization code from the "regular" branch to the top so
+			// that it can be shared. For now, this is fine since conf changes are
+			// internal commands anyway and unlikely to be sent at significant volume.
+			if err := proposeBatch(
+				ctx, b.p, raftGroup, sl, []admitEntHandle{{}}, []*ProposalData{p},
 			); err != nil && !errors.Is(err, raft.ErrProposalDropped) {
 				// Silently ignore dropped proposals (they were always silently
 				// ignored prior to the introduction of ErrProposalDropped).
@@ -591,13 +602,7 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 
 			// We don't want deduct flow tokens for reproposed commands, and of
 			// course for proposals that didn't integrate with kvflowcontrol.
-			//
-			// TODO(tbg): with useReproposalsV2, we make new proposals in
-			// tryReproposeWithNewLeaseIndex that will have createdAtTicks ==
-			// proposedAtTicks. They will have !reproposal but raftAdmissionMeta=nil.
-			// What is createdAtTicks==proposedAtTicks even good for? The !reproposal
-			// condition already handles the case in which it isn't.
-			shouldAdmit := p.createdAtTicks == p.proposedAtTicks && !reproposal && p.raftAdmissionMeta != nil
+			shouldAdmit := !reproposal && p.raftAdmissionMeta != nil
 			if !shouldAdmit {
 				admitHandles = append(admitHandles, admitEntHandle{})
 			} else {
@@ -615,6 +620,8 @@ func (b *propBuf) FlushLockedWithRaftGroup(
 	propErr := proposeBatch(ctx, b.p, raftGroup, ents, admitHandles, buf[firstProp:nextProp])
 	return used, propErr
 }
+
+var logCampaignOnRejectLease = log.Every(10 * time.Second)
 
 // maybeRejectUnsafeProposalLocked conditionally rejects proposals that are
 // deemed unsafe, given the current state of the raft group. Requests that may
@@ -698,7 +705,12 @@ func (b *propBuf) maybeRejectUnsafeProposalLocked(
 				li.leader)
 			b.p.rejectProposalWithRedirectLocked(ctx, p, li.leader)
 			if b.p.shouldCampaignOnRedirect(raftGroup) {
-				log.VEventf(ctx, 2, "campaigning because Raft leader not live in node liveness map")
+				const format = "campaigning because Raft leader (id=%d) not live in node liveness map"
+				if logCampaignOnRejectLease.ShouldLog() {
+					log.Infof(ctx, format, li.leader)
+				} else {
+					log.VEventf(ctx, 2, format, li.leader)
+				}
 				b.p.campaignLocked(ctx)
 			}
 			return true
@@ -1006,7 +1018,7 @@ func proposeBatch(
 				log.Event(p.ctx, "entry dropped")
 			}
 		}
-		p.onErrProposalDropped(ents, raftGroup.BasicStatus().RaftState)
+		p.onErrProposalDropped(ents, props, raftGroup.BasicStatus().RaftState)
 		return nil //nolint:returnerrcheck
 	}
 	if err == nil {
@@ -1036,6 +1048,16 @@ func maybeDeductFlowTokens(
 	for i, admitHandle := range admitHandles {
 		if admitHandle.handle == nil {
 			continue // nothing to do
+		}
+		if ents[i].Term == 0 && ents[i].Index == 0 {
+			// It's possible to have lost raft leadership right before stepping
+			// proposals through raft. They'll get forwarded to the new raft
+			// leader, and for flow token purposes, there's no tracking
+			// necessary. The token deductions below asserts on monotonic
+			// observations of log positions, which this empty position would
+			// otherwise violate. There's integration code elsewhere that will
+			// free up all tracked tokens as a result of this leadership change.
+			return
 		}
 		log.VInfof(ctx, 1, "bound index/log terms for proposal entry: %s",
 			raft.DescribeEntry(ents[i], func(bytes []byte) string {
@@ -1271,11 +1293,11 @@ type replicaProposer Replica
 var _ proposer = &replicaProposer{}
 
 func (rp *replicaProposer) locker() sync.Locker {
-	return &rp.mu.RWMutex
+	return &rp.mu.ReplicaMutex
 }
 
 func (rp *replicaProposer) rlocker() sync.Locker {
-	return rp.mu.RWMutex.RLocker()
+	return &rp.mu.ReplicaMutex
 }
 
 func (rp *replicaProposer) getReplicaID() roachpb.ReplicaID {
@@ -1303,8 +1325,7 @@ func (rp *replicaProposer) closedTimestampTarget() hlc.Timestamp {
 }
 
 func (rp *replicaProposer) withGroupLocked(fn func(raftGroup proposerRaft) error) error {
-	// Pass true for mayCampaignOnWake because we're about to propose a command.
-	return (*Replica)(rp).withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
+	return (*Replica)(rp).withRaftGroupLocked(func(raftGroup *raft.RawNode) (bool, error) {
 		// We're proposing a command here so there is no need to wake the leader
 		// if we were quiesced. However, we should make sure we are unquiesced.
 		(*Replica)(rp).maybeUnquiesceLocked(false /* wakeLeader */, true /* mayCampaign */)
@@ -1312,7 +1333,9 @@ func (rp *replicaProposer) withGroupLocked(fn func(raftGroup proposerRaft) error
 	})
 }
 
-func (rp *replicaProposer) onErrProposalDropped(ents []raftpb.Entry, stateType raft.StateType) {
+func (rp *replicaProposer) onErrProposalDropped(
+	ents []raftpb.Entry, _ []*ProposalData, stateType raft.StateType,
+) {
 	n := int64(len(ents))
 	rp.store.metrics.RaftProposalsDropped.Inc(n)
 	if stateType == raft.StateLeader {
@@ -1449,5 +1472,5 @@ func (rp *replicaProposer) rejectProposalWithErrLocked(
 	ctx context.Context, prop *ProposalData, pErr *kvpb.Error,
 ) {
 	(*Replica)(rp).cleanupFailedProposalLocked(prop)
-	prop.finishApplication(ctx, proposalResult{Err: pErr})
+	prop.finishApplication(ctx, makeProposalResultPErr(pErr))
 }

@@ -179,6 +179,7 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 			"granted",
 			"contended",
 			"duration",
+			"isolation_level",
 		},
 	},
 	"crdb_internal.cluster_queries": {
@@ -217,15 +218,19 @@ var zipInternalTablesPerCluster = DebugZipTableRegistry{
 		},
 	},
 	"crdb_internal.cluster_settings": {
-		customQueryRedacted: `SELECT * FROM (
-    		SELECT * 
-    		FROM crdb_internal.cluster_settings
-    		WHERE type <> 's'
-		) UNION (
-		    SELECT variable, '<redacted>' as value, type, public, description
-			FROM crdb_internal.cluster_settings g
-			WHERE type = 's'
-		)`,
+		customQueryRedacted: `SELECT
+			variable,
+			CASE WHEN type = 's' AND value != default_value THEN '<redacted>' ELSE value END value,
+			type,
+			public,
+			description,
+			default_value,
+			origin
+		FROM crdb_internal.cluster_settings`,
+	},
+	"crdb_internal.probe_ranges_1s_write_limit_100": {
+		customQueryRedacted:   `SELECT * FROM crdb_internal.probe_ranges(INTERVAL '1000ms', 'write') WHERE error != '' ORDER BY end_to_end_latency_ms DESC LIMIT 100;`,
+		customQueryUnredacted: `SELECT * FROM crdb_internal.probe_ranges(INTERVAL '1000ms', 'write') WHERE error != '' ORDER BY end_to_end_latency_ms DESC LIMIT 100;`,
 	},
 	"crdb_internal.cluster_transactions": {
 		// `last_auto_retry_reason` contains error text that may contain

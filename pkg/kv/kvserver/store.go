@@ -49,7 +49,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftentry"
@@ -63,11 +62,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigstore"
 	"github.com/cockroachdb/cockroach/pkg/storage"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
@@ -134,13 +135,32 @@ var defaultRaftSchedulerConcurrency = envutil.EnvOrDefaultInt(
 // counts, while also avoiding starvation by excessive sharding.
 var defaultRaftSchedulerShardSize = envutil.EnvOrDefaultInt("COCKROACH_SCHEDULER_SHARD_SIZE", 16)
 
-// defaultRaftEntryCacheSize is the default size in bytes for a store's Raft
-// entry cache. The Raft entry cache is shared by all Raft groups managed by the
-// store. It is used to cache uncommitted raft log entries such that once those
-// entries are committed, their application can avoid disk reads to retrieve
-// them from the persistent log.
-var defaultRaftEntryCacheSize = envutil.EnvOrDefaultBytes(
-	"COCKROACH_RAFT_ENTRY_CACHE_SIZE", 16<<20 /* 16 MiB */)
+// defaultRaftEntryCacheSize is the default size in bytes for the Raft entry
+// cache, divided evenly between stores. The Raft entry cache is shared by all
+// Raft groups managed by each store. It is used to cache uncommitted raft log
+// entries such that once those entries are committed, their application can
+// avoid disk reads to retrieve them from the persistent log.
+//
+// It defaults to 1/256 of system memory, with minimum 32 MB, e.g.:
+//
+// 8 GB RAM  = 32 MB  (~2 vCPUs)
+// 16 GB RAM = 64 MB  (~4 vCPUs)
+// 32 GB RAM = 128 MB (~8 vCPUs)
+// 64 GB RAM = 256 MB (~16 vCPUs)
+//
+// This is conservative, since the memory is not accounted for in memory budgets
+// nor via the --cache flag. However, it should be sufficient to achieve near
+// 100% cache hit rate for well-provisioned low-latency clusters with moderate
+// write volume. See: https://github.com/cockroachdb/cockroach/issues/98666
+var defaultRaftEntryCacheSize = func() int64 {
+	var cacheSize int64 = 32 << 20 // 32 MiB
+	if mem, _, err := status.GetTotalMemoryWithoutLogging(); err == nil {
+		if s := mem / 256; s > cacheSize {
+			cacheSize = s
+		}
+	}
+	return envutil.EnvOrDefaultBytes("COCKROACH_RAFT_ENTRY_CACHE_SIZE", cacheSize)
+}()
 
 // defaultRaftSchedulerPriorityShardSize specifies the default size of the Raft
 // scheduler priority shard, used for certain system ranges. This shard is
@@ -164,7 +184,7 @@ var bulkIOWriteLimit = settings.RegisterByteSizeSetting(
 	settings.SystemOnly,
 	"kv.bulk_io_write.max_rate",
 	"the rate limit (bytes/sec) to use for writes to disk on behalf of bulk io ops",
-	1<<40,
+	1<<40, // 1 TiB
 ).WithPublic()
 
 // addSSTableRequestLimit limits concurrent AddSSTable requests.
@@ -172,7 +192,7 @@ var addSSTableRequestLimit = settings.RegisterIntSetting(
 	settings.SystemOnly,
 	"kv.bulk_io_write.concurrent_addsstable_requests",
 	"number of concurrent AddSSTable requests per store before queueing",
-	1,
+	math.MaxInt, // unlimited
 	settings.PositiveInt,
 )
 
@@ -185,7 +205,7 @@ var addSSTableAsWritesRequestLimit = settings.RegisterIntSetting(
 	settings.SystemOnly,
 	"kv.bulk_io_write.concurrent_addsstable_as_writes_requests",
 	"number of concurrent AddSSTable requests ingested as writes per store before queueing",
-	10,
+	math.MaxInt, // unlimited
 	settings.PositiveInt,
 )
 
@@ -257,6 +277,12 @@ var ExportRequestsLimit = settings.RegisterIntSetting(
 	settings.PositiveInt,
 )
 
+// raftStepDownOnRemoval is a metamorphic test parameter that makes Raft leaders
+// step down on demotion or removal. Following an upgrade, clusters may have
+// replicas with mixed settings, because it's only changed when initializing
+// replicas. Varying it makes sure we handle this state.
+var raftStepDownOnRemoval = util.ConstantWithMetamorphicTestBool("raft-step-down-on-removal", true)
+
 // TestStoreConfig has some fields initialized with values relevant in tests.
 func TestStoreConfig(clock *hlc.Clock) StoreConfig {
 	return testStoreConfig(clock, clusterversion.TestingBinaryVersion)
@@ -299,6 +325,7 @@ func testStoreConfig(clock *hlc.Clock, version roachpb.Version) StoreConfig {
 }
 
 func newRaftConfig(
+	ctx context.Context,
 	strg raft.Storage,
 	id uint64,
 	appliedIndex kvpb.RaftIndex,
@@ -306,18 +333,33 @@ func newRaftConfig(
 	logger raft.Logger,
 ) *raft.Config {
 	return &raft.Config{
-		ID:                        id,
-		Applied:                   uint64(appliedIndex),
-		AsyncStorageWrites:        true,
-		ElectionTick:              storeCfg.RaftElectionTimeoutTicks,
-		HeartbeatTick:             storeCfg.RaftHeartbeatIntervalTicks,
-		MaxUncommittedEntriesSize: storeCfg.RaftMaxUncommittedEntriesSize,
-		MaxCommittedSizePerReady:  storeCfg.RaftMaxCommittedSizePerReady,
-		MaxSizePerMsg:             storeCfg.RaftMaxSizePerMsg,
-		MaxInflightMsgs:           storeCfg.RaftMaxInflightMsgs,
-		MaxInflightBytes:          storeCfg.RaftMaxInflightBytes,
-		Storage:                   strg,
-		Logger:                    logger,
+		ID:                          id,
+		Applied:                     uint64(appliedIndex),
+		AsyncStorageWrites:          true,
+		ElectionTick:                storeCfg.RaftElectionTimeoutTicks,
+		HeartbeatTick:               storeCfg.RaftHeartbeatIntervalTicks,
+		MaxUncommittedEntriesSize:   storeCfg.RaftMaxUncommittedEntriesSize,
+		MaxCommittedSizePerReady:    storeCfg.RaftMaxCommittedSizePerReady,
+		DisableConfChangeValidation: true, // see https://github.com/cockroachdb/cockroach/issues/105797
+		MaxSizePerMsg:               storeCfg.RaftMaxSizePerMsg,
+		MaxInflightMsgs:             storeCfg.RaftMaxInflightMsgs,
+		MaxInflightBytes:            storeCfg.RaftMaxInflightBytes,
+		Storage:                     strg,
+		Logger:                      logger,
+
+		// StepDownOnRemoval requires 23.2. Otherwise, in a mixed-version cluster, a
+		// 23.2 leader may step down when it demotes itself to learner, but a
+		// designated follower (first in the range) running 23.1 will only campaign
+		// once the leader is entirely removed from the range descriptor (see
+		// shouldCampaignOnConfChange). This would leave the range without a leader,
+		// having to wait out an election timeout.
+		//
+		// We only set this on replica initialization, so replicas without
+		// StepDownOnRemoval may remain on 23.2 nodes until they restart. That's
+		// totally fine, we just can't rely on this behavior until 24.1, but
+		// we currently don't either.
+		StepDownOnRemoval: storeCfg.Settings.Version.IsActive(ctx, clusterversion.V23_2) &&
+			raftStepDownOnRemoval,
 
 		PreVote:     true,
 		CheckQuorum: storeCfg.RaftEnableCheckQuorum,
@@ -1247,6 +1289,9 @@ func (sc *StoreConfig) SetDefaults(numStores int) {
 	}
 	if sc.RaftEntryCacheSize == 0 {
 		sc.RaftEntryCacheSize = uint64(defaultRaftEntryCacheSize)
+		if numStores > 1 { // guard against zero division
+			sc.RaftEntryCacheSize /= uint64(numStores)
+		}
 	}
 	if raftDisableLeaderFollowsLeaseholder {
 		sc.TestingKnobs.DisableLeaderFollowsLeaseholder = true
@@ -1993,15 +2038,6 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 	// due to a split crashing halfway will simply be resolved on the
 	// next split attempt. They can otherwise be ignored.
 	//
-	// Note that we do not create raft groups at this time; they will be created
-	// on-demand the first time they are needed. This helps reduce the amount of
-	// election-related traffic in a cold start.
-	// Raft initialization occurs when we propose a command on this range or
-	// receive a raft message addressed to it.
-	// TODO(bdarnell): Also initialize raft groups when read leases are needed.
-	// TODO(bdarnell): Scan all ranges at startup for unapplied log entries
-	// and initialize those groups.
-	//
 	// TODO(peter): While we have to iterate to find the replica descriptors
 	// serially, we can perform the migrations and replica creation
 	// concurrently. Note that while we can perform this initialization
@@ -2052,17 +2088,16 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 			return errors.AssertionFailedf("no tenantID for initialized replica %s", rep)
 		}
 
-		// For replicas that use expiration-based leases, eagerly initialize the
-		// Raft group and unquiesce it. We don't quiesce ranges with expiration
-		// leases, and we want to eagerly acquire leases for them, which happens
-		// during Raft ticks. We rely on Raft pre-vote to avoid disturbing
-		// established Raft leaders.
+		// Eagerly unquiesce replicas that use expiration-based leases. We don't
+		// quiesce ranges with expiration leases, and we want to eagerly acquire
+		// leases for them, which happens during Raft ticks. We rely on Raft
+		// pre-vote to avoid disturbing established Raft leaders.
 		//
 		// NB: cluster settings haven't propagated yet, so we have to check the last
 		// known lease instead of relying on shouldUseExpirationLeaseRLocked(). We
 		// also check Sequence > 0 to omit ranges that haven't seen a lease yet.
 		if l, _ := rep.GetLease(); l.Type() == roachpb.LeaseExpiration && l.Sequence > 0 {
-			rep.maybeInitializeRaftGroup(ctx)
+			rep.maybeUnquiesce(true /* wakeLeader */, true /* mayCampaign */)
 		}
 	}
 
@@ -2508,12 +2543,10 @@ func (s *Store) WriteLastUpTimestamp(ctx context.Context, time hlc.Timestamp) er
 	return storage.MVCCPutProto(
 		ctx,
 		s.TODOEngine(), // TODO(sep-raft-log): probably state engine
-		nil,
 		keys.StoreLastUpKey(),
 		hlc.Timestamp{},
-		hlc.ClockTimestamp{},
-		nil,
 		&time,
+		storage.MVCCWriteOptions{},
 	)
 }
 
@@ -2544,12 +2577,10 @@ func (s *Store) WriteHLCUpperBound(ctx context.Context, time int64) error {
 	if err := storage.MVCCPutProto(
 		ctx,
 		batch,
-		nil,
 		keys.StoreHLCUpperBoundKey(),
 		hlc.Timestamp{},
-		hlc.ClockTimestamp{},
-		nil,
 		&ts,
+		storage.MVCCWriteOptions{},
 	); err != nil {
 		return err
 	}
@@ -2911,22 +2942,24 @@ func (s *Store) RangeFeed(
 // whenever availability changes.
 func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	var (
-		raftLeaderCount               int64
-		leaseHolderCount              int64
-		leaseExpirationCount          int64
-		leaseEpochCount               int64
-		leaseLivenessCount            int64
-		raftLeaderNotLeaseHolderCount int64
-		raftLeaderInvalidLeaseCount   int64
-		quiescentCount                int64
-		uninitializedCount            int64
-		averageQueriesPerSecond       float64
-		averageRequestsPerSecond      float64
-		averageReadsPerSecond         float64
-		averageWritesPerSecond        float64
-		averageReadBytesPerSecond     float64
-		averageWriteBytesPerSecond    float64
-		averageCPUNanosPerSecond      float64
+		raftLeaderCount                int64
+		leaseHolderCount               int64
+		leaseExpirationCount           int64
+		leaseEpochCount                int64
+		leaseLivenessCount             int64
+		leaseViolatingPreferencesCount int64
+		leaseLessPreferredCount        int64
+		raftLeaderNotLeaseHolderCount  int64
+		raftLeaderInvalidLeaseCount    int64
+		quiescentCount                 int64
+		uninitializedCount             int64
+		averageQueriesPerSecond        float64
+		averageRequestsPerSecond       float64
+		averageReadsPerSecond          float64
+		averageWritesPerSecond         float64
+		averageReadBytesPerSecond      float64
+		averageWriteBytesPerSecond     float64
+		averageCPUNanosPerSecond       float64
 
 		rangeCount                int64
 		unavailableRangeCount     int64
@@ -2950,10 +2983,6 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	)
 
 	now := s.cfg.Clock.NowAsClockTimestamp()
-	var livenessMap livenesspb.IsLiveMap
-	if s.cfg.NodeLiveness != nil {
-		livenessMap = s.cfg.NodeLiveness.GetIsLiveMap()
-	}
 	clusterNodes := s.ClusterNodeCount()
 
 	s.mu.RLock()
@@ -2966,6 +2995,9 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	ioOverload, _ = s.ioThreshold.t.Score()
 	s.ioThreshold.Unlock()
 
+	// We want to avoid having to read this multiple times during the replica
+	// visiting, so load it once up front for all nodes.
+	livenessMap := s.cfg.NodeLiveness.ScanNodeVitalityFromCache()
 	newStoreReplicaVisitor(s).Visit(func(rep *Replica) bool {
 		metrics := rep.Metrics(ctx, now, livenessMap, clusterNodes)
 		if metrics.Leader {
@@ -2989,6 +3021,13 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 			}
 			if metrics.LivenessLease {
 				leaseLivenessCount++
+			}
+			// NB: Can't be satisfying a less preferred preference, and also
+			// satisfying no preferences.
+			if metrics.ViolatingLeasePreferences {
+				leaseViolatingPreferencesCount++
+			} else if metrics.LessPreferredLease {
+				leaseLessPreferredCount++
 			}
 		}
 		if metrics.Quiescent {
@@ -3048,6 +3087,8 @@ func (s *Store) updateReplicationGauges(ctx context.Context) error {
 	s.metrics.LeaseHolderCount.Update(leaseHolderCount)
 	s.metrics.LeaseExpirationCount.Update(leaseExpirationCount)
 	s.metrics.LeaseEpochCount.Update(leaseEpochCount)
+	s.metrics.LeaseViolatingPreferencesCount.Update(leaseViolatingPreferencesCount)
+	s.metrics.LeaseLessPreferredCount.Update(leaseLessPreferredCount)
 	s.metrics.LeaseLivenessCount.Update(leaseLivenessCount)
 	s.metrics.QuiescentCount.Update(quiescentCount)
 	s.metrics.UninitializedCount.Update(uninitializedCount)

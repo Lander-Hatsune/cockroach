@@ -297,7 +297,7 @@ var opDeclarative = []bool{
 	addUniqueConstraint:     true,
 	alterTableLocality:      false,
 	createIndex:             true,
-	createSequence:          false,
+	createSequence:          true,
 	createTable:             false,
 	createTableAs:           false,
 	createView:              false,
@@ -337,6 +337,7 @@ var opDeclarativeVersion = []clusterversion.Key{
 	addForeignKeyConstraint: clusterversion.V23_1,
 	addUniqueConstraint:     clusterversion.V23_1,
 	createIndex:             clusterversion.V23_1,
+	createSequence:          clusterversion.V23_2,
 	dropColumn:              clusterversion.V22_2,
 	dropColumnNotNull:       clusterversion.V23_1,
 	dropConstraint:          clusterversion.V23_1,
@@ -3802,6 +3803,8 @@ func (og *operationGenerator) selectStmt(ctx context.Context, tx pgx.Tx) (stmt *
 	// joins which are deep cannot do much of the FETCH FIRST X ROWS ONLY
 	// limit
 	stmt.potentialExecErrors.add(pgcode.DiskFull)
+	// Long running queries can be cancelled.
+	stmt.potentialExecErrors.add(pgcode.QueryCanceled)
 	return stmt, nil
 }
 

@@ -27,6 +27,7 @@ import (
 	"math/bits"
 	"math/rand"
 	"net"
+	"regexp"
 	"regexp/syntax"
 	"strconv"
 	"strings"
@@ -40,7 +41,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/config/zonepb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
-	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -2779,7 +2779,9 @@ nearest replica.`, builtinconstants.DefaultFollowerReadDuration),
 a CockroachDB HLC in decimal form.
 
 Note that uses of this function disable server-side optimizations and
-may increase either contention or retry errors, or both.`,
+may increase either contention or retry errors, or both.
+
+Returns an error if run in a transaction with an isolation level weaker than SERIALIZABLE.`,
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -4331,6 +4333,61 @@ value if you rely on the HLC for accuracy.`,
 			Volatility: volatility.Immutable,
 		},
 	),
+	"crdb_internal.merge_aggregated_stmt_metadata": makeBuiltin(arrayProps(),
+		tree.Overload{
+			Types:      tree.ParamTypes{{Name: "input", Typ: types.JSONBArray}},
+			ReturnType: tree.FixedReturnType(types.Jsonb),
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+				arr := tree.MustBeDArray(args[0])
+				metadata := &appstatspb.AggregatedStatementMetadata{}
+
+				var other appstatspb.AggregatedStatementMetadata
+				for _, metadataDatum := range arr.Array {
+					if metadataDatum == tree.DNull {
+						continue
+					}
+
+					metadataJSON := tree.MustBeDJSON(metadataDatum).JSON
+					// Ensure we start with an empty slice, otherwise the decode method below
+					// will just append the JSON datum value to what's already there.
+					other.Databases = nil
+					err := sqlstatsutil.DecodeAggregatedMetadataJSON(metadataJSON, &other)
+					//  Failure to decode should NOT return an error. Instead let's just ignore
+					// this JSON object that is not the correct format.
+					if err != nil {
+						continue
+					}
+
+					// Aggregate relevant stats.
+					metadata.Databases = util.CombineUnique(metadata.Databases, other.Databases)
+
+					metadata.DistSQLCount += other.DistSQLCount
+					metadata.FailedCount += other.FailedCount
+					metadata.FullScanCount += other.FullScanCount
+					metadata.VecCount += other.VecCount
+					metadata.TotalCount += other.TotalCount
+				}
+
+				// Set the constant info from the last decoded metadata object. If there were no
+				// elements then we can skip this as we are already at the zero values.
+				if len(arr.Array) > 0 {
+					metadata.ImplicitTxn = other.ImplicitTxn
+					metadata.Query = other.Query
+					metadata.QuerySummary = other.QuerySummary
+					metadata.StmtType = other.StmtType
+				}
+
+				aggregatedJSON, err := sqlstatsutil.BuildStmtDetailsMetadataJSON(metadata)
+				if err != nil {
+					return nil, err
+				}
+
+				return tree.NewDJSON(aggregatedJSON), nil
+			},
+			Info:       "Merge an array of AggregatedStatementMetadata into a single JSONB object",
+			Volatility: volatility.Immutable,
+		},
+	),
 
 	// Enum functions.
 	"enum_first": makeBuiltin(
@@ -4938,7 +4995,7 @@ value if you rely on the HLC for accuracy.`,
  'external'))`,
 			Info:       `create_tenant(id) is an alias for create_tenant('{"id": id, "service_mode": "external"}'::jsonb)`,
 			Volatility: volatility.Volatile,
-			Language:   tree.FunctionLangSQL,
+			Language:   tree.RoutineLangSQL,
 		},
 		// This overload is provided for use in tests.
 		tree.Overload{
@@ -4950,9 +5007,9 @@ value if you rely on the HLC for accuracy.`,
 			Body:       `SELECT crdb_internal.create_tenant(json_build_object('id', $1, 'name', $2))`,
 			Info:       `create_tenant(id, name) is an alias for create_tenant('{"id": id, "name": name}'::jsonb)`,
 			Volatility: volatility.Volatile,
-			Language:   tree.FunctionLangSQL,
+			Language:   tree.RoutineLangSQL,
 		},
-		// This overload is deprecated. Use CREATE TENANT instead.
+		// This overload is deprecated. Use CREATE VIRTUAL CLUSTER instead.
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "name", Typ: types.String},
@@ -4960,9 +5017,9 @@ value if you rely on the HLC for accuracy.`,
 			ReturnType: tree.FixedReturnType(types.Int),
 			Body:       `SELECT crdb_internal.create_tenant(json_build_object('name', $1))`,
 			Info: `create_tenant(name) is an alias for create_tenant('{"name": name}'::jsonb).
-DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
+DO NOT USE -- USE 'CREATE VIRTUAL CLUSTER' INSTEAD`,
 			Volatility: volatility.Volatile,
-			Language:   tree.FunctionLangSQL,
+			Language:   tree.RoutineLangSQL,
 		},
 	),
 
@@ -4996,9 +5053,9 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 			},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Body:       `SELECT crdb_internal.destroy_tenant($1, false)`,
-			Info:       "DO NOT USE -- USE 'DROP TENANT' INSTEAD.",
+			Info:       "DO NOT USE -- USE 'DROP VIRTUAL CLUSTER' INSTEAD.",
 			Volatility: volatility.Volatile,
-			Language:   tree.FunctionLangSQL,
+			Language:   tree.RoutineLangSQL,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
@@ -5022,7 +5079,7 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 				}
 				return args[0], nil
 			},
-			Info:       "DO NOT USE -- USE 'DROP TENANT IMMEDIATE' INSTEAD.",
+			Info:       "DO NOT USE -- USE 'DROP VIRTUAL CLUSTER IMMEDIATE' INSTEAD.",
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -5209,6 +5266,75 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 			Volatility: volatility.Stable,
 		},
 	),
+	"crdb_internal.repair_catalog_corruption": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemRepair,
+			DistsqlBlocklist: true,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "descriptor_id", Typ: types.Int},
+				{Name: "corruption", Typ: types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			// See the kv_repairable_catalog_corruptions virtual view definition for
+			// details about the different corruption types.
+			// Presently, 'descriptor' and 'namespace' are supported by this builtin.
+			Body: `
+SELECT
+	CASE corruption
+	WHEN 'descriptor'
+	THEN (
+		SELECT
+			max(
+				crdb_internal.unsafe_upsert_descriptor(
+					id,
+					crdb_internal.repaired_descriptor(
+						descriptor,
+						(SELECT array_agg(id) AS desc_id_array FROM system.descriptor),
+						(
+							SELECT
+								array_agg(id) AS job_id_array
+							FROM
+								system.jobs
+							WHERE
+								status NOT IN ('failed', 'succeeded', 'canceled', 'revert-failed')
+						)
+					),
+					true
+				)
+			)
+		FROM
+			system.descriptor
+		WHERE
+			id = $1
+	)
+	WHEN 'namespace'
+	THEN (
+		SELECT
+			max(
+				crdb_internal.unsafe_delete_namespace_entry(
+					"parentID",
+					"parentSchemaID",
+					name,
+					id,
+					true
+				)
+			)
+		FROM
+			system.namespace
+		WHERE
+			id = $1 AND id NOT IN (SELECT id FROM system.descriptor)
+	)
+	ELSE NULL
+	END
+`,
+			Info: "repair_catalog_corruption(descriptor_id,corruption) attempts to repair corrupt" +
+				" records in system tables associated with that descriptor id",
+			Volatility: volatility.Volatile,
+			Language:   tree.RoutineLangSQL,
+		},
+	),
 
 	"crdb_internal.force_error": makeBuiltin(
 		tree.FunctionProperties{
@@ -5253,7 +5379,7 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 					return nil, errors.Newf("expected string value, got %T", args[0])
 				}
 				msg := string(s)
-				return crdbInternalSendNotice(ctx, evalCtx, "NOTICE", msg)
+				return crdbInternalBufferNotice(ctx, evalCtx, "NOTICE", msg)
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
 			Volatility: volatility.Volatile,
@@ -5275,7 +5401,7 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 				if _, ok := pgnotice.ParseDisplaySeverity(severityString); !ok {
 					return nil, pgerror.Newf(pgcode.InvalidParameterValue, "severity %s is invalid", severityString)
 				}
-				return crdbInternalSendNotice(ctx, evalCtx, severityString, msg)
+				return crdbInternalBufferNotice(ctx, evalCtx, severityString, msg)
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
 			Volatility: volatility.Volatile,
@@ -5413,17 +5539,17 @@ DO NOT USE -- USE 'CREATE TENANT' INSTEAD`,
 			Types:      tree.ParamTypes{{Name: "key", Typ: types.Bytes}},
 			ReturnType: tree.FixedReturnType(types.Int),
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				if evalCtx.Txn == nil { // can occur during backfills
+					return nil, pgerror.Newf(pgcode.FeatureNotSupported,
+						"cannot use crdb_internal.lease_holder in this context")
+				}
 				key := []byte(tree.MustBeDBytes(args[0]))
-				b := &kv.Batch{}
+				b := evalCtx.Txn.NewBatch()
 				b.AddRawRequest(&kvpb.LeaseInfoRequest{
 					RequestHeader: kvpb.RequestHeader{
 						Key: key,
 					},
 				})
-				if evalCtx.Txn == nil { // can occur during backfills
-					return nil, pgerror.Newf(pgcode.FeatureNotSupported,
-						"cannot use crdb_internal.lease_holder in this context")
-				}
 				if err := evalCtx.Txn.Run(ctx, b); err != nil {
 					return nil, pgerror.Wrap(err, pgcode.InvalidParameterValue, "error fetching leaseholder")
 				}
@@ -6449,7 +6575,7 @@ generate_test_objects(pat, num) is an alias for
 generate_test_objects('{"names":pat, "counts":[num]}'::jsonb)
 `,
 			Volatility: volatility.Volatile,
-			Language:   tree.FunctionLangSQL,
+			Language:   tree.RoutineLangSQL,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
@@ -6465,7 +6591,7 @@ generate_test_objects(pat, counts) is an alias for
 generate_test_objects('{"names":pat, "counts":counts}'::jsonb)
 `,
 			Volatility: volatility.Volatile,
-			Language:   tree.FunctionLangSQL,
+			Language:   tree.RoutineLangSQL,
 		},
 		tree.Overload{
 			Types: tree.ParamTypes{
@@ -6993,6 +7119,34 @@ table's zone configuration this will return NULL.`,
 				return tree.MakeDBool(true), nil
 			},
 			Info:       `This function is used to clear the collected SQL statistics.`,
+			Volatility: volatility.Volatile,
+		},
+	),
+	"crdb_internal.reset_activity_tables": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // applicable only on the gateway
+		},
+		tree.Overload{
+			Types:      tree.ParamTypes{},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+				if err != nil {
+					return nil, err
+				}
+				if !isAdmin {
+					return nil, errors.New("crdb_internal.reset_activity_tables() requires admin privilege")
+				}
+				if evalCtx.SQLStatsController == nil {
+					return nil, errors.AssertionFailedf("sql stats controller not set")
+				}
+				if err := evalCtx.SQLStatsController.ResetActivityTables(ctx); err != nil {
+					return nil, err
+				}
+				return tree.MakeDBool(true), nil
+			},
+			Info:       `This function is used to clear the {statement|transaction} activity system tables.`,
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -7547,6 +7701,43 @@ specified store on the node it's run from. One of 'mvccGC', 'merge', 'split',
 		},
 	),
 
+	"crdb_internal.request_job_execution_details": makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // applicable only on the gateway
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "jobID", Typ: types.Int},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				// TODO(adityamaru): Figure out the correct permissions for collecting a
+				// job profiler bundle. For now only allow the admin role.
+				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+				if err != nil {
+					return nil, err
+				}
+
+				if !isAdmin {
+					return nil, errors.New("must be admin to request a job profiler bundle")
+				}
+
+				jobID := int(tree.MustBeDInt(args[0]))
+				if err := evalCtx.JobsProfiler.RequestExecutionDetailFiles(
+					ctx,
+					jobspb.JobID(jobID),
+				); err != nil {
+					return nil, err
+				}
+
+				return tree.DBoolTrue, nil
+			},
+			Volatility: volatility.Volatile,
+			Info:       `Used to request the collection of execution details for a given job ID`,
+		},
+	),
+
 	"crdb_internal.request_statement_bundle": makeBuiltin(
 		tree.FunctionProperties{
 			Category:         builtinconstants.CategorySystemInfo,
@@ -7907,6 +8098,77 @@ expires until the statement bundle is collected`,
 				"(substrings surrounded by the redaction markers, '‹' and '›') with the redacted marker, " +
 				"'‹×›'.",
 			Volatility: volatility.Immutable,
+		},
+	),
+	"crdb_internal.plpgsql_raise": makeBuiltin(tree.FunctionProperties{
+		Category:     builtinconstants.CategoryString,
+		Undocumented: true,
+	},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "severity", Typ: types.String},
+				{Name: "message", Typ: types.String},
+				{Name: "detail", Typ: types.String},
+				{Name: "hint", Typ: types.String},
+				{Name: "code", Typ: types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.Int),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				argStrings := make([]string, len(args))
+				for i := range args {
+					s, ok := tree.AsDString(args[i])
+					if !ok {
+						return nil, errors.Newf("expected string value, got %T", args[i])
+					}
+					argStrings[i] = string(s)
+				}
+				// Build the error.
+				severity := strings.ToUpper(argStrings[0])
+				if _, ok := pgnotice.ParseDisplaySeverity(severity); !ok {
+					return nil, pgerror.Newf(
+						pgcode.InvalidParameterValue, "severity %s is invalid", severity,
+					)
+				}
+				message := argStrings[1]
+				err := errors.Newf("%s", message)
+				err = pgerror.WithSeverity(err, severity)
+				if detail := argStrings[2]; detail != "" {
+					err = errors.WithDetail(err, detail)
+				}
+				if hint := argStrings[3]; hint != "" {
+					err = errors.WithHint(err, hint)
+				}
+				if codeString := argStrings[4]; codeString != "" {
+					var code string
+					if regexp.MustCompile(`[A-Z0-9]{5}`).MatchString(codeString) {
+						// The supplied argument is a valid PG code.
+						code = codeString
+					} else {
+						// The supplied string may be a condition name.
+						if candidates, ok := pgcode.PLpgSQLConditionNameToCode[codeString]; ok {
+							// Some condition names map to more than one code, but postgres
+							// seems to just use the first (smallest) one.
+							code = candidates[0]
+						} else {
+							return nil, pgerror.Newf(pgcode.UndefinedObject,
+								"unrecognized exception condition: \"%s\"", codeString,
+							)
+						}
+					}
+					err = pgerror.WithCandidateCode(err, pgcode.MakeCode(code))
+				}
+				if severity == "ERROR" {
+					// Directly return the error from the function call.
+					return nil, err
+				}
+				// Send the error as a notice to the client, then return NULL.
+				if sendErr := crdbInternalSendNotice(ctx, evalCtx, err); sendErr != nil {
+					return nil, sendErr
+				}
+				return tree.DNull, nil
+			},
+			Info:       "This function is used internally to implement the PLpgSQL RAISE statement.",
+			Volatility: volatility.Volatile,
 		},
 	),
 }

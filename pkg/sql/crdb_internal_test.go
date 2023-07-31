@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/col/coldata"
 	"github.com/cockroachdb/cockroach/pkg/gossip"
@@ -168,7 +169,7 @@ func TestGossipAlertsTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	params, _ := tests.CreateTestServerParams()
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(context.Background())
 	ctx := context.Background()
 
@@ -479,16 +480,13 @@ SELECT
 		crdb_internal.json_to_pb(
 			'cockroach.sql.sqlbase.Descriptor',
 			json_set(
-				crdb_internal.pb_to_json(
-					'cockroach.sql.sqlbase.Descriptor',
-					descriptor,
-					false
+				json_set(
+					crdb_internal.pb_to_json('cockroach.sql.sqlbase.Descriptor', descriptor, false),
+					ARRAY['table', 'mutationJobs'],
+					jsonb_build_array(jsonb_build_object('job_id', 123456, 'mutation_id', 1))
 				),
-				ARRAY['table', 'mutationJobs'],
-				jsonb_build_array(
-					jsonb_build_object('job_id', 123456)
-				),
-				true
+				ARRAY['table', 'mutations'],
+				jsonb_build_array(jsonb_build_object('mutation_id', 1))
 			)
 		),
 		true
@@ -518,7 +516,7 @@ UPDATE system.namespace SET id = %d WHERE id = %d;
 				tableTblID, tableFkTblID, tableFkTblID),
 		},
 		{fmt.Sprintf("%d", tableNoJobID), "defaultdb", "public", "nojob",
-			fmt.Sprintf(`relation "nojob" (%d): unknown mutation ID 0 associated with job ID 123456`, tableNoJobID),
+			fmt.Sprintf(`relation "nojob" (%d): mutation in state UNKNOWN, direction NONE, and no column/index descriptor`, tableNoJobID),
 		},
 		{fmt.Sprintf("%d", tableNoJobID), "defaultdb", "public", "nojob", `mutation job 123456: job not found`},
 		{fmt.Sprintf("%d", schemaID), fmt.Sprintf("[%d]", databaseID), "public", "",
@@ -781,7 +779,12 @@ func TestClusterInflightTracesVirtualTable(t *testing.T) {
 			},
 		}
 		var rowIdx int
-		rows := sqlDB.Query(t, `SELECT trace_id, node_id, trace_str, jaeger_json from crdb_internal.cluster_inflight_traces WHERE trace_id=$1`, traceID)
+		rows := sqlDB.Query(t, `
+                  SELECT trace_id, node_id, trace_str, jaeger_json
+                  FROM crdb_internal.cluster_inflight_traces
+                  WHERE trace_id = $1
+                  ORDER BY node_id;`, // sort by node_id in case instances are returned out of order
+			traceID)
 		defer rows.Close()
 		for rows.Next() {
 			var traceID, nodeID int
@@ -975,27 +978,16 @@ func TestTxnContentionEventsTableWithRangeDescriptor(t *testing.T) {
 func TestTxnContentionEventsTableMultiTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	defer ccl.TestingEnableEnterprise()()
 
 	ctx := context.Background()
-	tc := testcluster.StartTestCluster(t, 1,
-		base.TestClusterArgs{
-			ServerArgs: base.TestServerArgs{
-				// Test is designed to run with explicit tenants. No need to
-				// implicitly create a tenant.
-				DefaultTestTenant: base.TestTenantDisabled,
-			},
-		})
-	defer tc.Stopper().Stop(ctx)
-	_, tSQL := serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
-		TenantID: roachpb.MustMakeTenantID(10),
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestTenantAlwaysEnabled,
 	})
+	defer s.Stopper().Stop(ctx)
+	sqlDB := sqlutils.MakeSQLRunner(db)
 
-	conn, err := tSQL.Conn(ctx)
-	require.NoError(t, err)
-	sqlDB := sqlutils.MakeSQLRunner(conn)
-	defer tSQL.Close()
-
-	testTxnContentionEventsTableHelper(t, ctx, tSQL, sqlDB)
+	testTxnContentionEventsTableHelper(t, ctx, db, sqlDB)
 }
 
 func causeContention(
@@ -1271,11 +1263,11 @@ func TestExecutionInsights(t *testing.T) {
 
 	// Start the cluster.
 	ctx := context.Background()
-	settings := cluster.MakeTestingClusterSettings()
-	args := base.TestClusterArgs{ServerArgs: base.TestServerArgs{Settings: settings}}
-	tc := testcluster.StartTestCluster(t, 1, args)
-	defer tc.Stopper().Stop(ctx)
-	sqlDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	srv, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+
+	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	// We'll check both the cluster-wide table and the node-local one.
 	virtualTables := []interface{}{
@@ -1301,17 +1293,10 @@ func TestExecutionInsights(t *testing.T) {
 				}()
 
 				// Connect to the cluster as the test user.
-				pgUrl, cleanup := sqlutils.PGUrl(t, tc.Server(0).ServingSQLAddr(),
-					fmt.Sprintf("TestExecutionInsights-%s-%s", table, testCase.option),
-					url.User("testuser"),
-				)
-				defer cleanup()
-				db, err := gosql.Open("postgres", pgUrl.String())
-				require.NoError(t, err)
-				defer func() { _ = db.Close() }()
+				tdb := s.SQLConnForUser(t, "testuser", "")
 
 				// Try to read the virtual table, and see that we can or cannot as expected.
-				rows, err := db.Query(fmt.Sprintf("SELECT count(*) FROM crdb_internal.%s", table))
+				rows, err := tdb.Query(fmt.Sprintf("SELECT count(*) FROM crdb_internal.%s", table))
 				defer func() {
 					if rows != nil {
 						_ = rows.Close()
@@ -1518,7 +1503,7 @@ func TestInternalSystemJobsAccess(t *testing.T) {
 	// do not disable background job creation nor job adoption. This is because creating
 	// users requires jobs to be created and run. Thus, this test only creates jobs of type
 	// jobspb.TypeImport and overrides the import resumer.
-	registry := s.JobRegistry().(*jobs.Registry)
+	registry := s.ApplicationLayer().JobRegistry().(*jobs.Registry)
 	registry.TestingWrapResumerConstructor(jobspb.TypeImport, func(r jobs.Resumer) jobs.Resumer {
 		return &fakeResumer{}
 	})
@@ -1527,7 +1512,7 @@ func TestInternalSystemJobsAccess(t *testing.T) {
 		pgURL := url.URL{
 			Scheme: "postgres",
 			User:   url.UserPassword(user, "test"),
-			Host:   s.SQLAddr(),
+			Host:   s.AdvSQLAddr(),
 		}
 		db2, err := gosql.Open("postgres", pgURL.String())
 		assert.NoError(t, err)

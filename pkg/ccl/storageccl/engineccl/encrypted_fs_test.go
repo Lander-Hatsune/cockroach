@@ -41,7 +41,7 @@ func TestEncryptedFS(t *testing.T) {
 
 	require.NoError(t, memFS.MkdirAll("/bar", os.ModePerm))
 	fileRegistry := &storage.PebbleFileRegistry{FS: memFS, DBDir: "/bar"}
-	require.NoError(t, fileRegistry.Load())
+	require.NoError(t, fileRegistry.Load(context.Background()))
 
 	// Using a StoreKeyManager for the test since it is easy to create. Write a key for the
 	// StoreKeyManager.
@@ -197,7 +197,7 @@ func TestEncryptedFSUnencryptedFiles(t *testing.T) {
 	require.NoError(t, memFS.MkdirAll("/foo", os.ModeDir))
 
 	fileRegistry := &storage.PebbleFileRegistry{FS: memFS, DBDir: "/foo"}
-	require.NoError(t, fileRegistry.Load())
+	require.NoError(t, fileRegistry.Load(context.Background()))
 
 	keyManager := &StoreKeyManager{fs: memFS, activeKeyFilename: "plain", oldKeyFilename: "plain"}
 	require.NoError(t, keyManager.Load(context.Background()))
@@ -397,12 +397,10 @@ func TestPebbleEncryption2(t *testing.T) {
 		err = storage.MVCCPut(
 			context.Background(),
 			db,
-			nil, /* ms */
 			roachpb.Key(key),
 			hlc.Timestamp{},
-			hlc.ClockTimestamp{},
 			roachpb.MakeValueFromBytes([]byte(val)),
-			nil, /* txn */
+			storage.MVCCWriteOptions{},
 		)
 		require.NoError(t, err)
 		require.NoError(t, db.Flush())

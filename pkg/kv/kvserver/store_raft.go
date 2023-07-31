@@ -183,7 +183,8 @@ func (s *Store) HandleDelegatedSnapshot(
 	}
 
 	// Pass the request to the sender replica.
-	if err := sender.followerSendSnapshot(ctx, req.RecipientReplica, req); err != nil {
+	msgAppResp, err := sender.followerSendSnapshot(ctx, req.RecipientReplica, req)
+	if err != nil {
 		// If an error occurred during snapshot sending, send an error response.
 		return &kvserverpb.DelegateSnapshotResponse{
 			Status:         kvserverpb.DelegateSnapshotResponse_ERROR,
@@ -195,6 +196,7 @@ func (s *Store) HandleDelegatedSnapshot(
 	return &kvserverpb.DelegateSnapshotResponse{
 		Status:         kvserverpb.DelegateSnapshotResponse_APPLIED,
 		CollectedSpans: sp.GetConfiguredRecording(),
+		MsgAppResp:     msgAppResp,
 	}
 }
 
@@ -203,12 +205,22 @@ func (s *Store) HandleDelegatedSnapshot(
 func (s *Store) HandleSnapshot(
 	ctx context.Context, header *kvserverpb.SnapshotRequest_Header, stream SnapshotResponseStream,
 ) error {
+	if fn := s.cfg.TestingKnobs.HandleSnapshotDone; fn != nil {
+		defer fn()
+	}
 	ctx = s.AnnotateCtx(ctx)
 	const name = "storage.Store: handle snapshot"
 	return s.stopper.RunTaskWithErr(ctx, name, func(ctx context.Context) error {
 		s.metrics.RaftRcvdMessages[raftpb.MsgSnap].Inc(1)
 
-		return s.receiveSnapshot(ctx, header, stream)
+		err := s.receiveSnapshot(ctx, header, stream)
+		if err != nil && ctx.Err() != nil {
+			// Log trace of incoming snapshot on context cancellation (e.g.
+			// times out or caller goes away).
+			log.Infof(ctx, "incoming snapshot stream failed with error: %v\ntrace:\n%v",
+				err, tracing.SpanFromContext(ctx).GetConfiguredRecording())
+		}
+		return err
 	})
 }
 
@@ -416,8 +428,9 @@ func (s *Store) processRaftRequestWithReplica(
 // will have been removed.
 func (s *Store) processRaftSnapshotRequest(
 	ctx context.Context, snapHeader *kvserverpb.SnapshotRequest_Header, inSnap IncomingSnapshot,
-) *kvpb.Error {
-	return s.withReplicaForRequest(ctx, &snapHeader.RaftMessageRequest, func(
+) (*raftpb.Message, *kvpb.Error) {
+	var msgAppResp *raftpb.Message
+	pErr := s.withReplicaForRequest(ctx, &snapHeader.RaftMessageRequest, func(
 		ctx context.Context, r *Replica,
 	) (pErr *kvpb.Error) {
 		ctx = r.AnnotateCtx(ctx)
@@ -486,8 +499,24 @@ func (s *Store) processRaftSnapshotRequest(
 			log.Infof(ctx, "ignored stale snapshot at index %d", snapHeader.RaftMessageRequest.Message.Snapshot.Metadata.Index)
 			s.metrics.RangeSnapshotRecvUnusable.Inc(1)
 		}
+		// If the snapshot was applied and acked with an MsgAppResp, return that
+		// message up the stack. We're using msgAppRespCh as a shortcut to avoid
+		// plumbing return parameters through an additional few layers of raft
+		// handling.
+		//
+		// NB: in practice there's always an MsgAppResp here, but it is better not
+		// to rely on what is essentially discretionary raft behavior.
+		select {
+		case msg := <-inSnap.msgAppRespCh:
+			msgAppResp = &msg
+		default:
+		}
 		return nil
 	})
+	if pErr != nil {
+		return nil, pErr
+	}
+	return msgAppResp, nil
 }
 
 // HandleRaftResponse implements the IncomingRaftMessageHandler interface. Per
@@ -750,10 +779,8 @@ func (s *Store) processRaft(ctx context.Context) {
 				delete(r.mu.proposals, k)
 				prop.finishApplication(
 					context.Background(),
-					proposalResult{
-						Err: kvpb.NewError(kvpb.NewAmbiguousResultErrorf("store is stopping")),
-					},
-				)
+					makeProposalResultErr(
+						kvpb.NewAmbiguousResultErrorf("store is stopping")))
 			}
 			r.mu.Unlock()
 			return true
@@ -832,8 +859,7 @@ func (s *Store) updateLivenessMap() {
 		// will continually probe the connection. The check can also have false
 		// positives if the node goes down after populating the map, but that
 		// matters even less.
-		entry.IsLive = !s.TestingKnobs().DisableLivenessMapConnHealth &&
-			(s.cfg.NodeDialer.ConnHealth(nodeID, rpc.SystemClass) == nil)
+		entry.IsLive = s.cfg.NodeDialer.ConnHealth(nodeID, rpc.SystemClass) == nil
 		nextMap[nodeID] = entry
 	}
 	s.livenessMap.Store(nextMap)

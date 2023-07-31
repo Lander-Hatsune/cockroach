@@ -355,6 +355,18 @@ func TestMVCCHistories(t *testing.T) {
 		}
 
 		e := newEvalCtx(ctx, engine)
+		defer func() {
+			require.NoError(t, engine.Compact())
+			m := engine.GetMetrics().Metrics
+			if m.Keys.MissizedTombstonesCount > 0 {
+				// A missized tombstone is a Pebble DELSIZED tombstone that encodes
+				// the wrong size of the value it deletes. This kind of tombstone is
+				// written when ClearOptions.ValueSizeKnown=true. If this assertion
+				// failed, something might be awry in the code clearing the key. Are
+				// we feeding the wrong value length to ValueSize?
+				t.Fatalf("expected to find 0 missized tombstones; found %d", m.Keys.MissizedTombstonesCount)
+			}
+		}()
 		defer e.close()
 		if strings.Contains(path, "_nometamorphiciter") {
 			e.noMetamorphicIter = true
@@ -878,11 +890,11 @@ func (rw intentPrintingReadWriter) PutIntent(
 }
 
 func (rw intentPrintingReadWriter) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID,
+	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts storage.ClearOptions,
 ) error {
 	rw.buf.Printf("called ClearIntent(%v, TDNUM(%t), %v)\n",
 		key, txnDidNotUpdateMeta, txnUUID)
-	return rw.ReadWriter.ClearIntent(key, txnDidNotUpdateMeta, txnUUID)
+	return rw.ReadWriter.ClearIntent(key, txnDidNotUpdateMeta, txnUUID, opts)
 }
 
 func (e *evalCtx) tryWrapForIntentPrinting(rw storage.ReadWriter) storage.ReadWriter {
@@ -992,7 +1004,7 @@ func cmdClear(e *evalCtx) error {
 	key := e.getKey()
 	ts := e.getTs(nil)
 	return e.withWriter("clear", func(rw storage.ReadWriter) error {
-		return rw.ClearMVCC(storage.MVCCKey{Key: key, Timestamp: ts})
+		return rw.ClearMVCC(storage.MVCCKey{Key: key, Timestamp: ts}, storage.ClearOptions{})
 	})
 }
 
@@ -1089,7 +1101,12 @@ func cmdCPut(e *evalCtx) error {
 	resolve, resolveStatus := e.getResolve()
 
 	return e.withWriter("cput", func(rw storage.ReadWriter) error {
-		if err := storage.MVCCConditionalPut(e.ctx, rw, e.ms, key, ts, localTs, val, expVal, behavior, txn); err != nil {
+		opts := storage.MVCCWriteOptions{
+			Txn:            txn,
+			LocalTimestamp: localTs,
+			Stats:          e.ms,
+		}
+		if err := storage.MVCCConditionalPut(e.ctx, rw, key, ts, val, expVal, behavior, opts); err != nil {
 			return err
 		}
 		if resolve {
@@ -1110,7 +1127,12 @@ func cmdInitPut(e *evalCtx) error {
 	resolve, resolveStatus := e.getResolve()
 
 	return e.withWriter("initput", func(rw storage.ReadWriter) error {
-		if err := storage.MVCCInitPut(e.ctx, rw, e.ms, key, ts, localTs, val, failOnTombstones, txn); err != nil {
+		opts := storage.MVCCWriteOptions{
+			Txn:            txn,
+			LocalTimestamp: localTs,
+			Stats:          e.ms,
+		}
+		if err := storage.MVCCInitPut(e.ctx, rw, key, ts, val, failOnTombstones, opts); err != nil {
 			return err
 		}
 		if resolve {
@@ -1127,7 +1149,12 @@ func cmdDelete(e *evalCtx) error {
 	localTs := hlc.ClockTimestamp(e.getTsWithName("localTs"))
 	resolve, resolveStatus := e.getResolve()
 	return e.withWriter("del", func(rw storage.ReadWriter) error {
-		foundKey, err := storage.MVCCDelete(e.ctx, rw, e.ms, key, ts, localTs, txn)
+		opts := storage.MVCCWriteOptions{
+			Txn:            txn,
+			LocalTimestamp: localTs,
+			Stats:          e.ms,
+		}
+		foundKey, err := storage.MVCCDelete(e.ctx, rw, key, ts, opts)
 		if err == nil || errors.HasType(err, &kvpb.WriteTooOldError{}) {
 			// We want to output foundKey even if a WriteTooOldError is returned,
 			// since the error may be swallowed/deferred during evaluation.
@@ -1156,8 +1183,13 @@ func cmdDeleteRange(e *evalCtx) error {
 
 	resolve, resolveStatus := e.getResolve()
 	return e.withWriter("del_range", func(rw storage.ReadWriter) error {
+		opts := storage.MVCCWriteOptions{
+			Txn:            txn,
+			LocalTimestamp: localTs,
+			Stats:          e.ms,
+		}
 		deleted, resumeSpan, num, err := storage.MVCCDeleteRange(
-			e.ctx, rw, e.ms, key, endKey, int64(max), ts, localTs, txn, returnKeys)
+			e.ctx, rw, key, endKey, int64(max), ts, opts, returnKeys)
 		if err != nil {
 			return err
 		}
@@ -1310,7 +1342,12 @@ func cmdIncrement(e *evalCtx) error {
 	resolve, resolveStatus := e.getResolve()
 
 	return e.withWriter("increment", func(rw storage.ReadWriter) error {
-		curVal, err := storage.MVCCIncrement(e.ctx, rw, e.ms, key, ts, localTs, txn, inc)
+		opts := storage.MVCCWriteOptions{
+			Txn:            txn,
+			LocalTimestamp: localTs,
+			Stats:          e.ms,
+		}
+		curVal, err := storage.MVCCIncrement(e.ctx, rw, key, ts, opts, inc)
 		if err != nil {
 			return err
 		}
@@ -1346,7 +1383,12 @@ func cmdPut(e *evalCtx) error {
 	resolve, resolveStatus := e.getResolve()
 
 	return e.withWriter("put", func(rw storage.ReadWriter) error {
-		if err := storage.MVCCPut(e.ctx, rw, e.ms, key, ts, localTs, val, txn); err != nil {
+		opts := storage.MVCCWriteOptions{
+			Txn:            txn,
+			LocalTimestamp: localTs,
+			Stats:          e.ms,
+		}
+		if err := storage.MVCCPut(e.ctx, rw, key, ts, val, opts); err != nil {
 			return err
 		}
 		if resolve {

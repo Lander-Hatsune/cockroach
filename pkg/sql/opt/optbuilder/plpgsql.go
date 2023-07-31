@@ -12,12 +12,14 @@ package optbuilder
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/opt"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/plpgsqltree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
@@ -119,6 +121,9 @@ type plpgsqlBuilder struct {
 	// varTypes maps from the name of each variable to its type.
 	varTypes map[tree.Name]*types.T
 
+	// constants tracks the variables that were declared as constant.
+	constants map[tree.Name]struct{}
+
 	// returnType is the return type of the PL/pgSQL function.
 	returnType *types.T
 
@@ -162,12 +167,6 @@ func (b *plpgsqlBuilder) init(
 				"not-null PL/pgSQL variables are not yet supported",
 			))
 		}
-		if dec.Constant {
-			panic(unimplemented.NewWithIssueDetail(105241,
-				"constant variable",
-				"constant PL/pgSQL variables are not yet supported",
-			))
-		}
 		if dec.Collate != "" {
 			panic(unimplemented.NewWithIssueDetail(105245,
 				"variable collation",
@@ -183,13 +182,19 @@ func (b *plpgsqlBuilder) build(block *plpgsqltree.PLpgSQLStmtBlock, s *scope) *s
 	s = s.push()
 	b.ensureScopeHasExpr(s)
 
-	// Some variable declarations initialize the variable.
+	b.constants = make(map[tree.Name]struct{})
 	for _, dec := range b.decls {
 		if dec.Expr != nil {
+			// Some variable declarations initialize the variable.
 			s = b.addPLpgSQLAssign(s, dec.Var, dec.Expr)
 		} else {
 			// Uninitialized variables are null.
 			s = b.addPLpgSQLAssign(s, dec.Var, &tree.CastExpr{Expr: tree.DNull, Type: dec.Typ})
+		}
+		if dec.Constant {
+			// Add to the constants map after initializing the variable, since
+			// constant variables only prevent assignment, not initialization.
+			b.constants[dec.Var] = struct{}{}
 		}
 	}
 	if s = b.buildPLpgSQLStatements(block.Body, s); s != nil {
@@ -345,6 +350,40 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(
 			} else {
 				panic(pgerror.New(pgcode.Syntax, "CONTINUE cannot be used outside a loop"))
 			}
+		case *plpgsqltree.PLpgSQLStmtRaise:
+			// RAISE statements allow the PLpgSQL function to send an error or a
+			// notice to the client. We handle these side effects by building them
+			// into a separate body statement that is only executed for its side
+			// effects. The remaining PLpgSQL statements then become the last body
+			// statement, which returns the actual result of evaluation.
+			//
+			// The synchronous notice sending behavior is implemented in the
+			// crdb_internal.plpgsql_raise builtin function. The side-effecting body
+			// statement just makes a call into crdb_internal.plpgsql_raise using the
+			// RAISE statement options as parameters.
+			con := b.makeContinuation("_stmt_raise")
+			const raiseFnName = "crdb_internal.plpgsql_raise"
+			props, overloads := builtinsregistry.GetBuiltinProperties(raiseFnName)
+			if len(overloads) != 1 {
+				panic(errors.AssertionFailedf("expected one overload for %s", raiseFnName))
+			}
+			raiseCall := b.ob.factory.ConstructFunction(
+				b.getRaiseArgs(con.s, t),
+				&memo.FunctionPrivate{
+					Name:       raiseFnName,
+					Typ:        types.Int,
+					Properties: props,
+					Overload:   &overloads[0],
+				},
+			)
+			raiseColName := scopeColName("").WithMetadataName(b.makeIdentifier("stmt_raise"))
+			raiseScope := con.s.push()
+			b.ob.synthesizeColumn(raiseScope, raiseColName, types.Int, nil /* expr */, raiseCall)
+			b.ob.constructProjectForScope(con.s, raiseScope)
+			con.def.Body = []memo.RelExpr{raiseScope.expr}
+			con.def.BodyProps = []*physical.Required{raiseScope.makePhysicalProps()}
+			b.finishContinuation(stmts[i+1:], &con, false /* recursive */)
+			return b.callContinuation(&con, s)
 		default:
 			panic(unimplemented.New(
 				"unimplemented PL/pgSQL statement",
@@ -363,9 +402,14 @@ func (b *plpgsqlBuilder) buildPLpgSQLStatements(
 func (b *plpgsqlBuilder) addPLpgSQLAssign(
 	inScope *scope, ident plpgsqltree.PLpgSQLVariable, val plpgsqltree.PLpgSQLExpr,
 ) *scope {
+	if b.constants != nil {
+		if _, ok := b.constants[ident]; ok {
+			panic(pgerror.Newf(pgcode.ErrorInAssignment, "variable \"%s\" is declared CONSTANT", ident))
+		}
+	}
 	typ, ok := b.varTypes[ident]
 	if !ok {
-		panic(errors.AssertionFailedf("failed to find type for variable %s", ident))
+		panic(pgerror.Newf(pgcode.Syntax, "\"%s\" is not a known variable", ident))
 	}
 	assignScope := inScope.push()
 	for i := range inScope.cols {
@@ -386,25 +430,136 @@ func (b *plpgsqlBuilder) addPLpgSQLAssign(
 	return assignScope
 }
 
+// getRaiseArgs validates the options attached to the given PLpgSQL RAISE
+// statement and returns the arguments to be used for a call to the
+// crdb_internal.plpgsql_raise builtin function.
+func (b *plpgsqlBuilder) getRaiseArgs(
+	s *scope, raise *plpgsqltree.PLpgSQLStmtRaise,
+) memo.ScalarListExpr {
+	var severity, message, detail, hint, code opt.ScalarExpr
+	makeConstStr := func(str string) opt.ScalarExpr {
+		return b.ob.factory.ConstructConstVal(tree.NewDString(str), types.String)
+	}
+	// Retrieve the error/notice severity.
+	logLevel := strings.ToUpper(raise.LogLevel)
+	if logLevel == "" {
+		// EXCEPTION is the default log level.
+		logLevel = "EXCEPTION"
+	}
+	switch logLevel {
+	case "EXCEPTION":
+		// ERROR is the equivalent severity to log-level EXCEPTION.
+		severity = makeConstStr("ERROR")
+	case "LOG", "INFO", "NOTICE", "WARNING":
+		severity = makeConstStr(logLevel)
+	case "DEBUG":
+		// DEBUG log-level maps to severity DEBUG1.
+		severity = makeConstStr("DEBUG1")
+	default:
+		panic(errors.AssertionFailedf("unexpected log level %s", raise.LogLevel))
+	}
+	// Retrieve the message, if it was set with the format syntax.
+	if raise.Message != "" {
+		message = b.makeRaiseFormatMessage(s, raise.Message, raise.Params)
+	}
+	if raise.Code != "" {
+		code = makeConstStr(raise.Code)
+	} else if raise.CodeName != "" {
+		code = makeConstStr(raise.CodeName)
+	}
+	// Retrieve the RAISE options, if any.
+	buildOptionExpr := func(name string, expr plpgsqltree.PLpgSQLExpr, isDup bool) opt.ScalarExpr {
+		if isDup {
+			panic(pgerror.Newf(pgcode.Syntax, "RAISE option already specified: %s", name))
+		}
+		return b.buildPLpgSQLExpr(expr, types.String, s)
+	}
+	for _, option := range raise.Options {
+		optName := strings.ToUpper(option.OptType)
+		switch optName {
+		case "MESSAGE":
+			message = buildOptionExpr(optName, option.Expr, message != nil)
+		case "DETAIL":
+			detail = buildOptionExpr(optName, option.Expr, detail != nil)
+		case "HINT":
+			hint = buildOptionExpr(optName, option.Expr, hint != nil)
+		case "ERRCODE":
+			code = buildOptionExpr(optName, option.Expr, code != nil)
+		case "COLUMN", "CONSTRAINT", "DATATYPE", "TABLE", "SCHEMA":
+			panic(unimplemented.NewWithIssuef(106237, "RAISE option %s is not yet implemented", optName))
+		default:
+			panic(errors.AssertionFailedf("unrecognized RAISE option: %s", option.OptType))
+		}
+	}
+	if code == nil {
+		if logLevel == "EXCEPTION" {
+			// The default error code for EXCEPTION is ERRCODE_RAISE_EXCEPTION.
+			code = makeConstStr(pgcode.RaiseException.String())
+		} else {
+			code = makeConstStr(pgcode.SuccessfulCompletion.String())
+		}
+	}
+	// If no message text is supplied, use the error code or condition name.
+	if message == nil {
+		message = code
+	}
+	args := memo.ScalarListExpr{severity, message, detail, hint, code}
+	for i := range args {
+		if args[i] == nil {
+			args[i] = makeConstStr("")
+		}
+	}
+	return args
+}
+
+// A PLpgSQL RAISE statement can specify a format string, where supplied
+// expressions replace instances of '%' in the string. A literal '%' character
+// is specified by doubling it: '%%'. The formatting arguments can be arbitrary
+// SQL expressions.
+func (b *plpgsqlBuilder) makeRaiseFormatMessage(
+	s *scope, format string, args []plpgsqltree.PLpgSQLExpr,
+) (result opt.ScalarExpr) {
+	makeConstStr := func(str string) opt.ScalarExpr {
+		return b.ob.factory.ConstructConstVal(tree.NewDString(str), types.String)
+	}
+	addToResult := func(expr opt.ScalarExpr) {
+		if result == nil {
+			result = expr
+		} else {
+			// Concatenate the previously built string with the current one.
+			result = b.ob.factory.ConstructConcat(result, expr)
+		}
+	}
+	// Split the format string on each pair of '%' characters; any '%' characters
+	// in the substrings are formatting parameters.
+	var argIdx int
+	for i, literalSubstr := range strings.Split(format, "%%") {
+		if i > 0 {
+			// Add the literal '%' character in place of the matched '%%'.
+			addToResult(makeConstStr("%"))
+		}
+		// Split on the parameter characters '%'.
+		for j, paramSubstr := range strings.Split(literalSubstr, "%") {
+			if j > 0 {
+				// Add the next argument at the location of this parameter.
+				if argIdx >= len(args) {
+					panic(pgerror.Newf(pgcode.Syntax, "too few parameters specified for RAISE"))
+				}
+				addToResult(b.buildPLpgSQLExpr(args[argIdx], types.String, s))
+				argIdx++
+			}
+			addToResult(makeConstStr(paramSubstr))
+		}
+	}
+	if argIdx < len(args) {
+		panic(pgerror.Newf(pgcode.Syntax, "too many parameters specified for RAISE"))
+	}
+	return result
+}
+
 // makeContinuation allocates a new continuation function with an uninitialized
 // definition.
 func (b *plpgsqlBuilder) makeContinuation(name string) continuation {
-	return continuation{
-		def: &memo.UDFDefinition{
-			Name:              b.makeIdentifier(name),
-			Typ:               b.returnType,
-			CalledOnNullInput: true,
-		},
-	}
-}
-
-// finishContinuation initializes the definition of a continuation function with
-// the function body. It is separate from makeContinuation to allow recursive
-// function definitions, which need to push the continuation before it is
-// finished.
-func (b *plpgsqlBuilder) finishContinuation(
-	stmts []plpgsqltree.PLpgSQLStatement, con *continuation, recursive bool,
-) {
 	s := b.ob.allocScope()
 	b.ensureScopeHasExpr(s)
 	params := make(opt.ColList, 0, len(b.decls)+len(b.params))
@@ -422,18 +577,42 @@ func (b *plpgsqlBuilder) finishContinuation(
 	for _, param := range b.params {
 		addParam(tree.Name(param.Name), param.Typ)
 	}
+	return continuation{
+		def: &memo.UDFDefinition{
+			Params:            params,
+			Name:              b.makeIdentifier(name),
+			Typ:               b.returnType,
+			CalledOnNullInput: true,
+		},
+		s: s,
+	}
+}
+
+// finishContinuation adds the final body statement to the definition of a
+// continuation function. This statement returns the result of executing the
+// given PLpgSQL statements. There may be other statements that are executed
+// before this final statement for their side effects (e.g. RAISE statement).
+//
+// finishContinuation is separate from makeContinuation to allow recursive
+// function definitions, which need to push the continuation before it is
+// finished.
+func (b *plpgsqlBuilder) finishContinuation(
+	stmts []plpgsqltree.PLpgSQLStatement, con *continuation, recursive bool,
+) {
 	// Make sure to push s before constructing the continuation scope to ensure
 	// that the parameter columns are not projected.
-	continuationScope := b.buildPLpgSQLStatements(stmts, s.push())
+	continuationScope := b.buildPLpgSQLStatements(stmts, con.s.push())
 	if continuationScope == nil {
 		// One or more branches did not terminate with a RETURN statement.
 		con.reachedEndOfFunction = true
 		return
 	}
+	// Append to the body statements because some PLpgSQL statements will make a
+	// continuation routine with more than one body statement in order to handle
+	// side effects (see the RAISE case in buildPLpgSQLStatements).
+	con.def.Body = append(con.def.Body, continuationScope.expr)
+	con.def.BodyProps = append(con.def.BodyProps, continuationScope.makePhysicalProps())
 	con.def.IsRecursive = recursive
-	con.def.Body = []memo.RelExpr{continuationScope.expr}
-	con.def.BodyProps = []*physical.Required{continuationScope.makePhysicalProps()}
-	con.def.Params = params
 	// Set the volatility of the continuation routine to the least restrictive
 	// volatility level in the expression's Relational properties.
 	vol := continuationScope.expr.Relational().VolatilitySet
@@ -470,7 +649,8 @@ func (b *plpgsqlBuilder) callContinuation(con *continuation, s *scope) *scope {
 	for _, param := range b.params {
 		addArg(tree.Name(param.Name), param.Typ)
 	}
-	call := b.ob.factory.ConstructUDFCall(args, &memo.UDFCallPrivate{Def: con.def})
+	// PLpgSQL continuation routines are always in tail-call position.
+	call := b.ob.factory.ConstructUDFCall(args, &memo.UDFCallPrivate{Def: con.def, TailCall: true})
 
 	returnColName := scopeColName("").WithMetadataName(con.def.Name)
 	returnScope := s.push()
@@ -512,6 +692,10 @@ type continuation struct {
 	// def is used to construct a call into a routine that picks up execution
 	// from a branch in the control flow.
 	def *memo.UDFDefinition
+
+	// s is a scope initialized with the parameters of the routine. It should be
+	// used to construct the routine body statement.
+	s *scope
 
 	// isLoopContinuation indicates that this continuation was constructed for the
 	// body statements of a loop.

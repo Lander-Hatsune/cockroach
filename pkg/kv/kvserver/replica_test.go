@@ -42,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/lockspanset"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftlog"
@@ -57,7 +58,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -1055,6 +1055,17 @@ func TestReplicaLeaseCounters(t *testing.T) {
 
 	var tc testContext
 	cfg := TestStoreConfig(nil)
+	nlActive, nlRenewal := cfg.NodeLivenessDurations()
+	cfg.NodeLiveness = liveness.NewNodeLiveness(liveness.NodeLivenessOptions{
+		AmbientCtx:        log.AmbientContext{},
+		Stopper:           stopper,
+		Settings:          cfg.Settings,
+		Clock:             cfg.Clock,
+		LivenessThreshold: nlActive,
+		RenewalDuration:   nlRenewal,
+		Engines:           []storage.Engine{},
+		NodeDialer:        cfg.NodeDialer,
+	})
 	tc.StartWithStoreConfig(ctx, t, stopper, cfg)
 
 	assert := func(actual, min, max int64) error {
@@ -1775,8 +1786,8 @@ func TestOptimizePuts(t *testing.T) {
 			require.NoError(t, storage.MVCCDeleteRangeUsingTombstone(ctx, tc.engine, nil,
 				c.exKey, c.exEndKey, hlc.MinTimestamp, hlc.ClockTimestamp{}, nil, nil, false, 0, nil))
 		} else if c.exKey != nil {
-			require.NoError(t, storage.MVCCPut(ctx, tc.engine, nil, c.exKey,
-				hlc.Timestamp{}, hlc.ClockTimestamp{}, roachpb.MakeValueFromString("foo"), nil))
+			require.NoError(t, storage.MVCCPut(ctx, tc.engine, c.exKey,
+				hlc.Timestamp{}, roachpb.MakeValueFromString("foo"), storage.MVCCWriteOptions{}))
 		}
 		batch := kvpb.BatchRequest{}
 		for _, r := range c.reqs {
@@ -1823,7 +1834,7 @@ func TestOptimizePuts(t *testing.T) {
 			require.NoError(t, tc.engine.ClearMVCCRangeKey(storage.MVCCRangeKey{
 				StartKey: c.exKey, EndKey: c.exEndKey, Timestamp: hlc.MinTimestamp}))
 		} else if c.exKey != nil {
-			require.NoError(t, tc.engine.ClearUnversioned(c.exKey))
+			require.NoError(t, tc.engine.ClearUnversioned(c.exKey, storage.ClearOptions{}))
 		}
 	}
 }
@@ -3481,7 +3492,7 @@ func TestReplicaAbortSpanReadError(t *testing.T) {
 
 	// Overwrite Abort span entry with garbage for the last op.
 	key := keys.AbortSpanKey(tc.repl.RangeID, txn.ID)
-	err := storage.MVCCPut(ctx, tc.engine, nil, key, hlc.Timestamp{}, hlc.ClockTimestamp{}, roachpb.MakeValueFromString("never read in this test"), nil)
+	err := storage.MVCCPut(ctx, tc.engine, key, hlc.Timestamp{}, roachpb.MakeValueFromString("never read in this test"), storage.MVCCWriteOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3715,12 +3726,12 @@ func TestReplicaTxnIdempotency(t *testing.T) {
 				return runWithTxn(nil, &args)
 			},
 			afterTxnStart: func(txn *roachpb.Transaction, key []byte) error {
-				args := deleteRangeArgs(key, append(key, 0))
+				args := deleteRangeArgs(key, roachpb.Key(key).Clone().Next())
 				args.Sequence = 2
 				return runWithTxn(txn, &args)
 			},
 			run: func(txn *roachpb.Transaction, key []byte) error {
-				args := deleteRangeArgs(key, append(key, 0))
+				args := deleteRangeArgs(key, roachpb.Key(key).Clone().Next())
 				args.Sequence = 2
 				return runWithTxn(txn, &args)
 			},
@@ -4560,7 +4571,7 @@ func TestEndTxnWithErrors(t *testing.T) {
 			existTxnRecord := existTxn.AsRecord()
 			txnKey := keys.TransactionKey(test.key, txn.ID)
 			if err := storage.MVCCPutProto(
-				ctx, tc.repl.store.TODOEngine(), nil, txnKey, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &existTxnRecord,
+				ctx, tc.repl.store.TODOEngine(), txnKey, hlc.Timestamp{}, &existTxnRecord, storage.MVCCWriteOptions{},
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -4603,7 +4614,7 @@ func TestEndTxnWithErrorAndSyncIntentResolution(t *testing.T) {
 	existTxn.Status = roachpb.ABORTED
 	existTxnRec := existTxn.AsRecord()
 	txnKey := keys.TransactionKey(txn.Key, txn.ID)
-	err := storage.MVCCPutProto(ctx, tc.repl.store.TODOEngine(), nil, txnKey, hlc.Timestamp{}, hlc.ClockTimestamp{}, nil, &existTxnRec)
+	err := storage.MVCCPutProto(ctx, tc.repl.store.TODOEngine(), txnKey, hlc.Timestamp{}, &existTxnRec, storage.MVCCWriteOptions{})
 	require.NoError(t, err)
 
 	// End the transaction, verify expected error, shouldn't deadlock.
@@ -8116,253 +8127,6 @@ func TestReplicaRefreshPendingCommandsTicks(t *testing.T) {
 	}
 }
 
-// TestReplicaRefreshMultiple tests an interaction between refreshing
-// proposals after a new leader or ticks (which results in multiple
-// copies in the log with the same lease index) and refreshing after
-// an illegal lease index error (with a new lease index assigned).
-//
-// The setup here is rather artificial, but it represents something
-// that can happen (very rarely) in the real world with multiple raft
-// leadership transfers.
-func TestReplicaRefreshMultiple(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	if useReproposalsV2 {
-		skip.IgnoreLintf(t, "TODO(tbg)")
-	}
-
-	ctx := context.Background()
-
-	const incCmdID = "deadbeef"
-	var incApplyCount int64
-	tsc := TestStoreConfig(nil)
-	tsc.TestingKnobs.TestingPostApplyFilter = func(filterArgs kvserverbase.ApplyFilterArgs) (int, *kvpb.Error) {
-		if filterArgs.ForcedError == nil && filterArgs.CmdID == incCmdID {
-			atomic.AddInt64(&incApplyCount, 1)
-		}
-		return 0, nil
-	}
-	var tc testContext
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	tc.StartWithStoreConfig(ctx, t, stopper, tsc)
-	repl := tc.repl
-
-	key := roachpb.Key("a")
-
-	// Run a few commands first: This advances the lease index, which is
-	// necessary for the tricks we're going to play to induce failures
-	// (we need to be able to subtract from the current lease index
-	// without going below 0).
-	for i := 0; i < 3; i++ {
-		inc := incrementArgs(key, 1)
-		if _, pErr := kv.SendWrapped(ctx, tc.Sender(), inc); pErr != nil {
-			t.Fatal(pErr)
-		}
-	}
-	// Sanity check the resulting value.
-	get := getArgs(key)
-	if resp, pErr := kv.SendWrapped(ctx, tc.Sender(), &get); pErr != nil {
-		t.Fatal(pErr)
-	} else if x, err := resp.(*kvpb.GetResponse).Value.GetInt(); err != nil {
-		t.Fatalf("returned non-int: %+v", err)
-	} else if x != 3 {
-		t.Fatalf("expected 3, got %d", x)
-	}
-
-	// Manually propose another increment. This is the one we'll
-	// manipulate into failing. (the use of increment here is not
-	// significant. I originally wrote it this way because I thought the
-	// non-idempotence of increment would make it easier to test, but
-	// since the reproposals we're concerned with don't result in
-	// reevaluation it doesn't matter)
-	inc := incrementArgs(key, 1)
-	ba := &kvpb.BatchRequest{}
-	ba.Add(inc)
-	ba.Timestamp = tc.Clock().Now()
-
-	st := repl.CurrentLeaseStatus(ctx)
-	proposal, pErr := repl.requestToProposal(ctx, incCmdID, ba, allSpansGuard(), &st, uncertainty.Interval{})
-	if pErr != nil {
-		t.Fatal(pErr)
-	}
-	// Save this channel; it may get reset to nil before we read from it.
-	proposalDoneCh := proposal.doneCh
-
-	repl.mu.Lock()
-	ai := repl.mu.state.LeaseAppliedIndex
-	if ai <= 1 {
-		// Lease index zero is special in this test because we subtract
-		// from it below, so we need enough previous proposals in the
-		// log to ensure it doesn't go negative.
-		t.Fatalf("test requires LeaseAppliedIndex >= 2 at this point, have %d", ai)
-	}
-	assigned := false
-	repl.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) kvpb.LeaseAppliedIndex {
-		if p == proposal && !assigned {
-			assigned = true
-			t.Logf("assigned wrong LAI %d", ai-1)
-			return ai - 1
-		}
-		return 0
-	}
-	repl.mu.Unlock()
-
-	// Propose the command manually with errors induced. The first time it is
-	// proposed it will be given the incorrect max lease index which ensures
-	// that it will generate a retry when it fails. Then call refreshProposals
-	// twice to repropose it and put it in the logs twice more.
-	proposal.command.ProposerLeaseSequence = repl.mu.state.Lease.Sequence
-	_, tok := repl.mu.proposalBuf.TrackEvaluatingRequest(ctx, hlc.MinTimestamp)
-	if pErr := repl.propose(ctx, proposal, tok); pErr != nil {
-		t.Fatal(pErr)
-	}
-	repl.mu.Lock()
-	if err := tc.repl.mu.proposalBuf.flushLocked(ctx); err != nil {
-		t.Fatal(err)
-	}
-	repl.refreshProposalsLocked(ctx, 0 /* refreshAtDelta */, reasonNewLeader)
-	repl.refreshProposalsLocked(ctx, 0 /* refreshAtDelta */, reasonNewLeader)
-	repl.mu.Unlock()
-	require.Zero(t, tc.repl.mu.proposalBuf.EvaluatingRequestsCount())
-
-	// Wait for our proposal to apply. The two refreshed proposals above
-	// will fail due to their illegal lease index. Then they'll generate
-	// a reproposal (in the bug that we're testing against, they'd
-	// *each* generate a reproposal). When this reproposal succeeds, the
-	// doneCh is signaled.
-	select {
-	case resp := <-proposalDoneCh:
-		if resp.Err != nil {
-			t.Fatal(resp.Err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out")
-	}
-	// In the buggy case, there's a second reproposal that we don't have
-	// a good way to observe, so just sleep to let it apply if it's in
-	// the system.
-	time.Sleep(10 * time.Millisecond)
-
-	// The command applied exactly once. Note that this check would pass
-	// even in the buggy case, since illegal lease index proposals do
-	// not generate reevaluations (and increment is handled upstream of
-	// raft).
-	if resp, pErr := kv.SendWrapped(ctx, tc.Sender(), &get); pErr != nil {
-		t.Fatal(pErr)
-	} else if x, err := resp.(*kvpb.GetResponse).Value.GetInt(); err != nil {
-		t.Fatalf("returned non-int: %+v", err)
-	} else if x != 4 {
-		t.Fatalf("expected 4, got %d", x)
-	}
-
-	// The real test: our apply filter can tell us whether there was a
-	// duplicate reproposal. (A reproposed increment isn't harmful, but
-	// some other commands could be)
-	if x := atomic.LoadInt64(&incApplyCount); x != 1 {
-		t.Fatalf("expected 1, got %d", x)
-	}
-}
-
-// TestReplicaReproposalWithNewLeaseIndexError tests an interaction where a
-// proposal is rejected beneath raft due an illegal lease index error and then
-// hits an error when being reproposed. The expectation is that this error
-// manages to make its way back to the client.
-func TestReplicaReproposalWithNewLeaseIndexError(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	if useReproposalsV2 {
-		skip.IgnoreLint(t, "TODO(tbg)")
-	}
-
-	ctx := context.Background()
-	var tc testContext
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	tc.Start(ctx, t, stopper)
-
-	type magicKey struct{}
-	magicCtx := context.WithValue(ctx, magicKey{}, "foo")
-
-	var curFlushAttempt, curInsertAttempt int32 // updated atomically
-	tc.repl.mu.Lock()
-	tc.repl.mu.proposalBuf.testing.leaseIndexFilter = func(p *ProposalData) kvpb.LeaseAppliedIndex {
-		if v := p.ctx.Value(magicKey{}); v != nil {
-			flushAttempts := atomic.AddInt32(&curFlushAttempt, 1)
-			switch flushAttempts {
-			case 1:
-				// This is the first time the command is being given a max lease
-				// applied index. Set the index to that of the recently applied
-				// write. Two requests can't have the same lease applied index,
-				// so this will cause it to be rejected beneath raft with an
-				// illegal lease index error.
-				wrongLeaseIndex := kvpb.LeaseAppliedIndex(1)
-				return wrongLeaseIndex
-			default:
-				// Unexpected. Asserted against below.
-				return 0
-			}
-		}
-		return 0
-	}
-	tc.repl.mu.proposalBuf.testing.insertFilter = func(p *ProposalData) error {
-		if v := p.ctx.Value(magicKey{}); v != nil {
-			curAttempt := atomic.AddInt32(&curInsertAttempt, 1)
-			switch curAttempt {
-			case 2:
-				// This is the second time the command is being given a max
-				// lease applied index, which should be after the command was
-				// rejected beneath raft. Return an error. We expect this error
-				// to propagate up through tryReproposeWithNewLeaseIndex and
-				// make it back to the client.
-				return errors.New("boom")
-			default:
-				// Unexpected. Asserted against below.
-				return nil
-			}
-		}
-		return nil
-	}
-	tc.repl.mu.Unlock()
-
-	// Perform a few writes to advance the lease applied index.
-	const initCount = 3
-	key := roachpb.Key("a")
-	for i := 0; i < initCount; i++ {
-		iArg := incrementArgs(key, 1)
-		if _, pErr := tc.SendWrapped(iArg); pErr != nil {
-			t.Fatal(pErr)
-		}
-	}
-
-	// Perform a write that will first hit an illegal lease index error and
-	// will then hit the injected error when we attempt to repropose it.
-	ba := &kvpb.BatchRequest{}
-	iArg := incrementArgs(key, 10)
-	ba.Add(iArg)
-	if _, pErr := tc.Sender().Send(magicCtx, ba); pErr == nil {
-		t.Fatal("expected a non-nil error")
-	} else if !testutils.IsPError(pErr, "boom") {
-		t.Fatalf("unexpected error: %v", pErr)
-	}
-	// The command should have been inserted in the buffer exactly twice.
-	if exp, act := int32(2), atomic.LoadInt32(&curInsertAttempt); exp != act {
-		t.Fatalf("expected %d proposals, got %d", exp, act)
-	}
-
-	// The command should not have applied.
-	gArgs := getArgs(key)
-	if reply, pErr := tc.SendWrapped(&gArgs); pErr != nil {
-		t.Fatal(pErr)
-	} else if v, err := reply.(*kvpb.GetResponse).Value.GetInt(); err != nil {
-		t.Fatal(err)
-	} else if v != initCount {
-		t.Fatalf("expected value of %d, found %d", initCount, v)
-	}
-}
-
 // Test that, if the Raft command resulting from EndTxn request fails to be
 // processed/apply, then the LocalResult associated with that command is
 // cleared.
@@ -9120,12 +8884,8 @@ func TestReplicaMetrics(t *testing.T) {
 		}
 		return d
 	}
-	live := func(ids ...roachpb.NodeID) livenesspb.IsLiveMap {
-		m := livenesspb.IsLiveMap{}
-		for _, id := range ids {
-			m[id] = livenesspb.IsLiveMapEntry{IsLive: true}
-		}
-		return m
+	live := func(ids ...roachpb.NodeID) livenesspb.NodeVitalityInterface {
+		return livenesspb.TestCreateNodeVitality(ids...)
 	}
 
 	ctx := context.Background()
@@ -9140,7 +8900,7 @@ func TestReplicaMetrics(t *testing.T) {
 		storeID     roachpb.StoreID
 		desc        roachpb.RangeDescriptor
 		raftStatus  *raftSparseStatus
-		liveness    livenesspb.IsLiveMap
+		liveness    livenesspb.NodeVitalityInterface
 		raftLogSize int64
 		expected    ReplicaMetrics
 	}{
@@ -9336,7 +9096,7 @@ func TestReplicaMetrics(t *testing.T) {
 			metrics := calcReplicaMetrics(calcReplicaMetricsInput{
 				raftCfg:            &cfg.RaftConfig,
 				conf:               spanConfig,
-				livenessMap:        c.liveness,
+				vitalityMap:        c.liveness.ScanNodeVitalityFromCache(),
 				desc:               &c.desc,
 				raftStatus:         c.raftStatus,
 				storeID:            c.storeID,
@@ -11051,7 +10811,7 @@ func TestReplicaServersideRefreshes(t *testing.T) {
 				expTS = ba.Txn.WriteTimestamp
 
 				scan := scanArgs(roachpb.Key("lscan"), roachpb.Key("lscan\x00"))
-				scan.KeyLocking = lock.Update
+				scan.KeyLocking = lock.Exclusive
 				ba.Add(scan)
 				return
 			},
@@ -11225,7 +10985,7 @@ func TestReplicaPushed1PC(t *testing.T) {
 	// Write a value outside the transaction.
 	tc.manualClock.Advance(10)
 	ts2 := tc.Clock().Now()
-	if err := storage.MVCCPut(ctx, tc.engine, nil, k, ts2, hlc.ClockTimestamp{}, roachpb.MakeValueFromString("one"), nil); err != nil {
+	if err := storage.MVCCPut(ctx, tc.engine, k, ts2, roachpb.MakeValueFromString("one"), storage.MVCCWriteOptions{}); err != nil {
 		t.Fatalf("writing interfering value: %+v", err)
 	}
 
@@ -11575,137 +11335,125 @@ func TestReplicaShouldCampaignOnWake(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	const storeID = roachpb.StoreID(1)
-
-	desc := roachpb.RangeDescriptor{
-		RangeID:  1,
-		StartKey: roachpb.RKeyMin,
-		EndKey:   roachpb.RKeyMax,
-		InternalReplicas: []roachpb.ReplicaDescriptor{
-			{
-				ReplicaID: 1,
-				NodeID:    1,
-				StoreID:   1,
-			},
-			{
-				ReplicaID: 2,
-				NodeID:    2,
-				StoreID:   2,
-			},
-			{
-				ReplicaID: 3,
-				NodeID:    3,
-				StoreID:   3,
-			},
-		},
-		NextReplicaID: 4,
-	}
-	livenessMap := livenesspb.IsLiveMap{
-		1: livenesspb.IsLiveMapEntry{IsLive: true},
-		2: livenesspb.IsLiveMapEntry{IsLive: false},
-		4: livenesspb.IsLiveMapEntry{IsLive: false},
-	}
-
-	myLease := roachpb.Lease{
-		Replica: roachpb.ReplicaDescriptor{
-			StoreID: storeID,
-		},
-	}
-	otherLease := roachpb.Lease{
-		Replica: roachpb.ReplicaDescriptor{
-			StoreID: roachpb.StoreID(2),
-		},
-	}
-
-	followerWithoutLeader := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      0,
-		},
-	}
-	followerWithLeader := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      1,
-		},
-	}
-	candidate := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateCandidate,
-			Lead:      0,
-		},
-	}
-	leader := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateLeader,
-			Lead:      1,
-		},
-	}
-	followerDeadLeader := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      2,
-		},
-	}
-	candidateDeadLeader := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateCandidate,
-			Lead:      2,
-		},
-	}
-	followerMissingLiveness := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      3,
-		},
-	}
-	followerMissingDesc := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      4,
-		},
-	}
-
-	tests := []struct {
+	type params struct {
 		leaseStatus             kvserverpb.LeaseStatus
+		storeID                 roachpb.StoreID
 		raftStatus              raft.BasicStatus
 		livenessMap             livenesspb.IsLiveMap
 		desc                    *roachpb.RangeDescriptor
 		requiresExpirationLease bool
-		exp                     bool
-	}{
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: myLease}, followerWithoutLeader, livenessMap, &desc, false, true},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: otherLease}, followerWithoutLeader, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: myLease}, followerWithLeader, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: otherLease}, followerWithLeader, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: myLease}, candidate, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: otherLease}, candidate, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: myLease}, leader, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_VALID, Lease: otherLease}, leader, livenessMap, &desc, false, false},
-
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: myLease}, followerWithoutLeader, livenessMap, &desc, false, true},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, followerWithoutLeader, livenessMap, &desc, false, true},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: myLease}, followerWithoutLeader, livenessMap, &desc, true, true},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, followerWithoutLeader, livenessMap, &desc, true, true},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: myLease}, followerWithLeader, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, followerWithLeader, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: myLease}, candidate, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, candidate, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: myLease}, leader, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, leader, livenessMap, &desc, false, false},
-
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, followerDeadLeader, livenessMap, &desc, false, true},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, followerDeadLeader, livenessMap, &desc, true, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, followerMissingLiveness, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, followerMissingDesc, livenessMap, &desc, false, false},
-		{kvserverpb.LeaseStatus{State: kvserverpb.LeaseState_EXPIRED, Lease: otherLease}, candidateDeadLeader, livenessMap, &desc, false, false},
+		now                     hlc.Timestamp
 	}
 
-	for i, test := range tests {
-		v := shouldCampaignOnWake(test.leaseStatus, storeID, test.raftStatus, test.livenessMap, test.desc, test.requiresExpirationLease)
-		if v != test.exp {
-			t.Errorf("%d: expected %v but got %v", i, test.exp, v)
-		}
+	// Set up a base state that we can vary, representing this node n1 being a
+	// follower of n2, but n2 is dead and does not hold a valid lease. We should
+	// campaign in this state.
+	base := params{
+		storeID: 1,
+		desc: &roachpb.RangeDescriptor{
+			RangeID:  1,
+			StartKey: roachpb.RKeyMin,
+			EndKey:   roachpb.RKeyMax,
+			InternalReplicas: []roachpb.ReplicaDescriptor{
+				{NodeID: 1, StoreID: 1, ReplicaID: 1},
+				{NodeID: 2, StoreID: 2, ReplicaID: 2},
+				{NodeID: 3, StoreID: 3, ReplicaID: 3},
+			},
+			NextReplicaID: 4,
+		},
+		leaseStatus: kvserverpb.LeaseStatus{
+			Lease: roachpb.Lease{Replica: roachpb.ReplicaDescriptor{StoreID: 2}},
+			State: kvserverpb.LeaseState_EXPIRED,
+		},
+		raftStatus: raft.BasicStatus{
+			SoftState: raft.SoftState{
+				RaftState: raft.StateFollower,
+				Lead:      2,
+			},
+		},
+		livenessMap: livenesspb.IsLiveMap{
+			1: livenesspb.IsLiveMapEntry{IsLive: true},
+			2: livenesspb.IsLiveMapEntry{IsLive: false},
+			3: livenesspb.IsLiveMapEntry{IsLive: false},
+		},
+	}
+
+	testcases := map[string]struct {
+		expect bool
+		modify func(*params)
+	}{
+		"dead leader without lease": {true, func(p *params) {}},
+		"valid remote lease": {false, func(p *params) {
+			p.leaseStatus.State = kvserverpb.LeaseState_VALID
+		}},
+		"valid local lease": {true, func(p *params) {
+			p.leaseStatus.State = kvserverpb.LeaseState_VALID
+			p.leaseStatus.Lease.Replica.StoreID = 1
+		}},
+		"pre-candidate": {false, func(p *params) {
+			p.raftStatus.SoftState.RaftState = raft.StatePreCandidate
+			p.raftStatus.Lead = raft.None
+		}},
+		"candidate": {false, func(p *params) {
+			p.raftStatus.SoftState.RaftState = raft.StateCandidate
+			p.raftStatus.Lead = raft.None
+		}},
+		"leader": {false, func(p *params) {
+			p.raftStatus.SoftState.RaftState = raft.StateLeader
+			p.raftStatus.Lead = 1
+		}},
+		"unknown leader": {true, func(p *params) {
+			p.raftStatus.Lead = raft.None
+		}},
+		"requires expiration lease": {false, func(p *params) {
+			p.requiresExpirationLease = true
+		}},
+		"leader not in desc": {false, func(p *params) {
+			p.raftStatus.Lead = 4
+		}},
+		"leader not in liveness": {false, func(p *params) {
+			delete(p.livenessMap, 2)
+		}},
+		"leader is live": {false, func(p *params) {
+			p.livenessMap[2] = livenesspb.IsLiveMapEntry{
+				IsLive: true,
+				Liveness: livenesspb.Liveness{
+					NodeID:     2,
+					Expiration: p.now.Add(0, 1).ToLegacyTimestamp(),
+				},
+			}
+		}},
+		"leader is live according to expiration": {false, func(p *params) {
+			p.livenessMap[2] = livenesspb.IsLiveMapEntry{
+				IsLive: false,
+				Liveness: livenesspb.Liveness{
+					NodeID:     2,
+					Expiration: p.now.Add(0, 1).ToLegacyTimestamp(),
+				},
+			}
+		}},
+		"leader is dead according to expiration": {true, func(p *params) {
+			p.livenessMap[2] = livenesspb.IsLiveMapEntry{
+				IsLive: true,
+				Liveness: livenesspb.Liveness{
+					NodeID:     2,
+					Expiration: p.now.Add(0, -1).ToLegacyTimestamp(),
+				},
+			}
+		}},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			p := base
+			p.livenessMap = livenesspb.IsLiveMap{}
+			for k, v := range base.livenessMap {
+				p.livenessMap[k] = v
+			}
+			tc.modify(&p)
+			require.Equal(t, tc.expect, shouldCampaignOnWake(p.leaseStatus, p.storeID, p.raftStatus,
+				p.livenessMap, p.desc, p.requiresExpirationLease, p.now))
+		})
 	}
 }
 
@@ -11713,109 +11461,218 @@ func TestReplicaShouldCampaignOnLeaseRequestRedirect(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	desc := roachpb.RangeDescriptor{
-		RangeID:  1,
-		StartKey: roachpb.RKeyMin,
-		EndKey:   roachpb.RKeyMax,
-		InternalReplicas: []roachpb.ReplicaDescriptor{
-			{
-				ReplicaID: 1,
-				NodeID:    1,
-				StoreID:   1,
-			},
-			{
-				ReplicaID: 2,
-				NodeID:    2,
-				StoreID:   2,
-			},
-			{
-				ReplicaID: 3,
-				NodeID:    3,
-				StoreID:   3,
-			},
-		},
-		NextReplicaID: 4,
+	type params struct {
+		raftStatus               raft.BasicStatus
+		livenessMap              livenesspb.IsLiveMap
+		desc                     *roachpb.RangeDescriptor
+		shouldUseExpirationLease bool
+		now                      hlc.Timestamp
 	}
 
-	now := hlc.Timestamp{WallTime: 100}
-	livenessMap := livenesspb.IsLiveMap{
-		1: livenesspb.IsLiveMapEntry{
-			IsLive:   true,
-			Liveness: livenesspb.Liveness{Epoch: 1, Expiration: now.Add(1, 0).ToLegacyTimestamp()},
+	// Set up a base state that we can vary, representing this node n1 being a
+	// follower of n2, but n2 is dead. We should campaign in this state.
+	base := params{
+		desc: &roachpb.RangeDescriptor{
+			RangeID:  1,
+			StartKey: roachpb.RKeyMin,
+			EndKey:   roachpb.RKeyMax,
+			InternalReplicas: []roachpb.ReplicaDescriptor{
+				{NodeID: 1, StoreID: 1, ReplicaID: 1},
+				{NodeID: 2, StoreID: 2, ReplicaID: 2},
+				{NodeID: 3, StoreID: 3, ReplicaID: 3},
+			},
+			NextReplicaID: 4,
 		},
-		2: livenesspb.IsLiveMapEntry{
-			// NOTE: we purposefully set IsLive to true in disagreement with the
-			// Liveness expiration to ensure that we're only looking at node liveness
-			// in shouldCampaignOnLeaseRequestRedirect and not at whether this node is
-			// reachable from the local node.
-			IsLive:   true,
-			Liveness: livenesspb.Liveness{Epoch: 1, Expiration: now.Add(-1, 0).ToLegacyTimestamp()},
+		raftStatus: raft.BasicStatus{
+			SoftState: raft.SoftState{
+				RaftState: raft.StateFollower,
+				Lead:      2,
+			},
 		},
+		livenessMap: livenesspb.IsLiveMap{
+			1: livenesspb.IsLiveMapEntry{IsLive: true},
+			2: livenesspb.IsLiveMapEntry{IsLive: false},
+			3: livenesspb.IsLiveMapEntry{IsLive: false},
+		},
+		now: hlc.Timestamp{Logical: 10},
 	}
 
-	followerWithoutLeader := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      0,
-		},
-	}
-	followerWithLeader := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      1,
-		},
-	}
-	candidate := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateCandidate,
-			Lead:      0,
-		},
-	}
-	leader := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateLeader,
-			Lead:      1,
-		},
-	}
-	followerDeadLeader := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      2,
-		},
-	}
-	followerMissingLiveness := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      3,
-		},
-	}
-	followerMissingDesc := raft.BasicStatus{
-		SoftState: raft.SoftState{
-			RaftState: raft.StateFollower,
-			Lead:      4,
-		},
-	}
-
-	tests := []struct {
-		name                    string
-		raftStatus              raft.BasicStatus
-		requiresExpirationLease bool
-		exp                     bool
+	testcases := map[string]struct {
+		expect bool
+		modify func(*params)
 	}{
-		{"candidate", candidate, false, false},
-		{"leader", leader, false, false},
-		{"follower without leader", followerWithoutLeader, false, true},
-		{"follower unknown leader", followerMissingDesc, false, false},
-		{"follower expiration-based lease", followerDeadLeader, true, false},
-		{"follower unknown liveness leader", followerMissingLiveness, false, false},
-		{"follower live leader", followerWithLeader, false, false},
-		{"follower dead leader", followerDeadLeader, false, true},
+		"dead leader": {true, func(p *params) {}},
+		"pre-candidate": {false, func(p *params) {
+			p.raftStatus.SoftState.RaftState = raft.StatePreCandidate
+			p.raftStatus.Lead = raft.None
+		}},
+		"candidate": {false, func(p *params) {
+			p.raftStatus.SoftState.RaftState = raft.StateCandidate
+			p.raftStatus.Lead = raft.None
+		}},
+		"leader": {false, func(p *params) {
+			p.raftStatus.SoftState.RaftState = raft.StateLeader
+			p.raftStatus.Lead = 1
+		}},
+		"unknown leader": {true, func(p *params) {
+			p.raftStatus.Lead = raft.None
+		}},
+		"should use expiration lease": {false, func(p *params) {
+			p.shouldUseExpirationLease = true
+		}},
+		"leader not in desc": {false, func(p *params) {
+			p.raftStatus.Lead = 4
+		}},
+		"leader not in liveness": {false, func(p *params) {
+			delete(p.livenessMap, 2)
+		}},
+		"leader is live": {false, func(p *params) {
+			p.livenessMap[2] = livenesspb.IsLiveMapEntry{
+				IsLive: true,
+				Liveness: livenesspb.Liveness{
+					NodeID:     2,
+					Expiration: p.now.Add(0, 1).ToLegacyTimestamp(),
+				},
+			}
+		}},
+		"leader is live according to expiration": {false, func(p *params) {
+			p.livenessMap[2] = livenesspb.IsLiveMapEntry{
+				IsLive: false,
+				Liveness: livenesspb.Liveness{
+					NodeID:     2,
+					Expiration: p.now.Add(0, 1).ToLegacyTimestamp(),
+				},
+			}
+		}},
+		"leader is dead according to expiration": {true, func(p *params) {
+			p.livenessMap[2] = livenesspb.IsLiveMapEntry{
+				IsLive: true,
+				Liveness: livenesspb.Liveness{
+					NodeID:     2,
+					Expiration: p.now.Add(0, -1).ToLegacyTimestamp(),
+				},
+			}
+		}},
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			v := shouldCampaignOnLeaseRequestRedirect(tc.raftStatus, livenessMap, &desc, tc.requiresExpirationLease, now)
-			require.Equal(t, tc.exp, v)
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			p := base
+			p.livenessMap = livenesspb.IsLiveMap{}
+			for k, v := range base.livenessMap {
+				p.livenessMap[k] = v
+			}
+			tc.modify(&p)
+			require.Equal(t, tc.expect, shouldCampaignOnLeaseRequestRedirect(
+				p.raftStatus, p.livenessMap, p.desc, p.shouldUseExpirationLease, p.now))
+		})
+	}
+}
+
+func TestReplicaShouldForgetLeaderOnVoteRequest(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	type params struct {
+		raftStatus  raft.BasicStatus
+		livenessMap livenesspb.IsLiveMap
+		desc        *roachpb.RangeDescriptor
+		now         hlc.Timestamp
+	}
+
+	// Set up a base state that we can vary, representing this node n1 being a
+	// follower of n2, but n2 is dead. We should forget the leader in this state.
+	base := params{
+		desc: &roachpb.RangeDescriptor{
+			RangeID:  1,
+			StartKey: roachpb.RKeyMin,
+			EndKey:   roachpb.RKeyMax,
+			InternalReplicas: []roachpb.ReplicaDescriptor{
+				{NodeID: 1, StoreID: 1, ReplicaID: 1},
+				{NodeID: 2, StoreID: 2, ReplicaID: 2},
+				{NodeID: 3, StoreID: 3, ReplicaID: 3},
+			},
+			NextReplicaID: 4,
+		},
+		raftStatus: raft.BasicStatus{
+			SoftState: raft.SoftState{
+				RaftState: raft.StateFollower,
+				Lead:      2,
+			},
+		},
+		livenessMap: livenesspb.IsLiveMap{
+			1: livenesspb.IsLiveMapEntry{IsLive: true},
+			2: livenesspb.IsLiveMapEntry{IsLive: false},
+			3: livenesspb.IsLiveMapEntry{IsLive: false},
+		},
+		now: hlc.Timestamp{Logical: 10},
+	}
+
+	testcases := map[string]struct {
+		expect bool
+		modify func(*params)
+	}{
+		"dead leader": {true, func(p *params) {}},
+		"pre-candidate": {false, func(p *params) {
+			p.raftStatus.SoftState.RaftState = raft.StatePreCandidate
+			p.raftStatus.Lead = raft.None
+		}},
+		"candidate": {false, func(p *params) {
+			p.raftStatus.SoftState.RaftState = raft.StateCandidate
+			p.raftStatus.Lead = raft.None
+		}},
+		"leader": {false, func(p *params) {
+			p.raftStatus.SoftState.RaftState = raft.StateLeader
+			p.raftStatus.Lead = 1
+		}},
+		"unknown leader": {false, func(p *params) {
+			p.raftStatus.Lead = raft.None
+		}},
+		"leader not in desc": {true, func(p *params) {
+			p.raftStatus.Lead = 4
+		}},
+		"leader not in liveness": {true, func(p *params) {
+			delete(p.livenessMap, 2)
+		}},
+		"leader is live": {false, func(p *params) {
+			p.livenessMap[2] = livenesspb.IsLiveMapEntry{
+				IsLive: true,
+				Liveness: livenesspb.Liveness{
+					NodeID:     2,
+					Expiration: p.now.Add(0, 1).ToLegacyTimestamp(),
+				},
+			}
+		}},
+		"leader is live according to expiration": {false, func(p *params) {
+			p.livenessMap[2] = livenesspb.IsLiveMapEntry{
+				IsLive: false,
+				Liveness: livenesspb.Liveness{
+					NodeID:     2,
+					Expiration: p.now.Add(0, 1).ToLegacyTimestamp(),
+				},
+			}
+		}},
+		"leader is dead according to expiration": {true, func(p *params) {
+			p.livenessMap[2] = livenesspb.IsLiveMapEntry{
+				IsLive: true,
+				Liveness: livenesspb.Liveness{
+					NodeID:     2,
+					Expiration: p.now.Add(0, -1).ToLegacyTimestamp(),
+				},
+			}
+		}},
+	}
+
+	for name, tc := range testcases {
+		t.Run(name, func(t *testing.T) {
+			p := base
+			p.livenessMap = livenesspb.IsLiveMap{}
+			for k, v := range base.livenessMap {
+				p.livenessMap[k] = v
+			}
+			tc.modify(&p)
+			require.Equal(t, tc.expect, shouldForgetLeaderOnVoteRequest(
+				p.raftStatus, p.livenessMap, p.desc, p.now))
 		})
 	}
 }
@@ -13634,10 +13491,10 @@ func setMockPutWithEstimates(containsEstimatesDelta int64) (undo func()) {
 		ctx context.Context, readWriter storage.ReadWriter, cArgs batcheval.CommandArgs, _ kvpb.Response,
 	) (result.Result, error) {
 		args := cArgs.Args.(*kvpb.PutRequest)
-		ms := cArgs.Stats
-		ms.ContainsEstimates += containsEstimatesDelta
+		opts := storage.MVCCWriteOptions{Txn: cArgs.Header.Txn, Stats: cArgs.Stats}
+		opts.Stats.ContainsEstimates += containsEstimatesDelta
 		ts := cArgs.Header.Timestamp
-		return result.Result{}, storage.MVCCBlindPut(ctx, readWriter, ms, args.Key, ts, hlc.ClockTimestamp{}, args.Value, cArgs.Header.Txn)
+		return result.Result{}, storage.MVCCBlindPut(ctx, readWriter, args.Key, ts, args.Value, opts)
 	}
 
 	batcheval.UnregisterCommand(kvpb.Put)

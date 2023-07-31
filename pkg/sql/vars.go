@@ -872,7 +872,7 @@ var varGen = map[string]sessionVar{
 	`enable_implicit_select_for_update`: {
 		GetStringVal: makePostgresBoolGetStringValFn(`enable_implicit_select_for_update`),
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar("enabled_implicit_select_for_update", s)
+			b, err := paramparse.ParseBoolVar("enable_implicit_select_for_update", s)
 			if err != nil {
 				return err
 			}
@@ -1491,7 +1491,7 @@ var varGen = map[string]sessionVar{
 	// See https://github.com/postgres/postgres/blob/REL_10_STABLE/src/backend/utils/misc/guc.c#L3401-L3409
 	`transaction_isolation`: {
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
-			level := kvTxnIsolationLevelToTree(evalCtx.Txn.IsoLevel())
+			level := tree.IsolationLevelFromKVTxnIsolationLevel(evalCtx.Txn.IsoLevel())
 			return strings.ToLower(level.String()), nil
 		},
 		RuntimeSet: func(ctx context.Context, evalCtx *extendedEvalContext, local bool, s string) error {
@@ -1566,17 +1566,17 @@ var varGen = map[string]sessionVar{
 	},
 
 	// CockroachDB extension.
-	`disable_drop_tenant`: {
+	`disable_drop_virtual_cluster`: {
 		Hidden: true,
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
-			return formatBoolAsPostgresSetting(evalCtx.SessionData().DisableDropTenant), nil
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().DisableDropVirtualCluster), nil
 		},
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			b, err := paramparse.ParseBoolVar("disable_drop_tenant", s)
+			b, err := paramparse.ParseBoolVar("disable_drop_virtual_cluster", s)
 			if err != nil {
 				return err
 			}
-			m.SetDisableDropTenant(b)
+			m.SetDisableDropVirtualCluster(b)
 			return nil
 		},
 		GlobalDefault: func(sv *settings.Values) string {
@@ -1589,7 +1589,7 @@ var varGen = map[string]sessionVar{
 			// - The session var is named "disable_" because we want the Go
 			//   default value (false) to mean that tenant deletion is enabled.
 			//   This is needed for backward-compatibility with Cockroach Cloud.
-			return formatBoolAsPostgresSetting(!enableDropTenant.Get(sv))
+			return formatBoolAsPostgresSetting(!enableDropVirtualCluster.Get(sv))
 		},
 	},
 
@@ -2772,22 +2772,11 @@ var varGen = map[string]sessionVar{
 		// It should only be set at connection time.
 		Hidden: true,
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
-			if strings.ToLower(s) == "database" {
-				m.SetReplicationMode(sessiondatapb.ReplicationMode_REPLICATION_MODE_DATABASE)
-				return nil
-			}
-			b, err := paramparse.ParseBoolVar("replication", s)
+			mode, err := ReplicationModeFromString(s)
 			if err != nil {
-				return pgerror.Newf(
-					pgcode.InvalidParameterValue,
-					`parameter "replication" requires a boolean value or "database"`,
-				)
+				return err
 			}
-			if b {
-				m.SetReplicationMode(sessiondatapb.ReplicationMode_REPLICATION_MODE_ENABLED)
-			} else {
-				m.SetReplicationMode(sessiondatapb.ReplicationMode_REPLICATION_MODE_DISABLED)
-			}
+			m.SetReplicationMode(mode)
 			return nil
 		},
 		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
@@ -2803,6 +2792,82 @@ var varGen = map[string]sessionVar{
 		},
 		GlobalDefault: globalFalse,
 	},
+
+	// CockroachDB extension.
+	`max_connections`: {
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			maxConn := maxNumNonAdminConnections.Get(&evalCtx.ExecCfg.Settings.SV)
+			return strconv.FormatInt(maxConn, 10), nil
+		},
+	},
+
+	// CockroachDB extension.
+	`optimizer_use_improved_join_elimination`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`optimizer_use_improved_join_elimination`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("optimizer_use_improved_join_elimination", s)
+			if err != nil {
+				return err
+			}
+			m.SetOptimizerUseImprovedJoinElimination(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().OptimizerUseImprovedJoinElimination), nil
+		},
+		GlobalDefault: globalTrue,
+	},
+
+	// CockroachDB extension.
+	`enable_implicit_fk_locking_for_serializable`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_implicit_fk_locking_for_serializable`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enable_implicit_fk_locking_for_serializable", s)
+			if err != nil {
+				return err
+			}
+			m.SetImplicitFKLockingForSerializable(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().ImplicitFKLockingForSerializable), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension.
+	`enable_durable_locking_for_serializable`: {
+		GetStringVal: makePostgresBoolGetStringValFn(`enable_durable_locking_for_serializable`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := paramparse.ParseBoolVar("enable_durable_locking_for_serializable", s)
+			if err != nil {
+				return err
+			}
+			m.SetDurableLockingForSerializable(b)
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return formatBoolAsPostgresSetting(evalCtx.SessionData().DurableLockingForSerializable), nil
+		},
+		GlobalDefault: globalFalse,
+	},
+}
+
+func ReplicationModeFromString(s string) (sessiondatapb.ReplicationMode, error) {
+	if strings.ToLower(s) == "database" {
+		return sessiondatapb.ReplicationMode_REPLICATION_MODE_DATABASE, nil
+	}
+	b, err := paramparse.ParseBoolVar("replication", s)
+	if err != nil {
+		return 0, pgerror.Newf(
+			pgcode.InvalidParameterValue,
+			`parameter "replication" requires a boolean value or "database"`,
+		)
+	}
+	if b {
+		return sessiondatapb.ReplicationMode_REPLICATION_MODE_ENABLED, nil
+	}
+	return sessiondatapb.ReplicationMode_REPLICATION_MODE_DISABLED, nil
 }
 
 // We want test coverage for this on and off so make it metamorphic.

@@ -30,13 +30,13 @@ import (
 var adminPrefix = "/_admin/v1/"
 
 func getAdminJSONProto(
-	ts serverutils.TestTenantInterface, path string, response protoutil.Message,
+	ts serverutils.ApplicationLayerInterface, path string, response protoutil.Message,
 ) error {
 	return getAdminJSONProtoWithAdminOption(ts, path, response, true)
 }
 
 func getAdminJSONProtoWithAdminOption(
-	ts serverutils.TestTenantInterface, path string, response protoutil.Message, isAdmin bool,
+	ts serverutils.ApplicationLayerInterface, path string, response protoutil.Message, isAdmin bool,
 ) error {
 	return serverutils.GetJSONProtoWithAdminOption(ts, adminPrefix+path, response, isAdmin)
 }
@@ -47,19 +47,26 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	// Need to disable the test tenant because this test fails
-	// when run through a tenant (with internal server error).
-	// More investigation is required. Tracked with #76387.
-	defaultTestTenant := base.TestTenantDisabled
+	// TODO(clust-obs): This test should work with just a single node,
+	// i.e. using serverutils.StartServer` instead of
+	// `StartNewTestCluster`.
 	testCluster := serverutils.StartNewTestCluster(t, 3,
 		base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
-				DefaultTestTenant: defaultTestTenant,
+				// The code below ought to work when this is omitted. This
+				// needs to be investigated further.
+				DefaultTestTenant: base.TestIsForStuffThatShouldWorkWithSecondaryTenantsButDoesntYet(106897),
 			},
 		})
 	defer testCluster.Stopper().Stop(context.Background())
 
 	firstServer := testCluster.Server(0)
+
+	// Enable zone configs for secondary tenants.
+	systemSqlDb := firstServer.SystemLayer().SQLConn(t, "system")
+	_, err := systemSqlDb.Exec("ALTER TENANT ALL SET CLUSTER SETTING sql.zone_configs.allow_for_secondary_tenant.enabled = true")
+	require.NoError(t, err)
+
 	sqlDB := sqlutils.MakeSQLRunner(testCluster.ServerConn(0))
 
 	sqlDB.Exec(t, `CREATE DATABASE roachblog`)
@@ -82,11 +89,6 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	sqlDB.Exec(t, `ALTER PARTITION us OF TABLE comments CONFIGURE ZONE USING gc.ttlseconds = 9001`)
 	sqlDB.Exec(t, `ALTER PARTITION eu OF TABLE comments CONFIGURE ZONE USING gc.ttlseconds = 9002`)
 
-	if defaultTestTenant == base.TestTenantDisabled {
-		// Make sure secondary tenants don't cause the endpoint to error.
-		sqlDB.Exec(t, "CREATE TENANT 'app'")
-	}
-
 	// Assert that we get all roachblog zone configs back.
 	expectedZoneConfigNames := map[string]struct{}{
 		"PARTITION eu OF INDEX roachblog.public.comments@comments_pkey": {},
@@ -94,7 +96,7 @@ func TestAdminAPIDataDistributionPartitioning(t *testing.T) {
 	}
 
 	var resp serverpb.DataDistributionResponse
-	err := serverutils.GetJSONProto(firstServer, adminPrefix+"data_distribution", &resp)
+	err = serverutils.GetJSONProto(firstServer, adminPrefix+"data_distribution", &resp)
 	require.NoError(t, err)
 
 	actualZoneConfigNames := map[string]struct{}{}
@@ -131,7 +133,7 @@ func TestAdminAPIJobs(t *testing.T) {
 	defer dirCleanupFn()
 	s, conn, _ := serverutils.StartServer(t, base.TestServerArgs{
 		// Fails with the default test tenant. Tracked with #76378.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		ExternalIODir:     dir})
 	defer s.Stopper().Stop(context.Background())
 	sqlDB := sqlutils.MakeSQLRunner(conn)
@@ -170,8 +172,8 @@ func TestListTenants(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
-		DefaultTestTenant: base.TestTenantDisabled,
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 	})
 	defer s.Stopper().Stop(ctx)
 
@@ -204,14 +206,13 @@ func TestListTenants(t *testing.T) {
 
 func TestTableAndDatabaseDetailsAndStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{DefaultTestTenant: base.TestTenantDisabled})
+	s, db, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
 
-	st, db := serverutils.StartTenant(t, s, base.TestTenantArgs{
-		TenantID: serverutils.TestTenantID(),
-	})
+	st := s.ApplicationLayer()
 	_, err := db.Exec("CREATE TABLE test (id int)")
 	require.NoError(t, err)
 	_, err = db.Exec("INSERT INTO test VALUES (1)")

@@ -471,6 +471,7 @@ func NewServer(cfg *ExecutorConfig, pool *mon.BytesMonitor) *Server {
 		DB: NewInternalDB(
 			s, MemoryMetrics{}, sqlStatsInternalExecutorMonitor,
 		),
+		ClusterID:      s.cfg.NodeInfo.LogicalClusterID,
 		SQLIDContainer: cfg.NodeInfo.NodeID,
 		JobRegistry:    s.cfg.JobRegistry,
 		Knobs:          cfg.SQLStatsTestingKnobs,
@@ -678,8 +679,7 @@ func (s *Server) GetUnscrubbedStmtStats(
 		stmtStats = append(stmtStats, *stat)
 		return nil
 	}
-	err :=
-		s.sqlStats.GetLocalMemProvider().IterateStatementStats(ctx, &sqlstats.IteratorOptions{}, stmtStatsVisitor)
+	err := s.sqlStats.GetLocalMemProvider().IterateStatementStats(ctx, sqlstats.IteratorOptions{}, stmtStatsVisitor)
 
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to fetch statement stats")
@@ -698,8 +698,7 @@ func (s *Server) GetUnscrubbedTxnStats(
 		txnStats = append(txnStats, *stat)
 		return nil
 	}
-	err :=
-		s.sqlStats.GetLocalMemProvider().IterateTransactionStats(ctx, &sqlstats.IteratorOptions{}, txnStatsVisitor)
+	err := s.sqlStats.GetLocalMemProvider().IterateTransactionStats(ctx, sqlstats.IteratorOptions{}, txnStatsVisitor)
 
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to fetch statement stats")
@@ -748,8 +747,7 @@ func (s *Server) getScrubbedStmtStats(
 		return nil
 	}
 
-	err :=
-		statsProvider.IterateStatementStats(ctx, &sqlstats.IteratorOptions{}, stmtStatsVisitor)
+	err := statsProvider.IterateStatementStats(ctx, sqlstats.IteratorOptions{}, stmtStatsVisitor)
 
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to fetch scrubbed statement stats")
@@ -1151,7 +1149,6 @@ func (s *Server) newConnExecutor(
 	ex.transitionCtx.sessionTracing = &ex.sessionTracing
 
 	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
-	ex.extraTxnState.createdSequences = make(map[descpb.ID]struct{})
 
 	if postSetupFn != nil {
 		postSetupFn(ex)
@@ -1973,6 +1970,7 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) {
 	ex.extraTxnState.numDDL = 0
 	ex.extraTxnState.firstStmtExecuted = false
 	ex.extraTxnState.hasAdminRoleCache = HasAdminRoleCache{}
+	ex.extraTxnState.createdSequences = nil
 
 	if ex.extraTxnState.fromOuterTxn {
 		if ex.extraTxnState.shouldResetSyntheticDescriptors {
@@ -1998,8 +1996,6 @@ func (ex *connExecutor) resetExtraTxnState(ctx context.Context, ev txnEvent) {
 	if err := ex.extraTxnState.sqlCursors.closeAll(false /* errorOnWithHold */); err != nil {
 		log.Warningf(ctx, "error closing cursors: %v", err)
 	}
-
-	ex.extraTxnState.createdSequences = make(map[descpb.ID]struct{})
 
 	switch ev.eventType {
 	case txnCommit, txnRollback:
@@ -2797,6 +2793,7 @@ func (ex *connExecutor) execCopyOut(
 			int(ex.state.mu.autoRetryCounter),
 			ex.extraTxnState.txnCounter,
 			numOutputRows,
+			ex.state.mu.stmtCount,
 			0, /* bulkJobId */
 			copyErr,
 			ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived),
@@ -2926,13 +2923,18 @@ func (ex *connExecutor) execCopyOut(
 	}
 
 	if copyErr := ex.execWithProfiling(ctx, cmd.Stmt, nil, func(ctx context.Context) error {
-		ex.mu.Lock()
-		queryMeta, ok := ex.mu.ActiveQueries[queryID]
-		if !ok {
-			return errors.AssertionFailedf("query %d not in registry", queryID)
+		if err := func() error {
+			ex.mu.Lock()
+			defer ex.mu.Unlock()
+			queryMeta, ok := ex.mu.ActiveQueries[queryID]
+			if !ok {
+				return errors.AssertionFailedf("query %d not in registry", queryID)
+			}
+			queryMeta.phase = executing
+			return nil
+		}(); err != nil {
+			return err
 		}
-		queryMeta.phase = executing
-		ex.mu.Unlock()
 
 		// We'll always have a txn on the planner since we called resetPlanner
 		// above.
@@ -3041,7 +3043,8 @@ func (ex *connExecutor) execCopyIn(
 		var stats topLevelQueryStats
 		ex.planner.maybeLogStatement(ctx, ex.executorType, true,
 			int(ex.state.mu.autoRetryCounter), ex.extraTxnState.txnCounter,
-			numInsertedRows, 0, /* bulkJobId */
+			numInsertedRows, ex.state.mu.stmtCount,
+			0, /* bulkJobId */
 			copyErr,
 			ex.statsCollector.PhaseTimes().GetSessionPhaseTime(sessionphase.SessionQueryReceived),
 			&ex.extraTxnState.hasAdminRoleCache,
@@ -3188,13 +3191,18 @@ func (ex *connExecutor) execCopyIn(
 	}
 
 	if copyErr = ex.execWithProfiling(ctx, cmd.Stmt, nil, func(ctx context.Context) error {
-		ex.mu.Lock()
-		queryMeta, ok := ex.mu.ActiveQueries[queryID]
-		if !ok {
-			return errors.AssertionFailedf("query %d not in registry", queryID)
+		if err := func() error {
+			ex.mu.Lock()
+			defer ex.mu.Unlock()
+			queryMeta, ok := ex.mu.ActiveQueries[queryID]
+			if !ok {
+				return errors.AssertionFailedf("query %d not in registry", queryID)
+			}
+			queryMeta.phase = executing
+			return nil
+		}(); err != nil {
+			return err
 		}
-		queryMeta.phase = executing
-		ex.mu.Unlock()
 		return cm.run(ctx)
 	}); copyErr != nil {
 		// TODO(andrei): We don't have a full retriable error story for the copy machine.
@@ -3422,21 +3430,6 @@ func (ex *connExecutor) txnIsolationLevelToKV(
 		default:
 			log.Fatalf(context.Background(), "unknown isolation level: %s", level)
 		}
-	}
-	return ret
-}
-
-func kvTxnIsolationLevelToTree(level isolation.Level) tree.IsolationLevel {
-	var ret tree.IsolationLevel
-	switch level {
-	case isolation.Serializable:
-		ret = tree.SerializableIsolation
-	case isolation.ReadCommitted:
-		ret = tree.ReadCommittedIsolation
-	case isolation.Snapshot:
-		ret = tree.SnapshotIsolation
-	default:
-		log.Fatalf(context.Background(), "unknown isolation level: %s", level)
 	}
 	return ret
 }
@@ -3996,7 +3989,7 @@ func (ex *connExecutor) serialize() serverpb.Session {
 			Priority:              ex.state.priority.String(),
 			QualityOfService:      sessiondatapb.ToQoSLevelString(txn.AdmissionHeader().Priority),
 			LastAutoRetryReason:   autoRetryReasonStr,
-			IsolationLevel:        kvTxnIsolationLevelToTree(ex.state.isolationLevel).String(),
+			IsolationLevel:        tree.IsolationLevelFromKVTxnIsolationLevel(ex.state.isolationLevel).String(),
 		}
 	}
 

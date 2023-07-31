@@ -61,7 +61,9 @@ disallow_full_table_scans                                  off
 distsql                                                    off
 enable_auto_rehoming                                       off
 enable_create_stats_using_extremes                         off
+enable_durable_locking_for_serializable                    off
 enable_experimental_alter_column_type_general              off
+enable_implicit_fk_locking_for_serializable                off
 enable_implicit_select_for_update                          on
 enable_implicit_transaction_for_batch_statements           on
 enable_insert_fast_path                                    on
@@ -107,6 +109,7 @@ locality                                                   region=test,dc=dc1
 locality_optimized_partitioned_index_scan                  on
 lock_timeout                                               0
 log_timezone                                               UTC
+max_connections                                            -1
 max_identifier_length                                      128
 max_index_keys                                             32
 node_id                                                    1
@@ -119,6 +122,7 @@ optimizer_use_forecasts                                    on
 optimizer_use_histograms                                   on
 optimizer_use_improved_computed_column_filters_derivation  on
 optimizer_use_improved_disjunction_stats                   on
+optimizer_use_improved_join_elimination                    on
 optimizer_use_improved_split_disjunction_for_joins         on
 optimizer_use_limit_ordering_for_streaming_group_by        on
 optimizer_use_multicol_stats                               on

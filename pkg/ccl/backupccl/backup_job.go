@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl"
 	"github.com/cockroachdb/cockroach/pkg/cloud"
 	"github.com/cockroachdb/cockroach/pkg/cloud/cloudpb"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/joberror"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
@@ -61,6 +62,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/gogo/protobuf/types"
 )
 
@@ -220,6 +222,9 @@ func backup(
 	// Create a channel that is large enough that it does not block.
 	perNodeProgressCh := make(chan map[execinfrapb.ComponentID]float32, numTotalSpans)
 	storePerNodeProgressLoop := func(ctx context.Context) error {
+		if !execCtx.ExecCfg().Settings.Version.IsActive(ctx, clusterversion.V23_1) {
+			return nil
+		}
 		for {
 			select {
 			case prog, ok := <-perNodeProgressCh:
@@ -476,13 +481,18 @@ func (b *backupResumer) ForceRealSpan() bool {
 	return true
 }
 
+// DumpTraceAfterRun implements the TraceableJob interface.
+func (b *backupResumer) DumpTraceAfterRun() bool {
+	return true
+}
+
 // Resume is part of the jobs.Resumer interface.
 func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 	// The span is finished by the registry executing the job.
 	details := b.job.Details().(jobspb.BackupDetails)
 	p := execCtx.(sql.JobExecContext)
 
-	if err := b.maybeRelocateJobExecution(ctx, p, details.ExecutionLocality); err != nil {
+	if err := maybeRelocateJobExecution(ctx, b.job.ID(), p, details.ExecutionLocality, "BACKUP"); err != nil {
 		return err
 	}
 
@@ -559,7 +569,7 @@ func (b *backupResumer) Resume(ctx context.Context, execCtx interface{}) error {
 		initialDetails := details
 		if err := insqlDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 			backupDetails, m, err := getBackupDetailAndManifest(
-				ctx, p.ExecCfg(), txn, details, p.User(), backupDest,
+				ctx, p.ExecCfg(), txn, initialDetails, p.User(), backupDest,
 			)
 			if err != nil {
 				return err
@@ -880,8 +890,12 @@ func (b *backupResumer) ReportResults(ctx context.Context, resultsCh chan<- tree
 	}
 }
 
-func (b *backupResumer) maybeRelocateJobExecution(
-	ctx context.Context, p sql.JobExecContext, locality roachpb.Locality,
+func maybeRelocateJobExecution(
+	ctx context.Context,
+	jobID jobspb.JobID,
+	p sql.JobExecContext,
+	locality roachpb.Locality,
+	jobDesc redact.SafeString,
 ) error {
 	if locality.NonEmpty() {
 		current, err := p.DistSQLPlanner().GetSQLInstanceInfo(p.ExecCfg().JobRegistry.ID())
@@ -890,8 +904,8 @@ func (b *backupResumer) maybeRelocateJobExecution(
 		}
 		if ok, missedTier := current.Locality.Matches(locality); !ok {
 			log.Infof(ctx,
-				"BACKUP job %d initially adopted on instance %d but it does not match locality filter %s, finding a new coordinator",
-				b.job.ID(), current.NodeID, missedTier.String(),
+				"%s job %d initially adopted on instance %d but it does not match locality filter %s, finding a new coordinator",
+				jobDesc, jobID, current.NodeID, missedTier.String(),
 			)
 
 			instancesInRegion, err := p.DistSQLPlanner().GetAllInstancesByLocality(ctx, locality)
@@ -904,7 +918,7 @@ func (b *backupResumer) maybeRelocateJobExecution(
 			var res error
 			if err := p.ExecCfg().InternalDB.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 				var err error
-				res, err = p.ExecCfg().JobRegistry.RelocateLease(ctx, txn, b.job.ID(), dest.InstanceID, dest.SessionID)
+				res, err = p.ExecCfg().JobRegistry.RelocateLease(ctx, txn, jobID, dest.InstanceID, dest.SessionID)
 				return err
 			}); err != nil {
 				return errors.Wrapf(err, "failed to relocate job coordinator to %d", dest.InstanceID)

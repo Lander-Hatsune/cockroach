@@ -17,6 +17,7 @@ go_library(
     # Pin the dependencies used in auto-generated code.
     deps = [
         "//pkg/geo/geoindex",
+        "//pkg/kv/kvserver/concurrency/isolation",
         "//pkg/roachpb",
         "//pkg/sql/appstatspb",
         "//pkg/sql/catalog/colinfo",
@@ -31,6 +32,7 @@ go_library(
         "//pkg/sql/pgwire/pgerror",
         "//pkg/sql/sem/catid",
         "//pkg/sql/sem/tree",
+        "//pkg/sql/sessiondatapb",
         "//pkg/sql/types",
         "//pkg/util",
         "//pkg/util/errorutil",
@@ -60,6 +62,8 @@ go_test(
     embed = [":explain"],
     deps = [
         "//pkg/base",
+        "//pkg/security/securityassets",
+        "//pkg/security/securitytest",
         "//pkg/server",
         "//pkg/sql/catalog/colinfo",
         "//pkg/sql/execinfra",

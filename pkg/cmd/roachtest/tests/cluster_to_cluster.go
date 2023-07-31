@@ -399,6 +399,9 @@ func (rd *replicationDriver) setupC2C(ctx context.Context, t test.Test, c cluste
 	destNode := dstCluster.SeededRandNode(rd.rng)
 
 	addr, err := c.ExternalPGUrl(ctx, t.L(), srcNode, "")
+	t.L().Printf("Randomly chosen src node %d for gateway with address %s", srcNode, addr)
+	t.L().Printf("Randomly chosen dst node %d for gateway", destNode)
+
 	require.NoError(t, err)
 
 	srcDB := c.Conn(ctx, t.L(), srcNode[0])
@@ -407,7 +410,7 @@ func (rd *replicationDriver) setupC2C(ctx context.Context, t test.Test, c cluste
 	destSQL := sqlutils.MakeSQLRunner(destDB)
 
 	srcClusterSettings(t, srcSQL)
-	destClusterSettings(t, destSQL)
+	destClusterSettings(t, destSQL, rd.rs.additionalDuration)
 
 	createTenantAdminRole(t, "src-system", srcSQL)
 	createTenantAdminRole(t, "dst-system", destSQL)
@@ -634,6 +637,31 @@ AS OF SYSTEM TIME '%s'`, startTimeDecimal, aost)
 	require.Equal(rd.t, srcFingerprint, destFingerprint)
 }
 
+// checkParticipatingNodes asserts that multiple nodes in the source and dest cluster are
+// participating in the replication stream, if the test is running on multi node clusters.
+//
+// Note: this isn't a strict requirement of all physical replication streams,
+// rather we check this here because we expect a distributed physical
+// replication stream in a healthy pair of multinode clusters.
+func (rd *replicationDriver) checkParticipatingNodes(ingestionJobId int) {
+	progress := getJobProgress(rd.t, rd.setup.dst.sysSQL, jobspb.JobID(ingestionJobId)).GetStreamIngest()
+	if rd.rs.srcNodes > 1 {
+		require.Greater(rd.t, len(progress.StreamAddresses), 1, "only 1 src node participating")
+	}
+	if rd.rs.dstNodes > 1 {
+		var destNodeCount int
+		destNodes := make(map[int]struct{})
+		for _, dstNode := range progress.PartitionProgress {
+			dstNodeID := int(dstNode.DestSQLInstanceID)
+			if _, ok := destNodes[dstNodeID]; !ok {
+				destNodes[dstNodeID] = struct{}{}
+				destNodeCount++
+			}
+		}
+		require.Greater(rd.t, destNodeCount, 1, "only 1 dst node participating")
+	}
+}
+
 func (rd *replicationDriver) main(ctx context.Context) {
 	metricSnapper := rd.startStatsCollection(ctx)
 	rd.preStreamingWorkload(ctx)
@@ -717,6 +745,8 @@ func (rd *replicationDriver) main(ctx context.Context) {
 	rd.setup.dst.sysSQL.QueryRow(rd.t, "SELECT clock_timestamp()").Scan(&currentTime)
 	cutoverTime := currentTime.Add(-rd.rs.cutover)
 	rd.t.Status("cutover time chosen: ", cutoverTime.String())
+
+	rd.checkParticipatingNodes(ingestionJobID)
 
 	retainedTime := rd.getReplicationRetainedTime()
 
@@ -871,7 +901,6 @@ func registerClusterToCluster(r registry.Registry) {
 			additionalDuration: 0,
 			cutover:            1 * time.Minute,
 			maxAcceptedLatency: 1 * time.Hour,
-			skip:               "Reveals a bad bug related to replicating an import. See https://github.com/cockroachdb/cockroach/issues/105676 ",
 		},
 	} {
 		sp := sp
@@ -898,7 +927,8 @@ func registerClusterToCluster(r registry.Registry) {
 type c2cPhase int
 
 const (
-	phaseInitialScan c2cPhase = iota
+	phaseNotReady c2cPhase = iota
+	phaseInitialScan
 	phaseSteadyState
 	phaseCutover
 )
@@ -963,8 +993,9 @@ func makeReplShutdownDriver(
 	rd := makeReplicationDriver(t, c, rsp.replicationSpec)
 	return replShutdownDriver{
 		replicationDriver: rd,
-		phase:             c2cPhase(rd.rng.Intn(int(phaseCutover) + 1)),
-		rsp:               rsp,
+		// choose either initialScan (1), SteadyState (2), or cutover (3)
+		phase: c2cPhase(rd.rng.Intn(int(phaseCutover)) + 1),
+		rsp:   rsp,
 	}
 }
 
@@ -1009,6 +1040,7 @@ func (rrd *replShutdownDriver) getTargetAndWatcherNodes(ctx context.Context) {
 		// shut down roachprod node 5.
 		coordinatorNode += rrd.rsp.srcNodes
 	}
+	rrd.t.L().Printf("node %d is coordinator for target job %d", coordinatorNode, int(jobID))
 
 	var targetNode int
 
@@ -1036,7 +1068,13 @@ func getPhase(rd *replicationDriver, dstJobID jobspb.JobID) c2cPhase {
 	require.Equal(rd.t, jobs.StatusRunning, jobs.Status(jobStatus))
 
 	streamIngestProgress := getJobProgress(rd.t, rd.setup.dst.sysSQL, dstJobID).GetStreamIngest()
+
 	if streamIngestProgress.ReplicatedTime.IsEmpty() {
+		if len(streamIngestProgress.StreamAddresses) == 0 {
+			return phaseNotReady
+		}
+		// Only return phaseInitialScan once all available stream addresses from the
+		// source cluster have been persisted.
 		return phaseInitialScan
 	}
 	if streamIngestProgress.CutoverTime.IsEmpty() {
@@ -1332,9 +1370,16 @@ func srcClusterSettings(t test.Test, db *sqlutils.SQLRunner) {
 	db.ExecMultiple(t, `SET CLUSTER SETTING kv.rangefeed.enabled = true;`)
 }
 
-func destClusterSettings(t test.Test, db *sqlutils.SQLRunner) {
+func destClusterSettings(t test.Test, db *sqlutils.SQLRunner, additionalDuration time.Duration) {
 	db.ExecMultiple(t, `SET CLUSTER SETTING cross_cluster_replication.enabled = true;`,
-		`SET CLUSTER SETTING kv.rangefeed.enabled = true;`)
+		`SET CLUSTER SETTING kv.rangefeed.enabled = true;`,
+		`SET CLUSTER SETTING stream_replication.replan_flow_threshold = 0.1;`)
+
+	if additionalDuration != 0 {
+		replanFrequency := additionalDuration / 2
+		db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING stream_replication.replan_flow_frequency = '%s'`,
+			replanFrequency))
+	}
 }
 
 func copyPGCertsAndMakeURL(

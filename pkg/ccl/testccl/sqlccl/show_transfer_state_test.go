@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/cockroachdb/cockroach-go/v2/crdb"
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -27,31 +28,22 @@ func TestShowTransferState(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	ctx := context.Background()
 
-	params, _ := tests.CreateTestServerParams()
-	s, mainDB, _ := serverutils.StartServer(t, params)
+	s, mainDB, _ := serverutils.StartServer(t, base.TestServerArgs{
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
+	})
 	defer s.Stopper().Stop(ctx)
 	tenant, tenantDB := serverutils.StartTenant(t, s, tests.CreateTestTenantParams(serverutils.TestTenantID()))
 	defer tenant.Stopper().Stop(ctx)
-	defer tenantDB.Close()
 
 	_, err := tenantDB.Exec("CREATE USER testuser WITH PASSWORD 'hunter2'")
 	require.NoError(t, err)
 	_, err = mainDB.Exec("ALTER TENANT ALL SET CLUSTER SETTING server.user_login.session_revival_token.enabled = true")
 	require.NoError(t, err)
 
+	testUserConn := tenant.SQLConnForUser(t, username.TestUser, "")
+
 	t.Run("without_transfer_key", func(t *testing.T) {
-		pgURL, cleanup := sqlutils.PGUrl(
-			t,
-			tenant.SQLAddr(),
-			"TestShowTransferState-without_transfer_key",
-			url.UserPassword(username.TestUser, "hunter2"),
-		)
-		defer cleanup()
-
-		conn, err := gosql.Open("postgres", pgURL.String())
-		require.NoError(t, err)
-		defer conn.Close()
-
+		conn := testUserConn
 		rows, err := conn.Query("SHOW TRANSFER STATE")
 		require.NoError(t, err, "show transfer state failed")
 		defer rows.Close()
@@ -71,7 +63,7 @@ func TestShowTransferState(t *testing.T) {
 		err = rows.Scan(&errVal, &sessionState, &sessionRevivalToken)
 		require.NoError(t, err, "unexpected error while reading transfer state")
 
-		require.False(t, errVal.Valid)
+		require.Falsef(t, errVal.Valid, "expected null error, got %s", errVal.String)
 		require.True(t, sessionState.Valid)
 		require.True(t, sessionRevivalToken.Valid)
 	})
@@ -180,17 +172,7 @@ func TestShowTransferState(t *testing.T) {
 		})
 
 		t.Run("transaction", func(t *testing.T) {
-			pgURL, cleanup := sqlutils.PGUrl(
-				t,
-				tenant.SQLAddr(),
-				"TestShowTransferState-errors-transaction",
-				url.UserPassword(username.TestUser, "hunter2"),
-			)
-			defer cleanup()
-
-			conn, err := gosql.Open("postgres", pgURL.String())
-			require.NoError(t, err)
-			defer conn.Close()
+			conn := testUserConn
 
 			var errVal, sessionState, sessionRevivalToken gosql.NullString
 			err = crdb.ExecuteTx(ctx, conn, nil /* txopts */, func(tx *gosql.Tx) error {

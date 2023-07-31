@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
-	"github.com/cockroachdb/cockroach/pkg/sql/pgwire"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -42,7 +41,7 @@ type serverIdx int
 const RandomServer serverIdx = -1
 
 type testTenant struct {
-	tenant                   serverutils.TestTenantInterface
+	tenant                   serverutils.ApplicationLayerInterface
 	tenantConn               *gosql.DB
 	tenantDB                 *sqlutils.SQLRunner
 	tenantStatus             serverpb.SQLStatusServer
@@ -70,7 +69,7 @@ func (h *testTenant) TenantContentionRegistry() *contention.Registry {
 	return h.tenantContentionRegistry
 }
 
-func (h *testTenant) GetTenant() serverutils.TestTenantInterface {
+func (h *testTenant) GetTenant() serverutils.ApplicationLayerInterface {
 	return h.tenant
 }
 
@@ -80,7 +79,7 @@ func (h *testTenant) GetTenantDB() *gosql.DB {
 
 // TestTenant exposes an interface for testing an individual tenant
 type TestTenant interface {
-	GetTenant() serverutils.TestTenantInterface
+	GetTenant() serverutils.ApplicationLayerInterface
 	GetTenantDB() *gosql.DB
 	GetTenantConn() *sqlutils.SQLRunner
 	TenantSQLStats() *persistedsqlstats.PersistedSQLStats
@@ -100,7 +99,7 @@ func newTestTenant(
 	tenant, tenantConn := serverutils.StartTenant(t, server, args)
 	sqlDB := sqlutils.MakeSQLRunner(tenantConn)
 	status := tenant.StatusServer().(serverpb.SQLStatusServer)
-	sqlStats := tenant.PGServer().(*pgwire.Server).SQLServer.
+	sqlStats := tenant.SQLServer().(*sql.Server).
 		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
 	contentionRegistry := tenant.ExecutorConfig().(sql.ExecutorConfig).ContentionRegistry
 
@@ -145,14 +144,11 @@ func NewTestTenantHelper(
 ) TenantTestHelper {
 	t.Helper()
 
-	t.Helper()
-
-	params, _ := tests.CreateTestServerParams()
-	params.Knobs = knobs
-	// We're running tenant tests, no need for a default tenant.
-	params.DefaultTestTenant = base.TestTenantDisabled
 	testCluster := serverutils.StartNewTestCluster(t, 1 /* numNodes */, base.TestClusterArgs{
-		ServerArgs: params,
+		ServerArgs: base.TestServerArgs{
+			Knobs:             knobs,
+			DefaultTestTenant: base.TestControlsTenantsExplicitly,
+		},
 	})
 	server := testCluster.Server(0)
 
@@ -250,7 +246,7 @@ func (c tenantCluster) TenantHTTPClient(t *testing.T, idx serverIdx, isAdmin boo
 		client, err = c.Tenant(idx).GetTenant().GetAuthenticatedHTTPClient(false, serverutils.SingleTenantSession)
 	}
 	require.NoError(t, err)
-	return &httpClient{t: t, client: client, baseURL: c[idx].GetTenant().AdminURL()}
+	return &httpClient{t: t, client: client, baseURL: c[idx].GetTenant().AdminURL().String()}
 }
 
 func (c tenantCluster) TenantAdminHTTPClient(t *testing.T, idx serverIdx) *httpClient {

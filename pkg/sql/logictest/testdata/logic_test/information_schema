@@ -55,7 +55,7 @@ information_schema  information_schema_catalog_name        table  admin  NULL  N
 information_schema  key_column_usage                       table  admin  NULL  NULL
 information_schema  keywords                               table  admin  NULL  NULL
 information_schema  optimizer_trace                        table  admin  NULL  NULL
-information_schema  parameters                             table  admin  NULL  NULL
+information_schema  parameters                             view   admin  NULL  NULL
 information_schema  partitions                             table  admin  NULL  NULL
 information_schema  plugins                                table  admin  NULL  NULL
 information_schema  processlist                            table  admin  NULL  NULL
@@ -68,7 +68,7 @@ information_schema  role_table_grants                      table  admin  NULL  N
 information_schema  role_udt_grants                        table  admin  NULL  NULL
 information_schema  role_usage_grants                      table  admin  NULL  NULL
 information_schema  routine_privileges                     table  admin  NULL  NULL
-information_schema  routines                               table  admin  NULL  NULL
+information_schema  routines                               view   admin  NULL  NULL
 information_schema  schema_privileges                      table  admin  NULL  NULL
 information_schema  schemata                               table  admin  NULL  NULL
 information_schema  schemata_extensions                    table  admin  NULL  NULL
@@ -270,7 +270,7 @@ information_schema  information_schema_catalog_name        table  admin  NULL  N
 information_schema  key_column_usage                       table  admin  NULL  NULL
 information_schema  keywords                               table  admin  NULL  NULL
 information_schema  optimizer_trace                        table  admin  NULL  NULL
-information_schema  parameters                             table  admin  NULL  NULL
+information_schema  parameters                             view   admin  NULL  NULL
 information_schema  partitions                             table  admin  NULL  NULL
 information_schema  plugins                                table  admin  NULL  NULL
 information_schema  processlist                            table  admin  NULL  NULL
@@ -283,7 +283,7 @@ information_schema  role_table_grants                      table  admin  NULL  N
 information_schema  role_udt_grants                        table  admin  NULL  NULL
 information_schema  role_usage_grants                      table  admin  NULL  NULL
 information_schema  routine_privileges                     table  admin  NULL  NULL
-information_schema  routines                               table  admin  NULL  NULL
+information_schema  routines                               view   admin  NULL  NULL
 information_schema  schema_privileges                      table  admin  NULL  NULL
 information_schema  schemata                               table  admin  NULL  NULL
 information_schema  schemata_extensions                    table  admin  NULL  NULL
@@ -441,6 +441,7 @@ crdb_internal       kv_flow_token_deductions
 crdb_internal       kv_inherited_role_members
 crdb_internal       kv_node_liveness
 crdb_internal       kv_node_status
+crdb_internal       kv_repairable_catalog_corruptions
 crdb_internal       kv_store_status
 crdb_internal       kv_system_privileges
 crdb_internal       leases
@@ -790,6 +791,7 @@ kv_flow_token_deductions
 kv_inherited_role_members
 kv_node_liveness
 kv_node_status
+kv_repairable_catalog_corruptions
 kv_store_status
 kv_system_privileges
 leases
@@ -1229,6 +1231,7 @@ system         crdb_internal       kv_flow_token_deductions                SYSTE
 system         crdb_internal       kv_inherited_role_members               SYSTEM VIEW  NO                  1
 system         crdb_internal       kv_node_liveness                        SYSTEM VIEW  NO                  1
 system         crdb_internal       kv_node_status                          SYSTEM VIEW  NO                  1
+system         crdb_internal       kv_repairable_catalog_corruptions       SYSTEM VIEW  NO                  1
 system         crdb_internal       kv_store_status                         SYSTEM VIEW  NO                  1
 system         crdb_internal       kv_system_privileges                    SYSTEM VIEW  NO                  1
 system         public              lease                                   BASE TABLE   YES                 1
@@ -3177,6 +3180,7 @@ NULL     public   system         crdb_internal       kv_flow_token_deductions   
 NULL     public   system         crdb_internal       kv_inherited_role_members               SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_node_liveness                        SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_node_status                          SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_repairable_catalog_corruptions       SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_store_status                         SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_system_privileges                    SELECT          NO            YES
 NULL     public   system         crdb_internal       leases                                  SELECT          NO            YES
@@ -3837,6 +3841,7 @@ NULL     public   system         crdb_internal       kv_flow_token_deductions   
 NULL     public   system         crdb_internal       kv_inherited_role_members               SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_node_liveness                        SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_node_status                          SELECT          NO            YES
+NULL     public   system         crdb_internal       kv_repairable_catalog_corruptions       SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_store_status                         SELECT          NO            YES
 NULL     public   system         crdb_internal       kv_system_privileges                    SELECT          NO            YES
 NULL     public   system         crdb_internal       leases                                  SELECT          NO            YES
@@ -4709,6 +4714,7 @@ type_udt_catalog                     STRING       true         NULL            �
 type_udt_schema                      STRING       true         NULL            ·                      {}       false
 type_udt_name                        STRING       true         NULL            ·                      {}       false
 scope_catalog                        STRING       true         NULL            ·                      {}       false
+scope_schema                         STRING       true         NULL            ·                      {}       false
 scope_name                           STRING       true         NULL            ·                      {}       false
 maximum_cardinality                  INT8         true         NULL            ·                      {}       false
 dtd_identifier                       STRING       true         NULL            ·                      {}       false
@@ -4759,10 +4765,12 @@ result_cast_scope_name               STRING       true         NULL            �
 result_cast_maximum_cardinality      INT8         true         NULL            ·                      {}       false
 result_cast_dtd_identifier           STRING       true         NULL            ·                      {}       false
 
-query TTTTTTTTTTTTTTIITTTTTTIIIITTTTTTTITTTTTTTTTTTITTTTTTTTTTTTTITTTTTTTIIITTITTTTTTIT colnames
-SELECT * FROM information_schema.routines
+query TTTTTTTTTTTTTTTIITTTTTTIIIITTTTTTTITTTTTTTTTTTITTTTTTTTTTTTTITTTTTTTIIITTITTTTTTIT colnames,rowsort
+SELECT * FROM information_schema.routines WHERE routine_name = 'pg_get_functiondef'
 ----
-specific_catalog  specific_schema  specific_name  routine_catalog  routine_schema  routine_name  routine_type  module_catalog  module_schema  module_name  udt_catalog  udt_schema  udt_name  data_type  character_maximum_length  character_octet_length  character_set_catalog  character_set_schema  character_set_name  collation_catalog  collation_schema  collation_name  numeric_precision  numeric_precision_radix  numeric_scale  datetime_precision  interval_type  interval_precision  type_udt_catalog  type_udt_schema  type_udt_name  scope_catalog  scope_name  maximum_cardinality  dtd_identifier  routine_body  routine_definition  external_name  external_language  parameter_style  is_deterministic  sql_data_access  is_null_call  sql_path  schema_level_routine  max_dynamic_result_sets  is_user_defined_cast  is_implicitly_invocable  security_type  to_sql_specific_catalog  to_sql_specific_schema  to_sql_specific_name  as_locator  created  last_altered  new_savepoint_level  is_udt_dependent  result_cast_from_data_type  result_cast_as_locator  result_cast_char_max_length  result_cast_char_octet_length  result_cast_char_set_catalog  result_cast_char_set_schema  result_cast_char_set_name  result_cast_collation_catalog  result_cast_collation_schema  result_cast_collation_name  result_cast_numeric_precision  result_cast_numeric_precision_radix  result_cast_numeric_scale  result_cast_datetime_precision  result_cast_interval_type  result_cast_interval_precision  result_cast_type_udt_catalog  result_cast_type_udt_schema  result_cast_type_udt_name  result_cast_scope_catalog  result_cast_scope_schema  result_cast_scope_name  result_cast_maximum_cardinality  result_cast_dtd_identifier
+specific_catalog  specific_schema  specific_name            routine_catalog  routine_schema  routine_name        routine_type  module_catalog  module_schema  module_name  udt_catalog  udt_schema  udt_name  data_type  character_maximum_length  character_octet_length  character_set_catalog  character_set_schema  character_set_name  collation_catalog  collation_schema  collation_name  numeric_precision  numeric_precision_radix  numeric_scale  datetime_precision  interval_type  interval_precision  type_udt_catalog  type_udt_schema  type_udt_name  scope_catalog  scope_schema  scope_name  maximum_cardinality  dtd_identifier  routine_body  routine_definition  external_name  external_language  parameter_style  is_deterministic  sql_data_access  is_null_call  sql_path  schema_level_routine  max_dynamic_result_sets  is_user_defined_cast  is_implicitly_invocable  security_type  to_sql_specific_catalog  to_sql_specific_schema  to_sql_specific_name  as_locator  created  last_altered  new_savepoint_level  is_udt_dependent  result_cast_from_data_type  result_cast_as_locator  result_cast_char_max_length  result_cast_char_octet_length  result_cast_char_set_catalog  result_cast_char_set_schema  result_cast_char_set_name  result_cast_collation_catalog  result_cast_collation_schema  result_cast_collation_name  result_cast_numeric_precision  result_cast_numeric_precision_radix  result_cast_numeric_scale  result_cast_datetime_precision  result_cast_interval_type  result_cast_interval_precision  result_cast_type_udt_catalog  result_cast_type_udt_schema  result_cast_type_udt_name  result_cast_scope_catalog  result_cast_scope_schema  result_cast_scope_name  result_cast_maximum_cardinality  result_cast_dtd_identifier
+test              pg_catalog       pg_get_functiondef_2035  test             pg_catalog      pg_get_functiondef  FUNCTION      NULL            NULL           NULL         NULL         NULL        NULL      text       NULL                      NULL                    NULL                   NULL                  NULL                NULL               NULL              NULL            NULL               NULL                     NULL           NULL                NULL           NULL                test              pg_catalog       text           NULL           NULL          NULL        NULL                 0               EXTERNAL      NULL                NULL           INTERNAL           GENERAL          NO                MODIFIES         NO            NULL      YES                   0                        NULL                  NULL                     INVOKER        NULL                     NULL                    NULL                  NO          NULL     NULL          NULL                 NO                NULL                        NULL                    NULL                         NULL                           NULL                          NULL                         NULL                       NULL                           NULL                          NULL                        NULL                           NULL                                 NULL                       NULL                            NULL                       NULL                            NULL                          NULL                         NULL                       NULL                       NULL                      NULL                    NULL                             NULL
+
 
 # test information_schema.parameters
 query TTBTTTB colnames,rowsort
@@ -4803,9 +4811,11 @@ dtd_identifier            STRING     true         NULL            ·            
 parameter_default         STRING     true         NULL            ·                      {}       false
 
 query TTTITTTTTIITTTTTTIIIITITTTTTTITT colnames
-SELECT * FROM information_schema.parameters
+SELECT * FROM information_schema.parameters WHERE specific_name LIKE 'get_byte%' ORDER BY specific_name, ordinal_position
 ----
 specific_catalog  specific_schema  specific_name  ordinal_position  parameter_mode  is_result  as_locator  parameter_name  data_type  character_maximum_length  character_octet_length  character_set_catalog  character_set_schema  character_set_name  collation_catalog  collation_schema  collation_name  numeric_precision  numeric_precision_radix  numeric_scale  datetime_precision  interval_type  interval_precision  udt_catalog  udt_schema  udt_name  scope_catalog  scope_schema  scope_name  maximum_cardinality  dtd_identifier  parameter_default
+test              pg_catalog       get_byte_854   1                 IN              NO         NO          NULL            bytea      NULL                      NULL                    NULL                   NULL                  NULL                NULL               NULL              NULL            NULL               NULL                     NULL           NULL                NULL           NULL                test         pg_catalog  bytea     NULL           NULL          NULL        NULL                 1               NULL
+test              pg_catalog       get_byte_854   2                 IN              NO         NO          NULL            bigint     NULL                      NULL                    NULL                   NULL                  NULL                NULL               NULL              NULL            NULL               NULL                     NULL           NULL                NULL           NULL                test         pg_catalog  int8      NULL           NULL          NULL        NULL                 2               NULL
 
 query TTTTTTTT colnames,rowsort
 SELECT * FROM system.information_schema.column_privileges WHERE table_name = 'eventlog'
@@ -5270,7 +5280,7 @@ default_transaction_read_only                              off
 default_transaction_use_follower_reads                     off
 default_with_oids                                          off
 descriptor_validation                                      on
-disable_drop_tenant                                        off
+disable_drop_virtual_cluster                               off
 disable_hoist_projection_in_join_limitation                off
 disable_partially_distributed_plans                        off
 disable_plan_gists                                         off
@@ -5278,7 +5288,9 @@ disallow_full_table_scans                                  off
 enable_auto_rehoming                                       off
 enable_create_stats_using_extremes                         off
 enable_drop_enum_value                                     on
+enable_durable_locking_for_serializable                    off
 enable_experimental_alter_column_type_general              off
+enable_implicit_fk_locking_for_serializable                off
 enable_implicit_select_for_update                          on
 enable_implicit_transaction_for_batch_statements           on
 enable_insert_fast_path                                    on
@@ -5326,6 +5338,7 @@ locality                                                   region=test,dc=dc1
 locality_optimized_partitioned_index_scan                  on
 lock_timeout                                               0
 log_timezone                                               UTC
+max_connections                                            -1
 max_identifier_length                                      128
 max_index_keys                                             32
 node_id                                                    1
@@ -5339,6 +5352,7 @@ optimizer_use_forecasts                                    on
 optimizer_use_histograms                                   on
 optimizer_use_improved_computed_column_filters_derivation  on
 optimizer_use_improved_disjunction_stats                   on
+optimizer_use_improved_join_elimination                    on
 optimizer_use_improved_split_disjunction_for_joins         on
 optimizer_use_limit_ordering_for_streaming_group_by        on
 optimizer_use_multicol_stats                               on
@@ -5746,101 +5760,152 @@ WHERE reverse(split_part(reverse(specific_name), '_', 1))::INT < 50
 ORDER BY specific_name, grantee;
 ----
 grantor  grantee  specific_catalog  specific_schema  specific_name  routine_catalog  routine_schema  routine_name  privilege_type  is_grantable
+NULL     admin    test              pg_catalog       array_agg_1    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_1    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_1    test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_10   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_10   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_10   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_11   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_11   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_11   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_12   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_12   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_12   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_13   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_13   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_13   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_14   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_14   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_14   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_15   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_15   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_15   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_16   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_16   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_16   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_17   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_17   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_17   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_18   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_18   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_18   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_19   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_19   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_19   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_2    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_2    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_2    test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_20   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_20   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_20   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_21   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_21   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_21   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_22   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_22   test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_22   test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_3    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_3    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_3    test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_4    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_4    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_4    test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_5    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_5    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_5    test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_6    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_6    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_6    test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_7    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_7    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_7    test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_8    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_8    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_8    test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       array_agg_9    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     public   test              pg_catalog       array_agg_9    test             pg_catalog      array_agg     EXECUTE         NO
 NULL     root     test              pg_catalog       array_agg_9    test             pg_catalog      array_agg     EXECUTE         NO
+NULL     admin    test              pg_catalog       avg_23         test             pg_catalog      avg           EXECUTE         NO
 NULL     public   test              pg_catalog       avg_23         test             pg_catalog      avg           EXECUTE         NO
 NULL     root     test              pg_catalog       avg_23         test             pg_catalog      avg           EXECUTE         NO
+NULL     admin    test              pg_catalog       avg_24         test             pg_catalog      avg           EXECUTE         NO
 NULL     public   test              pg_catalog       avg_24         test             pg_catalog      avg           EXECUTE         NO
 NULL     root     test              pg_catalog       avg_24         test             pg_catalog      avg           EXECUTE         NO
+NULL     admin    test              pg_catalog       avg_25         test             pg_catalog      avg           EXECUTE         NO
 NULL     public   test              pg_catalog       avg_25         test             pg_catalog      avg           EXECUTE         NO
 NULL     root     test              pg_catalog       avg_25         test             pg_catalog      avg           EXECUTE         NO
+NULL     admin    test              pg_catalog       avg_26         test             pg_catalog      avg           EXECUTE         NO
 NULL     public   test              pg_catalog       avg_26         test             pg_catalog      avg           EXECUTE         NO
 NULL     root     test              pg_catalog       avg_26         test             pg_catalog      avg           EXECUTE         NO
+NULL     admin    test              pg_catalog       bit_and_27     test             pg_catalog      bit_and       EXECUTE         NO
 NULL     public   test              pg_catalog       bit_and_27     test             pg_catalog      bit_and       EXECUTE         NO
 NULL     root     test              pg_catalog       bit_and_27     test             pg_catalog      bit_and       EXECUTE         NO
+NULL     admin    test              pg_catalog       bit_and_28     test             pg_catalog      bit_and       EXECUTE         NO
 NULL     public   test              pg_catalog       bit_and_28     test             pg_catalog      bit_and       EXECUTE         NO
 NULL     root     test              pg_catalog       bit_and_28     test             pg_catalog      bit_and       EXECUTE         NO
+NULL     admin    test              pg_catalog       bit_or_29      test             pg_catalog      bit_or        EXECUTE         NO
 NULL     public   test              pg_catalog       bit_or_29      test             pg_catalog      bit_or        EXECUTE         NO
 NULL     root     test              pg_catalog       bit_or_29      test             pg_catalog      bit_or        EXECUTE         NO
+NULL     admin    test              pg_catalog       bit_or_30      test             pg_catalog      bit_or        EXECUTE         NO
 NULL     public   test              pg_catalog       bit_or_30      test             pg_catalog      bit_or        EXECUTE         NO
 NULL     root     test              pg_catalog       bit_or_30      test             pg_catalog      bit_or        EXECUTE         NO
+NULL     admin    test              pg_catalog       bool_and_31    test             pg_catalog      bool_and      EXECUTE         NO
 NULL     public   test              pg_catalog       bool_and_31    test             pg_catalog      bool_and      EXECUTE         NO
 NULL     root     test              pg_catalog       bool_and_31    test             pg_catalog      bool_and      EXECUTE         NO
+NULL     admin    test              pg_catalog       bool_or_32     test             pg_catalog      bool_or       EXECUTE         NO
 NULL     public   test              pg_catalog       bool_or_32     test             pg_catalog      bool_or       EXECUTE         NO
 NULL     root     test              pg_catalog       bool_or_32     test             pg_catalog      bool_or       EXECUTE         NO
+NULL     admin    test              pg_catalog       concat_agg_33  test             pg_catalog      concat_agg    EXECUTE         NO
 NULL     public   test              pg_catalog       concat_agg_33  test             pg_catalog      concat_agg    EXECUTE         NO
 NULL     root     test              pg_catalog       concat_agg_33  test             pg_catalog      concat_agg    EXECUTE         NO
+NULL     admin    test              pg_catalog       concat_agg_34  test             pg_catalog      concat_agg    EXECUTE         NO
 NULL     public   test              pg_catalog       concat_agg_34  test             pg_catalog      concat_agg    EXECUTE         NO
 NULL     root     test              pg_catalog       concat_agg_34  test             pg_catalog      concat_agg    EXECUTE         NO
+NULL     admin    test              pg_catalog       corr_35        test             pg_catalog      corr          EXECUTE         NO
 NULL     public   test              pg_catalog       corr_35        test             pg_catalog      corr          EXECUTE         NO
 NULL     root     test              pg_catalog       corr_35        test             pg_catalog      corr          EXECUTE         NO
+NULL     admin    test              pg_catalog       corr_36        test             pg_catalog      corr          EXECUTE         NO
 NULL     public   test              pg_catalog       corr_36        test             pg_catalog      corr          EXECUTE         NO
 NULL     root     test              pg_catalog       corr_36        test             pg_catalog      corr          EXECUTE         NO
+NULL     admin    test              pg_catalog       corr_37        test             pg_catalog      corr          EXECUTE         NO
 NULL     public   test              pg_catalog       corr_37        test             pg_catalog      corr          EXECUTE         NO
 NULL     root     test              pg_catalog       corr_37        test             pg_catalog      corr          EXECUTE         NO
+NULL     admin    test              pg_catalog       corr_38        test             pg_catalog      corr          EXECUTE         NO
 NULL     public   test              pg_catalog       corr_38        test             pg_catalog      corr          EXECUTE         NO
 NULL     root     test              pg_catalog       corr_38        test             pg_catalog      corr          EXECUTE         NO
+NULL     admin    test              pg_catalog       corr_39        test             pg_catalog      corr          EXECUTE         NO
 NULL     public   test              pg_catalog       corr_39        test             pg_catalog      corr          EXECUTE         NO
 NULL     root     test              pg_catalog       corr_39        test             pg_catalog      corr          EXECUTE         NO
+NULL     admin    test              pg_catalog       corr_40        test             pg_catalog      corr          EXECUTE         NO
 NULL     public   test              pg_catalog       corr_40        test             pg_catalog      corr          EXECUTE         NO
 NULL     root     test              pg_catalog       corr_40        test             pg_catalog      corr          EXECUTE         NO
+NULL     admin    test              pg_catalog       corr_41        test             pg_catalog      corr          EXECUTE         NO
 NULL     public   test              pg_catalog       corr_41        test             pg_catalog      corr          EXECUTE         NO
 NULL     root     test              pg_catalog       corr_41        test             pg_catalog      corr          EXECUTE         NO
+NULL     admin    test              pg_catalog       corr_42        test             pg_catalog      corr          EXECUTE         NO
 NULL     public   test              pg_catalog       corr_42        test             pg_catalog      corr          EXECUTE         NO
 NULL     root     test              pg_catalog       corr_42        test             pg_catalog      corr          EXECUTE         NO
+NULL     admin    test              pg_catalog       corr_43        test             pg_catalog      corr          EXECUTE         NO
 NULL     public   test              pg_catalog       corr_43        test             pg_catalog      corr          EXECUTE         NO
 NULL     root     test              pg_catalog       corr_43        test             pg_catalog      corr          EXECUTE         NO
+NULL     admin    test              pg_catalog       covar_pop_44   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     public   test              pg_catalog       covar_pop_44   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     root     test              pg_catalog       covar_pop_44   test             pg_catalog      covar_pop     EXECUTE         NO
+NULL     admin    test              pg_catalog       covar_pop_45   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     public   test              pg_catalog       covar_pop_45   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     root     test              pg_catalog       covar_pop_45   test             pg_catalog      covar_pop     EXECUTE         NO
+NULL     admin    test              pg_catalog       covar_pop_46   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     public   test              pg_catalog       covar_pop_46   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     root     test              pg_catalog       covar_pop_46   test             pg_catalog      covar_pop     EXECUTE         NO
+NULL     admin    test              pg_catalog       covar_pop_47   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     public   test              pg_catalog       covar_pop_47   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     root     test              pg_catalog       covar_pop_47   test             pg_catalog      covar_pop     EXECUTE         NO
+NULL     admin    test              pg_catalog       covar_pop_48   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     public   test              pg_catalog       covar_pop_48   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     root     test              pg_catalog       covar_pop_48   test             pg_catalog      covar_pop     EXECUTE         NO
+NULL     admin    test              pg_catalog       covar_pop_49   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     public   test              pg_catalog       covar_pop_49   test             pg_catalog      covar_pop     EXECUTE         NO
 NULL     root     test              pg_catalog       covar_pop_49   test             pg_catalog      covar_pop     EXECUTE         NO
+
+subtest end

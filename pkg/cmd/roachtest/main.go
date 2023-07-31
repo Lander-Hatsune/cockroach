@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/util/allstacks"
+	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -236,7 +237,7 @@ Use --bench to list benchmarks instead of tests.
 
 Each test has a set of tags. The tags are used to skip tests which don't match
 the tag filter. The tag filter is specified by specifying a pattern with the
-"tag:" prefix. 
+"tag:" prefix.
 
 If multiple "tag:" patterns are specified, the test must match at
 least one of them.
@@ -292,6 +293,9 @@ the test tags.
 If all invoked tests passed, the exit status is zero. If at least one test
 failed, it is 10. Any other exit status reports a problem with the test
 runner itself.
+
+COCKROACH_ environment variables in the local environment are passed through to
+the cluster nodes on start.
 `,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if literalArtifacts == "" {
@@ -403,8 +407,8 @@ runner itself.
 		cmd.Flags().StringToStringVar(
 			&versionsBinaryOverride, "versions-binary-override", nil,
 			"List of <version>=<path to cockroach binary>. If a certain version <ver> "+
-				"is present in the list,"+"the respective binary will be used when a "+
-				"multi-version test asks for the respective binary, instead of "+
+				"is present in the list, the respective binary will be used when a "+
+				"mixed-version test asks for the respective binary, instead of "+
 				"`roachprod stage <ver>`. Example: 20.1.4=cockroach-20.1,20.2.0=cockroach-20.2.")
 	}
 
@@ -543,6 +547,13 @@ func runTests(register func(registry.Registry), cfg cliCfg, benchOnly bool) erro
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	CtrlC(ctx, l, cancel, cr)
+	// Install goroutine leak checker and run it at the end of the entire test
+	// run. If a test is leaking a goroutine, then it will likely be still around.
+	// We could diff goroutine snapshots before/after each executed test, but that
+	// could yield false positives; e.g., user-specified test teardown goroutines
+	// may still be running long after the test has completed.
+	defer leaktest.AfterTest(l)()
+
 	err := runner.Run(
 		ctx, specs, cfg.count, cfg.parallelism, opt,
 		testOpts{
@@ -557,11 +568,6 @@ func runTests(register func(registry.Registry), cfg cliCfg, benchOnly bool) erro
 	// kills the process.
 	l.PrintfCtx(ctx, "runTests destroying all clusters")
 	cr.destroyAllClusters(context.Background(), l)
-
-	// Dump all stacks to the build log.
-	// N.B. we expect no user-defined goroutines to be running at this point.
-	// In the future, we can enforce a leak check, analogous to leaktest.AfterTest
-	fmt.Fprintf(os.Stderr, "all stacks:\n\n%s\n", allstacks.Get())
 
 	if teamCity {
 		// Collect the runner logs.
@@ -615,13 +621,11 @@ func CtrlC(ctx context.Context, l *logger.Logger, cancel func(), cr *clusterRegi
 		select {
 		case <-sig:
 			shout(ctx, l, os.Stderr, "Second SIGINT received. Quitting. Cluster might be left behind.")
-			fmt.Fprintf(os.Stderr, "all stacks:\n\n%s\n", allstacks.Get())
-			os.Exit(2)
 		case <-destroyCh:
 			shout(ctx, l, os.Stderr, "Done destroying all clusters.")
-			fmt.Fprintf(os.Stderr, "all stacks:\n\n%s\n", allstacks.Get())
-			os.Exit(2)
 		}
+		l.Printf("all stacks:\n\n%s\n", allstacks.Get())
+		os.Exit(2)
 	}()
 }
 

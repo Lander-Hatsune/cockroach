@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/listenerutil"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
@@ -132,7 +133,7 @@ func TestCollectInfoFromOnlineCluster(t *testing.T) {
 		"collect-info",
 		"--insecure",
 		"--host",
-		tc.Server(2).ServingRPCAddr(),
+		tc.Server(2).AdvRPCAddr(),
 		replicaInfoFileName,
 	})
 
@@ -258,7 +259,7 @@ func TestLossOfQuorumRecovery(t *testing.T) {
 	// would not be able to upreplicate properly. So we need to decommission old nodes
 	// first before proceeding.
 	grpcConn, err := tcAfter.Server(0).RPCContext().GRPCDialNode(
-		tcAfter.Server(0).ServingRPCAddr(), tcAfter.Server(0).NodeID(), rpc.DefaultClass).Connect(ctx)
+		tcAfter.Server(0).AdvRPCAddr(), tcAfter.Server(0).NodeID(), rpc.DefaultClass).Connect(ctx)
 	require.NoError(t, err, "Failed to create test cluster after recovery")
 	adminClient := serverpb.NewAdminClient(grpcConn)
 
@@ -352,7 +353,7 @@ func TestStageVersionCheck(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	tc.StopServer(3)
 
-	grpcConn, err := tc.Server(0).RPCContext().GRPCDialNode(tc.Server(0).ServingRPCAddr(),
+	grpcConn, err := tc.Server(0).RPCContext().GRPCDialNode(tc.Server(0).AdvRPCAddr(),
 		tc.Server(0).NodeID(), rpc.DefaultClass).Connect(ctx)
 	require.NoError(t, err, "Failed to create test cluster after recovery")
 	adminClient := serverpb.NewAdminClient(grpcConn)
@@ -437,7 +438,7 @@ func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
 	})
 	defer c.Cleanup()
 
-	listenerReg := testutils.NewListenerRegistry()
+	listenerReg := listenerutil.NewListenerRegistry()
 	defer listenerReg.Close()
 
 	storeReg := server.NewStickyInMemEnginesRegistry()
@@ -461,7 +462,6 @@ func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
 					StickyEngineRegistry: storeReg,
 				},
 			},
-			Listener: listenerReg.GetOrFail(t, i),
 			StoreSpecs: []base.StoreSpec{
 				{
 					InMemory: true,
@@ -470,8 +470,8 @@ func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
 		}
 	}
 	tc := testcluster.NewTestCluster(t, 3, base.TestClusterArgs{
-		ReusableListeners: true,
-		ServerArgsPerNode: sa,
+		ReusableListenerReg: listenerReg,
+		ServerArgsPerNode:   sa,
 	})
 	tc.Start(t)
 	s := sqlutils.MakeSQLRunner(tc.Conns[0])
@@ -509,7 +509,7 @@ func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
 			"make-plan",
 			"--confirm=y",
 			"--certs-dir=test_certs",
-			"--host=" + tc.Server(0).ServingRPCAddr(),
+			"--host=" + tc.Server(0).AdvRPCAddr(),
 			"--plan=" + planFile,
 		})
 	require.NoError(t, err, "failed to run make-plan")
@@ -528,7 +528,7 @@ func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
 		[]string{
 			"debug", "recover", "apply-plan",
 			"--certs-dir=test_certs",
-			"--host=" + tc.Server(0).ServingRPCAddr(),
+			"--host=" + tc.Server(0).AdvRPCAddr(),
 			"--confirm=y", planFile,
 		})
 	require.NoError(t, err, "failed to run apply plan")
@@ -543,7 +543,7 @@ func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
 		[]string{
 			"debug", "recover", "verify",
 			"--certs-dir=test_certs",
-			"--host=" + tc.Server(0).ServingRPCAddr(),
+			"--host=" + tc.Server(0).AdvRPCAddr(),
 			planFile,
 		})
 	require.NoError(t, err, "failed to run verify plan")
@@ -554,7 +554,6 @@ func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
 	// NB: If recovery is not performed, server will just hang on startup.
 	// This is caused by liveness range becoming unavailable and preventing any
 	// progress. So it is likely that test will timeout if basic workflow fails.
-	listenerReg.ReopenOrFail(t, 0)
 	require.NoError(t, tc.RestartServer(0), "restart failed")
 	s = sqlutils.MakeSQLRunner(tc.Conns[0])
 
@@ -594,7 +593,7 @@ func TestHalfOnlineLossOfQuorumRecovery(t *testing.T) {
 		[]string{
 			"debug", "recover", "verify",
 			"--certs-dir=test_certs",
-			"--host=" + tc.Server(0).ServingRPCAddr(),
+			"--host=" + tc.Server(0).AdvRPCAddr(),
 			planFile,
 		})
 	require.NoError(t, err, "failed to run verify plan")

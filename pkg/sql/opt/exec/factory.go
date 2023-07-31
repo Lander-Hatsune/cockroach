@@ -263,6 +263,9 @@ type InsertFastPathFKCheck struct {
 
 	MatchMethod tree.CompositeKeyMatchMethod
 
+	// Row-level locking properties of the check.
+	Locking opt.Locking
+
 	// MkErr is called when a violation is detected (i.e. the index has no entries
 	// for a given inserted row). The values passed correspond to InsertCols
 	// above.
@@ -338,6 +341,7 @@ type ExecutionStats struct {
 	KVPairsRead           optional.Uint
 	KVRowsRead            optional.Uint
 	KVBatchRequestsIssued optional.Uint
+	UsedStreamer          bool
 
 	// Storage engine iterator statistics
 	//

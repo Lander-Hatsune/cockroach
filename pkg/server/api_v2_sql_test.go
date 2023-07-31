@@ -37,7 +37,7 @@ func TestExecSQL(t *testing.T) {
 		SQLAPIClock = timeutil.DefaultTimeSource{}
 	}()
 
-	server, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	server := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	ctx := context.Background()
 	defer server.Stopper().Stop(ctx)
 
@@ -62,7 +62,7 @@ func TestExecSQL(t *testing.T) {
 			}
 
 			resp, err := client.Post(
-				server.AdminURL()+"/api/v2/sql/", "application/json",
+				server.AdminURL().WithPath("/api/v2/sql/").String(), "application/json",
 				bytes.NewReader([]byte(d.Input)),
 			)
 			require.NoError(t, err)

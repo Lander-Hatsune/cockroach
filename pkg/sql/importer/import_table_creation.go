@@ -322,6 +322,13 @@ func (so *importSequenceOperators) GetLatestValueInSessionForSequenceByID(
 	return 0, errSequenceOperators
 }
 
+// GetLastSequenceValueByID implements the eval.SequenceOperators interface.
+func (so *importSequenceOperators) GetLastSequenceValueByID(
+	ctx context.Context, seqID uint32,
+) (int64, bool, error) {
+	return 0, false, errSequenceOperators
+}
+
 // SetSequenceValueByID implements the eval.SequenceOperators interface.
 func (so *importSequenceOperators) SetSequenceValueByID(
 	ctx context.Context, seqID uint32, newVal int64, isCalled bool,
@@ -419,7 +426,7 @@ func (r fkResolver) GetQualifiedTableNameByID(
 // GetQualifiedFunctionNameByID implements the resolver.SchemaResolver interface.
 func (r fkResolver) GetQualifiedFunctionNameByID(
 	ctx context.Context, id int64,
-) (*tree.FunctionName, error) {
+) (*tree.RoutineName, error) {
 	return nil, errSchemaResolver
 }
 
@@ -433,6 +440,6 @@ func (r fkResolver) ResolveFunction(
 // ResolveFunctionByOID implements the resolver.SchemaResolver interface.
 func (r fkResolver) ResolveFunctionByOID(
 	ctx context.Context, oid oid.Oid,
-) (*tree.FunctionName, *tree.Overload, error) {
+) (*tree.RoutineName, *tree.Overload, error) {
 	return nil, nil, errSchemaResolver
 }

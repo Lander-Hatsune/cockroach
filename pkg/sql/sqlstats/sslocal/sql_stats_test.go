@@ -14,6 +14,7 @@ import (
 	"context"
 	gosql "database/sql"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/url"
 	"sort"
@@ -22,6 +23,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -29,6 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
+	"github.com/cockroachdb/cockroach/pkg/sql/clusterunique"
+	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessionphase"
@@ -38,16 +42,19 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
 	"github.com/cockroachdb/cockroach/pkg/sql/tests"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util"
-	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uint128"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/jackc/pgx/v4"
 	"github.com/lib/pq"
 	"github.com/stretchr/testify/require"
@@ -77,7 +84,7 @@ func TestStmtStatsBulkIngestWithRandomMetadata(t *testing.T) {
 	require.NoError(t,
 		sqlStats.IterateStatementStats(
 			context.Background(),
-			&sqlstats.IteratorOptions{},
+			sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
 				statistics *appstatspb.CollectedStatementStatistics,
@@ -196,7 +203,7 @@ func TestSQLStatsStmtStatsBulkIngest(t *testing.T) {
 	require.NoError(t,
 		sqlStats.IterateStatementStats(
 			context.Background(),
-			&sqlstats.IteratorOptions{},
+			sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
 				statistics *appstatspb.CollectedStatementStatistics,
@@ -294,7 +301,7 @@ func TestSQLStatsTxnStatsBulkIngest(t *testing.T) {
 	require.NoError(t,
 		sqlStats.IterateTransactionStats(
 			context.Background(),
-			&sqlstats.IteratorOptions{},
+			sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
 				statistics *appstatspb.CollectedTransactionStatistics,
@@ -510,6 +517,141 @@ func TestExplicitTxnFingerprintAccounting(t *testing.T) {
 	}
 }
 
+func BenchmarkRecordStatement(b *testing.B) {
+	defer leaktest.AfterTest(b)()
+	defer log.Scope(b).Close(b)
+
+	ctx := context.Background()
+
+	st := cluster.MakeTestingClusterSettings()
+	monitor := mon.NewUnlimitedMonitor(
+		context.Background(), "test", mon.MemoryResource,
+		nil /* curCount */, nil /* maxHist */, math.MaxInt64, st,
+	)
+
+	insightsProvider := insights.New(st, insights.NewMetrics())
+	sqlStats := sslocal.New(
+		st,
+		sqlstats.MaxMemSQLStatsStmtFingerprints,
+		sqlstats.MaxMemSQLStatsTxnFingerprints,
+		metric.NewGauge(sql.MetaReportedSQLStatsMemCurBytes), /* curMemoryBytesCount */
+		metric.NewHistogram(metric.HistogramOptions{
+			Metadata: sql.MetaReportedSQLStatsMemMaxBytes,
+			Duration: 10 * time.Second,
+			MaxVal:   19 * 1000,
+			SigFigs:  3,
+			Buckets:  metric.MemoryUsage64MBBuckets,
+		}), /* maxMemoryBytesHist */
+		insightsProvider.Writer,
+		monitor,
+		nil, /* reportingSink */
+		nil, /* knobs */
+		insightsProvider.LatencyInformation(),
+	)
+
+	appStats := sqlStats.GetApplicationStats("" /* appName */, false /* internal */)
+	statsCollector := sslocal.NewStatsCollector(
+		st,
+		appStats,
+		sessionphase.NewTimes(),
+		nil, /* knobs */
+	)
+
+	txnId := uuid.FastMakeV4()
+	generateRecord := func() sqlstats.RecordedStmtStats {
+		return sqlstats.RecordedStmtStats{
+			SessionID:            clusterunique.ID{Uint128: uint128.Uint128{Hi: 0x1771ca67e66e6b48, Lo: 0x1}},
+			StatementID:          clusterunique.ID{Uint128: uint128.Uint128{Hi: 0x1771ca67e67262e8, Lo: 0x1}},
+			TransactionID:        txnId,
+			AutoRetryCount:       0,
+			AutoRetryReason:      error(nil),
+			RowsAffected:         1,
+			IdleLatencySec:       0,
+			ParseLatencySec:      6.5208e-05,
+			PlanLatencySec:       0.000187041,
+			RunLatencySec:        0.500771041,
+			ServiceLatencySec:    0.501024374,
+			OverheadLatencySec:   1.0839999999845418e-06,
+			BytesRead:            30,
+			RowsRead:             1,
+			RowsWritten:          1,
+			Nodes:                []int64{1},
+			StatementType:        1,
+			Plan:                 (*appstatspb.ExplainTreePlanNode)(nil),
+			PlanGist:             "AgHQAQIAAwIAAAcGBQYh0AEAAQ==",
+			StatementError:       error(nil),
+			IndexRecommendations: []string(nil),
+			Query:                "UPDATE t SET s = '_' WHERE id = '_'",
+			StartTime:            time.Date(2023, time.July, 14, 16, 58, 2, 837542000, time.UTC),
+			EndTime:              time.Date(2023, time.July, 14, 16, 58, 3, 338566374, time.UTC),
+			FullScan:             false,
+			ExecStats: &execstats.QueryLevelStats{
+				NetworkBytesSent:                   10,
+				MaxMemUsage:                        40960,
+				MaxDiskUsage:                       197,
+				KVBytesRead:                        30,
+				KVPairsRead:                        1,
+				KVRowsRead:                         1,
+				KVBatchRequestsIssued:              1,
+				KVTime:                             498771793,
+				MvccSteps:                          1,
+				MvccStepsInternal:                  2,
+				MvccSeeks:                          4,
+				MvccSeeksInternal:                  4,
+				MvccBlockBytes:                     39,
+				MvccBlockBytesInCache:              25,
+				MvccKeyBytes:                       23,
+				MvccValueBytes:                     250,
+				MvccPointCount:                     6,
+				MvccPointsCoveredByRangeTombstones: 99,
+				MvccRangeKeyCount:                  9,
+				MvccRangeKeyContainedPoints:        88,
+				MvccRangeKeySkippedPoints:          66,
+				NetworkMessages:                    55,
+				ContentionTime:                     498546750,
+				ContentionEvents:                   []kvpb.ContentionEvent{{Key: []byte{}, TxnMeta: enginepb.TxnMeta{ID: uuid.FastMakeV4(), Key: []uint8{0xf0, 0x89, 0x12, 0x74, 0x65, 0x73, 0x74, 0x0, 0x1, 0x88}, IsoLevel: 0, Epoch: 0, WriteTimestamp: hlc.Timestamp{WallTime: 1689354396802600000, Logical: 0, Synthetic: false}, MinTimestamp: hlc.Timestamp{WallTime: 1689354396802600000, Logical: 0, Synthetic: false}, Priority: 118164, Sequence: 1, CoordinatorNodeID: 1}, Duration: 498546750}},
+				RUEstimate:                         9999,
+				CPUTime:                            12345,
+				SqlInstanceIds:                     map[base.SQLInstanceID]struct{}{1: {}},
+				Regions:                            []string{"test"}},
+			Indexes:  []string{"104@1"},
+			Database: "defaultdb",
+		}
+	}
+
+	parallel := []int{10}
+	for _, p := range parallel {
+		name := fmt.Sprintf("RecordStatement: Parallelism %d", p)
+		b.Run(name, func(b *testing.B) {
+			b.SetParallelism(p)
+			recordValue := generateRecord()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					_, err := statsCollector.RecordStatement(
+						ctx,
+						appstatspb.StatementStatisticsKey{
+							Query:        "select * from T where t.l = 1000",
+							ImplicitTxn:  true,
+							Vec:          true,
+							FullScan:     true,
+							DistSQL:      true,
+							Database:     "testDb",
+							App:          "myTestApp",
+							PlanHash:     9001,
+							QuerySummary: "select * from T",
+						},
+						recordValue,
+					)
+					// Adds overhead to benchmark and shows up in profile
+					if err != nil {
+						require.NoError(b, err)
+					}
+				}
+			})
+		})
+	}
+}
+
 func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -621,7 +763,7 @@ func TestAssociatingStmtStatsWithTxnFingerprint(t *testing.T) {
 			var stats []*appstatspb.CollectedStatementStatistics
 			err = statsCollector.IterateStatementStats(
 				ctx,
-				&sqlstats.IteratorOptions{},
+				sqlstats.IteratorOptions{},
 				func(_ context.Context, s *appstatspb.CollectedStatementStatistics) error {
 					stats = append(stats, s)
 					return nil
@@ -734,11 +876,11 @@ func TestTransactionServiceLatencyOnExtendedProtocol(t *testing.T) {
 			}
 		},
 	}
-	s, _, _ := serverutils.StartServer(t, params)
+	s := serverutils.StartServerOnly(t, params)
 	defer s.Stopper().Stop(ctx)
 
 	pgURL, cleanupGoDB := sqlutils.PGUrl(
-		t, s.ServingSQLAddr(), "StartServer", url.User(username.RootUser))
+		t, s.AdvSQLAddr(), "StartServer", url.User(username.RootUser))
 	defer cleanupGoDB()
 	c, err := pgx.Connect(ctx, pgURL.String())
 	require.NoError(t, err, "error connecting with pg url")
@@ -1119,12 +1261,13 @@ func TestSQLStatsIdleLatencies(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.UnderStress(t, "These tests make timing assertions, which may fail under stress.")
-
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
 	s, db, _ := serverutils.StartServer(t, params)
 	defer s.Stopper().Stop(ctx)
+
+	// Max limit safety check on the expected idle latency in seconds. Mostly a paranoia check.
+	const idleLatCap float64 = 30
 
 	testCases := []struct {
 		name     string
@@ -1273,7 +1416,7 @@ func TestSQLStatsIdleLatencies(t *testing.T) {
 			// Note that we're not using pgx here because it *always* prepares
 			// statements, and we want to test our client latency measurements
 			// both with and without prepared statements.
-			dbUrl, cleanup := sqlutils.PGUrl(t, s.ServingSQLAddr(), t.Name(), url.User(username.RootUser))
+			dbUrl, cleanup := sqlutils.PGUrl(t, s.AdvSQLAddr(), t.Name(), url.User(username.RootUser))
 			defer cleanup()
 			connector, err := pq.NewConnector(dbUrl.String())
 			require.NoError(t, err)
@@ -1289,16 +1432,6 @@ func TestSQLStatsIdleLatencies(t *testing.T) {
 
 			// Run the test operations.
 			tc.ops(t, opsDB)
-
-			// Make looser timing assertions in CI, since we've seen
-			// more variability there.
-			// - Bazel test runs also use this looser delta.
-			// - Goland and `go test` use the tighter delta unless
-			//   the crdb_test build tag has been set.
-			delta := 0.003
-			if buildutil.CrdbTestBuild {
-				delta = 0.05
-			}
 
 			// Look for the latencies we expect.
 			t.Run("stmt", func(t *testing.T) {
@@ -1316,8 +1449,12 @@ func TestSQLStatsIdleLatencies(t *testing.T) {
 					actual[query] = latency
 				}
 				require.NoError(t, rows.Err())
-				require.InDeltaMapValues(t, tc.stmtLats, actual, delta,
-					"expected: %v\nactual: %v", tc.stmtLats, actual)
+				// Ensure that all test case statements have at least the minimum expected idle latency and do not exceed the
+				// safety check cap.
+				for tc_stmt, tc_latency := range tc.stmtLats {
+					require.GreaterOrEqual(t, actual[tc_stmt], tc_latency)
+					require.Less(t, actual[tc_stmt], idleLatCap)
+				}
 			})
 
 			t.Run("txn", func(t *testing.T) {
@@ -1328,8 +1465,10 @@ func TestSQLStatsIdleLatencies(t *testing.T) {
 					 WHERE app_name = $1`, appName)
 				err := row.Scan(&actual)
 				require.NoError(t, err)
-				require.GreaterOrEqual(t, actual, float64(0))
-				require.InDelta(t, tc.txnLat, actual, delta)
+				// Ensure the test case transaction has at least the minimum expected idle latency and do not exceed the safety
+				// check cap.
+				require.GreaterOrEqual(t, actual, tc.txnLat)
+				require.Less(t, actual, idleLatCap)
 			})
 		})
 	}

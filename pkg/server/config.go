@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/autoconfig/acprovider"
@@ -235,6 +236,7 @@ type BaseConfig struct {
 
 	// SharedStorage is specified to enable disaggregated shared storage.
 	SharedStorage string
+	*cloud.ExternalStorageAccessor
 
 	// StartDiagnosticsReporting starts the asynchronous goroutine that
 	// checks for CockroachDB upgrades and periodically reports
@@ -309,6 +311,7 @@ func (cfg *BaseConfig) SetDefaults(
 	cfg.AmbientCtx.AddLogTag("n", cfg.IDContainer)
 	cfg.Config.InitDefaults()
 	cfg.InitTestingKnobs()
+	cfg.ExternalStorageAccessor = cloud.NewExternalStorageAccessor()
 }
 
 // InitTestingKnobs sets up any testing knobs based on e.g. envvars.
@@ -536,6 +539,10 @@ type LocalKVServerInfo struct {
 	InternalServer     kvpb.InternalServer
 	ServerInterceptors rpc.ServerInterceptorInfo
 	Tracer             *tracing.Tracer
+
+	// SameProcessCapabilityAuthorizer is the tenant capability authorizer to
+	// use for servers running in the same process as the KV node.
+	SameProcessCapabilityAuthorizer tenantcapabilities.Authorizer
 }
 
 // MakeSQLConfig returns a SQLConfig with default values.
@@ -818,6 +825,7 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 			// TODO(radu): move up all remaining settings below so they apply to in-memory stores as well.
 			addCfgOpt(storage.MaxOpenFiles(int(openFileLimitPerStore)))
 			addCfgOpt(storage.MaxWriterConcurrency(2))
+			addCfgOpt(storage.RemoteStorageFactory(cfg.ExternalStorageAccessor))
 			if sharedStorage != nil {
 				addCfgOpt(storage.SharedStorage(sharedStorage))
 			}

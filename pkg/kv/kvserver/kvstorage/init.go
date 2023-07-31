@@ -60,12 +60,10 @@ func InitEngine(ctx context.Context, eng storage.Engine, ident roachpb.StoreIden
 	if err := storage.MVCCPutProto(
 		ctx,
 		batch,
-		nil,
 		keys.StoreIdentKey(),
 		hlc.Timestamp{},
-		hlc.ClockTimestamp{},
-		nil,
 		&ident,
+		storage.MVCCWriteOptions{},
 	); err != nil {
 		batch.Close()
 		return err
@@ -504,7 +502,7 @@ func LoadAndReconcileReplicas(ctx context.Context, eng storage.Engine) ([]Replic
 			// TODO(tbg): if clearRangeData were in this package we could destroy more
 			// effectively even if for some reason we had in the past written state
 			// other than the HardState here (not supposed to happen, but still).
-			if err := eng.ClearUnversioned(logstore.NewStateLoader(repl.RangeID).RaftHardStateKey()); err != nil {
+			if err := eng.ClearUnversioned(logstore.NewStateLoader(repl.RangeID).RaftHardStateKey(), storage.ClearOptions{}); err != nil {
 				return nil, errors.Wrapf(err, "removing HardState for r%d", repl.RangeID)
 			}
 			log.Eventf(ctx, "removed legacy uninitialized replica for r%s", repl.RangeID)

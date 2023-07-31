@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/memo"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/norm"
@@ -371,6 +372,30 @@ func TestMemoIsStale(t *testing.T) {
 	evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = true
 	stale()
 	evalCtx.SessionData().OptimizerUseImprovedComputedColumnFiltersDerivation = false
+	notStale()
+
+	// Stale optimizer_use_improved_join_elimination.
+	evalCtx.SessionData().OptimizerUseImprovedJoinElimination = true
+	stale()
+	evalCtx.SessionData().OptimizerUseImprovedJoinElimination = false
+	notStale()
+
+	// Stale enable_implicit_fk_locking_for_serializable.
+	evalCtx.SessionData().ImplicitFKLockingForSerializable = true
+	stale()
+	evalCtx.SessionData().ImplicitFKLockingForSerializable = false
+	notStale()
+
+	// Stale enable_durable_locking_for_serializable.
+	evalCtx.SessionData().DurableLockingForSerializable = true
+	stale()
+	evalCtx.SessionData().DurableLockingForSerializable = false
+	notStale()
+
+	// Stale txn isolation level.
+	evalCtx.TxnIsoLevel = isolation.ReadCommitted
+	stale()
+	evalCtx.TxnIsoLevel = isolation.Serializable
 	notStale()
 
 	// User no longer has access to view.

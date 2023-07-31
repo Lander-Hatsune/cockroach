@@ -126,6 +126,9 @@ export const hotRangesReducerObj = new PaginatedCachedDataReducer(
   api.getHotRanges,
   "hotRanges",
   hotRangesRequestToID,
+  1000 /* page limit */,
+  null /* invalidation period */,
+  moment.duration(30, "minutes"),
 );
 
 export const refreshDatabaseDetails = databaseDetailsReducerObj.refresh;
@@ -211,6 +214,19 @@ const jobReducerObj = new KeyedCachedDataReducer(
   moment.duration(10, "m"),
 );
 export const refreshJob = jobReducerObj.refresh;
+
+export const jobProfilerRequestKey = (
+  req: api.ListJobProfilerExecutionDetailsRequestMessage,
+): string => `${req.job_id}`;
+
+const jobProfilerReducerObj = new KeyedCachedDataReducer(
+  api.listExecutionDetailFiles,
+  "jobProfiler",
+  jobProfilerRequestKey,
+  null,
+  moment.duration(10, "m"),
+);
+export const refreshListExecutionDetailFiles = jobProfilerReducerObj.refresh;
 
 export const queryToID = (req: api.QueryPlanRequestMessage): string =>
   req.query;
@@ -367,16 +383,19 @@ const userSQLRolesReducerObj = new CachedDataReducer(
 export const invalidateUserSQLRoles = userSQLRolesReducerObj.invalidateData;
 export const refreshUserSQLRoles = userSQLRolesReducerObj.refresh;
 
+export const statementDiagnosticInvalidationPeriod = moment.duration(5, "m");
 const statementDiagnosticsReportsReducerObj = new CachedDataReducer(
   clusterUiApi.getStatementDiagnosticsReports,
   "statementDiagnosticsReports",
-  moment.duration(5, "m"),
+  statementDiagnosticInvalidationPeriod,
   moment.duration(1, "m"),
 );
 export const refreshStatementDiagnosticsRequests =
   statementDiagnosticsReportsReducerObj.refresh;
 export const invalidateStatementDiagnosticsRequests =
   statementDiagnosticsReportsReducerObj.invalidateData;
+export const RECEIVE_STATEMENT_DIAGNOSTICS_REPORT =
+  statementDiagnosticsReportsReducerObj.RECEIVE;
 
 const dataDistributionReducerObj = new CachedDataReducer(
   api.getDataDistribution,
@@ -528,6 +547,15 @@ const tenantsListObj = new CachedDataReducer(
 
 export const refreshTenantsList = tenantsListObj.refresh;
 
+const connectivityObj = new CachedDataReducer(
+  api.getNetworkConnectivity,
+  "connectivity",
+  moment.duration(30, "s"),
+  moment.duration(1, "minute"),
+);
+
+export const refreshConnectivity = connectivityObj.refresh;
+
 export interface APIReducersState {
   cluster: CachedDataReducerState<api.ClusterResponseMessage>;
   events: CachedDataReducerState<
@@ -549,6 +577,7 @@ export interface APIReducersState {
   nonTableStats: CachedDataReducerState<api.NonTableStatsResponseMessage>;
   logs: CachedDataReducerState<api.LogEntriesResponseMessage>;
   liveness: CachedDataReducerState<api.LivenessResponseMessage>;
+  jobProfiler: KeyedCachedDataReducerState<api.ListJobProfilerExecutionDetailsResponseMessage>;
   jobs: KeyedCachedDataReducerState<api.JobsResponseMessage>;
   job: KeyedCachedDataReducerState<api.JobResponseMessage>;
   queryPlan: CachedDataReducerState<api.QueryPlanResponseMessage>;
@@ -592,6 +621,7 @@ export interface APIReducersState {
   snapshot: KeyedCachedDataReducerState<clusterUiApi.GetTracingSnapshotResponse>;
   rawTrace: KeyedCachedDataReducerState<clusterUiApi.GetTraceResponse>;
   tenants: CachedDataReducerState<api.ListTenantsResponseMessage>;
+  connectivity: CachedDataReducerState<api.NetworkConnectivityResponse>;
 }
 
 export const apiReducersReducer = combineReducers<APIReducersState>({
@@ -610,6 +640,7 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [nonTableStatsReducerObj.actionNamespace]: nonTableStatsReducerObj.reducer,
   [logsReducerObj.actionNamespace]: logsReducerObj.reducer,
   [livenessReducerObj.actionNamespace]: livenessReducerObj.reducer,
+  [jobProfilerReducerObj.actionNamespace]: jobProfilerReducerObj.reducer,
   [jobsReducerObj.actionNamespace]: jobsReducerObj.reducer,
   [jobReducerObj.actionNamespace]: jobReducerObj.reducer,
   [queryPlanReducerObj.actionNamespace]: queryPlanReducerObj.reducer,
@@ -647,6 +678,7 @@ export const apiReducersReducer = combineReducers<APIReducersState>({
   [statementFingerprintInsightsReducerObj.actionNamespace]:
     statementFingerprintInsightsReducerObj.reducer,
   [tenantsListObj.actionNamespace]: tenantsListObj.reducer,
+  [connectivityObj.actionNamespace]: connectivityObj.reducer,
 });
 
 export { CachedDataReducerState, KeyedCachedDataReducerState };

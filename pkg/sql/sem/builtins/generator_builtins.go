@@ -15,6 +15,7 @@ import (
 	"context"
 	gojson "encoding/json"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/volatility"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/arith"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/json"
@@ -274,6 +276,40 @@ var generators = map[string]builtinDefinition{
 			types.String,
 			makeRegexpSplitToTableGeneratorFactory(true /* hasFlags */),
 			"Split string using a POSIX regular expression as the delimiter with flags."+regexpFlagInfo,
+			volatility.Immutable,
+		),
+	),
+
+	"workload_index_recs": makeBuiltin(genProps(),
+		makeGeneratorOverload(
+			tree.ParamTypes{},
+			types.String,
+			makeWorkloadIndexRecsGeneratorFactory(false /* hasTimstamp */, false /* hasBudget */),
+			"Returns set of index recommendations",
+			volatility.Immutable,
+		),
+		makeGeneratorOverload(
+			tree.ParamTypes{{Name: "timestamptz", Typ: types.TimestampTZ}},
+			types.String,
+			makeWorkloadIndexRecsGeneratorFactory(true /* hasTimstamp */, false /* hasBudget */),
+			"Returns set of index recommendations",
+			volatility.Immutable,
+		),
+		makeGeneratorOverload(
+			tree.ParamTypes{{Name: "budget", Typ: types.String}},
+			types.String,
+			makeWorkloadIndexRecsGeneratorFactory(false /* hasTimstamp */, true /* hasBudget */),
+			"Returns set of index recommendations",
+			volatility.Immutable,
+		),
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "timestamptz", Typ: types.TimestampTZ},
+				{Name: "budget", Typ: types.String},
+			},
+			types.String,
+			makeWorkloadIndexRecsGeneratorFactory(true /* hasTimstamp */, true /* hasBudget */),
+			"Returns set of index recommendations",
 			volatility.Immutable,
 		),
 	),
@@ -628,6 +664,23 @@ The last argument is a JSONB object containing the following optional fields:
 			spanStatsGeneratorType,
 			makeSpanStatsGenerator,
 			"Returns SpanStats for the provided spans.",
+			volatility.Stable,
+		),
+	),
+	"crdb_internal.sstable_metrics": makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategorySystemInfo,
+		},
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "node_id", Typ: types.Int},
+				{Name: "store_id", Typ: types.Int},
+				{Name: "start_key", Typ: types.Bytes},
+				{Name: "end_key", Typ: types.Bytes},
+			},
+			tableMetricsGeneratorType,
+			makeTableMetricsGenerator,
+			"Returns statistics for the sstables containing keys in the range start_key and end_key for the provided node id.",
 			volatility.Stable,
 		),
 	),
@@ -1054,8 +1107,8 @@ func makeVariadicUnnestGenerator(
 	return g, nil
 }
 
-// multipleArrayValueGenerator is a value generator that returns each element of a
-// list of arrays.
+// multipleArrayValueGenerator is a value generator that returns each element of
+// a list of arrays.
 type multipleArrayValueGenerator struct {
 	arrays    []*tree.DArray
 	nextIndex int
@@ -1105,6 +1158,27 @@ func (s *multipleArrayValueGenerator) Values() (tree.Datums, error) {
 		}
 	}
 	return s.datums, nil
+}
+
+// makeWorkloadIndexRecsGeneratorFactory uses the arrayValueGenerator to return
+// all the index recommendations as an array of strings. When the hasTimestamp
+// is true, it means that we only care about the index after some timestamp. The
+// hasBudget represents that there is a space limit if it is true.
+func makeWorkloadIndexRecsGeneratorFactory(
+	hasTimestamp bool, hasBudget bool,
+) eval.GeneratorOverload {
+	return func(_ context.Context, _ *eval.Context, _ tree.Datums) (eval.ValueGenerator, error) {
+		// Invoke the workloadindexrec.FindWorkloadRecs() to get indexRecs, err once
+		// it is implemented. The string array {"1", "2", "3"} is just dummy data
+		indexRecs := []string{"1", "2", "3"}
+		arr := tree.NewDArray(types.String)
+		for _, indexRec := range indexRecs {
+			if err := arr.Append(tree.NewDString(indexRec)); err != nil {
+				return nil, err
+			}
+		}
+		return &arrayValueGenerator{array: arr}, nil
+	}
 }
 
 func makeArrayGenerator(
@@ -3105,6 +3179,99 @@ func (tssi *tableSpanStatsIterator) ResolvedType() *types.T {
 	return tableSpanStatsGeneratorType
 }
 
+var tableMetricsGeneratorType = types.MakeLabeledTuple(
+	[]*types.T{types.Int, types.Int, types.Int, types.Int, types.Int, types.Json},
+	[]string{"node_id", "store_id", "level", "file_num", "approximate_span_bytes", "metrics"},
+)
+
+// tableMetricsIterator implements tree.ValueGenerator; it returns a set of
+// SSTable metrics (one per row).
+type tableMetricsIterator struct {
+	metrics []enginepb.SSTableMetricsInfo
+	evalCtx *eval.Context
+
+	iterIdx int
+	nodeID  int32
+	storeID int32
+	start   []byte
+	end     []byte
+}
+
+var _ eval.ValueGenerator = (*tableMetricsIterator)(nil)
+
+func newTableMetricsIterator(
+	evalCtx *eval.Context, nodeID, storeID int32, start, end []byte,
+) *tableMetricsIterator {
+	return &tableMetricsIterator{evalCtx: evalCtx, nodeID: nodeID, storeID: storeID, start: start, end: end}
+}
+
+// Start implements the tree.ValueGenerator interface.
+func (tmi *tableMetricsIterator) Start(ctx context.Context, _ *kv.Txn) error {
+	var err error
+	tmi.metrics, err = tmi.evalCtx.GetTableMetrics(ctx, tmi.nodeID, tmi.storeID, tmi.start, tmi.end)
+	if err != nil {
+		err = errors.Wrapf(err, "getting table metrics for node %d store %d", tmi.nodeID, tmi.storeID)
+	}
+
+	sort.SliceStable(tmi.metrics, func(i, j int) bool {
+		a, b := tmi.metrics[i], tmi.metrics[j]
+		return a.Level < b.Level || (a.Level == b.Level && a.TableID < b.TableID)
+	})
+
+	return err
+}
+
+// Next implements the tree.ValueGenerator interface.
+func (tmi *tableMetricsIterator) Next(_ context.Context) (bool, error) {
+	tmi.iterIdx++
+	return tmi.iterIdx <= len(tmi.metrics), nil
+}
+
+// Values implements the tree.ValueGenerator interface.
+func (tmi *tableMetricsIterator) Values() (tree.Datums, error) {
+	metricsInfo := tmi.metrics[tmi.iterIdx-1]
+
+	metricsJson, err := tree.ParseDJSON(string(metricsInfo.TableInfoJSON))
+	if err != nil {
+		return nil, err
+	}
+
+	return tree.Datums{
+		tree.NewDInt(tree.DInt(tmi.nodeID)),
+		tree.NewDInt(tree.DInt(tmi.storeID)),
+		tree.NewDInt(tree.DInt(metricsInfo.Level)),
+		tree.NewDInt(tree.DInt(metricsInfo.TableID)),
+		tree.NewDInt(tree.DInt(metricsInfo.ApproximateSpanBytes)),
+		metricsJson,
+	}, nil
+}
+
+// Close implements the tree.ValueGenerator interface.
+func (tmi *tableMetricsIterator) Close(_ context.Context) {}
+
+// ResolvedType implements the tree.ValueGenerator interface.
+func (tmi *tableMetricsIterator) ResolvedType() *types.T {
+	return tableMetricsGeneratorType
+}
+
+func makeTableMetricsGenerator(
+	ctx context.Context, evalCtx *eval.Context, args tree.Datums,
+) (eval.ValueGenerator, error) {
+	isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !isAdmin {
+		return nil, errInsufficientPriv
+	}
+	nodeID := int32(tree.MustBeDInt(args[0]))
+	storeID := int32(tree.MustBeDInt(args[1]))
+	start := []byte(tree.MustBeDBytes(args[2]))
+	end := []byte(tree.MustBeDBytes(args[3]))
+
+	return newTableMetricsIterator(evalCtx, nodeID, storeID, start, end), nil
+}
+
 var tableSpanStatsGeneratorType = types.MakeLabeledTuple(
 	[]*types.T{types.Int, types.Int, types.Int, types.Int, types.Int, types.Int, types.Float},
 	[]string{"database_id", "table_id", "range_count", "approximate_disk_bytes", "live_bytes", "total_bytes", "live_percentage"},
@@ -3202,7 +3369,7 @@ func makeSpanStatsGenerator(
 	spans := make([]roachpb.Span, 0, argSpans.Len())
 	for _, span := range argSpans.Array {
 		s := tree.MustBeDTuple(span)
-		if s.D[0] == tree.DNull || s.D[1] == tree.DNull {
+		if len(s.D) != 2 || s.D[0] == tree.DNull || s.D[1] == tree.DNull {
 			continue
 		}
 		startKey := roachpb.Key(tree.MustBeDBytes(s.D[0]))

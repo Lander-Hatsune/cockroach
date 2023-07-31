@@ -154,18 +154,20 @@ var (
 		return names
 	}()
 
+	fewBankRows      = 100
 	bankPossibleRows = []int{
-		100,    // creates keys with long revision history
-		1_000,  // small backup
-		10_000, // larger backups (a few GiB when using 128 KiB payloads)
+		fewBankRows, // creates keys with long revision history (not valid with largeBankPayload)
+		1_000,       // small backup
+		10_000,      // larger backups (a few GiB when using 128 KiB payloads)
 	}
 
+	largeBankPayload         = 128 << 10 // 128 KiB
 	bankPossiblePayloadBytes = []int{
-		0,         // workload default
-		9,         // 1 random byte (`initial-` + 1)
-		500,       // 5x default at the time of writing
-		16 << 10,  // 16 KiB
-		128 << 10, // 128 KiB
+		0,                // workload default
+		9,                // 1 random byte (`initial-` + 1)
+		500,              // 5x default at the time of writing
+		16 << 10,         // 16 KiB
+		largeBankPayload, // 128 KiB
 	}
 )
 
@@ -948,10 +950,14 @@ func newBackupCollection(name string, btype backupType, options []backupOption) 
 
 func (bc *backupCollection) uri() string {
 	// Append the `nonce` to the backup name since we are now sharing a
-	// global namespace represented by the cockroachdb-backup-testing
+	// global namespace represented by the BACKUP_TESTING_BUCKET
 	// bucket. The nonce allows multiple people (or TeamCity builds) to
 	// be running this test without interfering with one another.
-	return fmt.Sprintf("gs://cockroachdb-backup-testing/mixed-version/%s_%s?AUTH=implicit", bc.name, bc.nonce)
+	gcsBackupTestingBucket := os.Getenv("BACKUP_TESTING_BUCKET")
+	if gcsBackupTestingBucket == "" {
+		gcsBackupTestingBucket = "cockroachdb-backup-testing"
+	}
+	return fmt.Sprintf("gs://"+gcsBackupTestingBucket+"/mixed-version/%s_%s?AUTH=implicit", bc.name, bc.nonce)
 }
 
 func (bc *backupCollection) encryptionOption() *encryptionPassphrase {
@@ -1487,12 +1493,16 @@ func (mvb *mixedVersionBackup) runBackup(
 	}
 
 	pauseAfter := 1024 * time.Hour // infinity
+	var pauseResumeDB *gosql.DB
 	if rng.Float64() < pauseProbability {
 		possibleDurations := []time.Duration{
 			10 * time.Second, 30 * time.Second, 2 * time.Minute,
 		}
 		pauseAfter = possibleDurations[rng.Intn(len(possibleDurations))]
-		l.Printf("attempting pauses in %s", pauseAfter)
+
+		var node int
+		node, pauseResumeDB = h.RandomDB(rng, mvb.roachNodes)
+		l.Printf("attempting pauses in %s through node %d", pauseAfter, node)
 	}
 
 	// NB: we need to run with the `detached` option + poll the
@@ -1563,7 +1573,7 @@ func (mvb *mixedVersionBackup) runBackup(
 
 			pauseDur := 5 * time.Second
 			l.Printf("pausing job %d for %s", jobID, pauseDur)
-			if err := h.Exec(rng, fmt.Sprintf("PAUSE JOB %d", jobID)); err != nil {
+			if _, err := pauseResumeDB.Exec(fmt.Sprintf("PAUSE JOB %d", jobID)); err != nil {
 				// We just log the error if pausing the job fails since we
 				// cannot guarantee the job is still running by the time we
 				// attempt to pause it. If that's the case, the next iteration
@@ -1575,7 +1585,7 @@ func (mvb *mixedVersionBackup) runBackup(
 			time.Sleep(pauseDur)
 
 			l.Printf("resuming job %d", jobID)
-			if err := h.Exec(rng, fmt.Sprintf("RESUME JOB %d", jobID)); err != nil {
+			if _, err := pauseResumeDB.Exec(fmt.Sprintf("RESUME JOB %d", jobID)); err != nil {
 				return backupCollection{}, "", fmt.Errorf("error resuming job %d: %w", jobID, err)
 			}
 
@@ -1969,7 +1979,7 @@ func (mvb *mixedVersionBackup) resetCluster(
 		return fmt.Errorf("failed to wipe cluster: %w", err)
 	}
 
-	cockroachPath := clusterupgrade.BinaryPathFromVersion(version)
+	cockroachPath := clusterupgrade.BinaryPathForVersion(mvb.t, version)
 	return clusterupgrade.StartWithSettings(
 		ctx, l, mvb.cluster, mvb.roachNodes, option.DefaultStartOptsNoBackups(),
 		install.BinaryOption(cockroachPath), install.SecureOption(true),
@@ -2091,7 +2101,14 @@ func registerBackupMixedVersion(r registry.Registry) {
 
 			roachNodes := c.Range(1, c.Spec().NodeCount-1)
 			workloadNode := c.Node(c.Spec().NodeCount)
-			mvt := mixedversion.NewTest(ctx, t, t.L(), c, roachNodes)
+			mvt := mixedversion.NewTest(
+				ctx, t, t.L(), c, roachNodes,
+				// We use a longer upgrade timeout in this test to give the
+				// migrations enough time to finish considering all the data
+				// that might exist in the cluster by the time the upgrade is
+				// attempted.
+				mixedversion.UpgradeTimeout(30*time.Minute),
+			)
 			testRNG := mvt.RNG()
 
 			uploadVersion(ctx, t, c, workloadNode, clusterupgrade.MainVersion)
@@ -2107,8 +2124,20 @@ func registerBackupMixedVersion(r registry.Registry) {
 				Flag("warehouses", numWarehouses).
 				Option("tolerate-errors")
 
-			bankRows := bankPossibleRows[testRNG.Intn(len(bankPossibleRows))]
 			bankPayload := bankPossiblePayloadBytes[testRNG.Intn(len(bankPossiblePayloadBytes))]
+			bankRows := bankPossibleRows[testRNG.Intn(len(bankPossibleRows))]
+			// A small number of rows with large payloads will typically
+			// lead to really large ranges that may cause the test to fail
+			// (e.g., `split failed... cannot find valid split key`). We
+			// avoid this combination.
+			//
+			// TODO(renato): consider reintroducing this combination when
+			// #102284 is fixed.
+			for bankPayload == largeBankPayload && bankRows == fewBankRows {
+				bankPayload = bankPossiblePayloadBytes[testRNG.Intn(len(bankPossiblePayloadBytes))]
+				bankRows = bankPossibleRows[testRNG.Intn(len(bankPossibleRows))]
+			}
+
 			bankInit := roachtestutil.NewCommand("./cockroach workload init bank").
 				Flag("rows", bankRows).
 				MaybeFlag(bankPayload != 0, "payload-bytes", bankPayload).

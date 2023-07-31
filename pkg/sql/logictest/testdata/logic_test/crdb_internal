@@ -63,6 +63,7 @@ crdb_internal  kv_flow_token_deductions                table  admin  NULL  NULL
 crdb_internal  kv_inherited_role_members               table  admin  NULL  NULL
 crdb_internal  kv_node_liveness                        table  admin  NULL  NULL
 crdb_internal  kv_node_status                          table  admin  NULL  NULL
+crdb_internal  kv_repairable_catalog_corruptions       view   admin  NULL  NULL
 crdb_internal  kv_store_status                         table  admin  NULL  NULL
 crdb_internal  kv_system_privileges                    view   admin  NULL  NULL
 crdb_internal  leases                                  table  admin  NULL  NULL
@@ -201,7 +202,7 @@ pg_index                         false
 pg_indexes                       false
 pg_inherits                      true
 pg_init_privs                    true
-pg_language                      true
+pg_language                      false
 pg_largeobject                   true
 pg_largeobject_metadata          true
 pg_locks                         true

@@ -20,7 +20,16 @@ import {
 import { JobRequest, JobResponse } from "src/api/jobsApi";
 import { actions as jobActions } from "src/store/jobDetails";
 import { selectID } from "../../selectors";
-import { createInitialState } from "src/api";
+import {
+  ListJobProfilerExecutionDetailsRequest,
+  createInitialState,
+  getExecutionDetailFile,
+} from "src/api";
+import {
+  initialState,
+  actions as jobProfilerActions,
+} from "src/store/jobs/jobProfiler.reducer";
+import { Dispatch } from "redux";
 
 const emptyState = createInitialState<JobResponse>();
 
@@ -31,12 +40,19 @@ const mapStateToProps = (
   const jobID = selectID(state, props);
   return {
     jobRequest: state.adminUI?.job?.cachedData[jobID] ?? emptyState,
+    jobProfilerExecutionDetailFilesResponse:
+      state.adminUI?.executionDetailFiles ?? initialState,
+    jobProfilerLastUpdated: state.adminUI?.executionDetailFiles?.lastUpdated,
+    jobProfilerDataIsValid: state.adminUI?.executionDetailFiles?.valid,
+    onDownloadExecutionFileClicked: getExecutionDetailFile,
   };
 };
 
-const mapDispatchToProps = {
+const mapDispatchToProps = (dispatch: Dispatch): JobDetailsDispatchProps => ({
   refreshJob: (req: JobRequest) => jobActions.refresh(req),
-};
+  refreshExecutionDetailFiles: (req: ListJobProfilerExecutionDetailsRequest) =>
+    dispatch(jobProfilerActions.refresh(req)),
+});
 
 export const JobDetailsPageConnected = withRouter(
   connect<JobDetailsStateProps, JobDetailsDispatchProps, RouteComponentProps>(

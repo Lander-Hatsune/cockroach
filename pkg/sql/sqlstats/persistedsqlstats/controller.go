@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 )
 
 // Controller implements the SQL Stats subsystem control plane. This exposes
@@ -27,8 +28,9 @@ import (
 // subsystem.
 type Controller struct {
 	*sslocal.Controller
-	db isql.DB
-	st *cluster.Settings
+	db        isql.DB
+	st        *cluster.Settings
+	clusterID func() uuid.UUID
 }
 
 // NewController returns a new instance of sqlstats.Controller.
@@ -39,6 +41,7 @@ func NewController(
 		Controller: sslocal.NewController(sqlStats.SQLStats, status),
 		db:         db,
 		st:         sqlStats.cfg.Settings,
+		clusterID:  sqlStats.cfg.ClusterID,
 	}
 }
 
@@ -46,7 +49,7 @@ func NewController(
 // interface.
 func (s *Controller) CreateSQLStatsCompactionSchedule(ctx context.Context) error {
 	return s.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		_, err := CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, txn, s.st)
+		_, err := CreateSQLStatsCompactionScheduleIfNotYetExist(ctx, txn, s.st, s.clusterID())
 		return err
 	})
 }
@@ -59,32 +62,38 @@ func (s *Controller) ResetClusterSQLStats(ctx context.Context) error {
 		return err
 	}
 
-	resetSysTableStats := func(tableName string) (err error) {
-		ex := s.db.Executor()
-		_, err = ex.ExecEx(
-			ctx,
-			"reset-sql-stats",
-			nil, /* txn */
-			sessiondata.NodeUserSessionDataOverride,
-			"TRUNCATE "+tableName)
+	if err := s.resetSysTableStats(ctx, "system.statement_statistics"); err != nil {
 		return err
 	}
 
-	if err := resetSysTableStats("system.statement_statistics"); err != nil {
+	if err := s.resetSysTableStats(ctx, "system.transaction_statistics"); err != nil {
 		return err
 	}
 
-	if err := resetSysTableStats("system.transaction_statistics"); err != nil {
-		return err
-	}
+	return s.ResetActivityTables(ctx)
+}
 
+// ResetActivityTables implements the tree.SQLStatsController interface. This
+// method resets the {statement|transaction}_activity system tables.
+func (s *Controller) ResetActivityTables(ctx context.Context) error {
 	if !s.st.Version.IsActive(ctx, clusterversion.V23_1CreateSystemActivityUpdateJob) {
 		return nil
 	}
 
-	if err := resetSysTableStats("system.statement_activity"); err != nil {
+	if err := s.resetSysTableStats(ctx, "system.statement_activity"); err != nil {
 		return err
 	}
 
-	return resetSysTableStats("system.transaction_activity")
+	return s.resetSysTableStats(ctx, "system.transaction_activity")
+}
+
+func (s *Controller) resetSysTableStats(ctx context.Context, tableName string) (err error) {
+	ex := s.db.Executor()
+	_, err = ex.ExecEx(
+		ctx,
+		"reset-sql-stats",
+		nil, /* txn */
+		sessiondata.NodeUserSessionDataOverride,
+		"TRUNCATE "+tableName)
+	return err
 }

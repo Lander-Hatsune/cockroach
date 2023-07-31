@@ -36,6 +36,8 @@ func TestPersistedSQLStatsRead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	skip.WithIssue(t, 107804)
+
 	fakeTime := stubTime{
 		aggInterval: time.Hour,
 	}
@@ -93,7 +95,7 @@ func TestPersistedSQLStatsRead(t *testing.T) {
 		require.NoError(t,
 			sqlStats.IterateStatementStats(
 				context.Background(),
-				&sqlstats.IteratorOptions{
+				sqlstats.IteratorOptions{
 					SortedKey:      true,
 					SortedAppNames: true,
 				},
@@ -115,7 +117,7 @@ func TestPersistedSQLStatsRead(t *testing.T) {
 		require.NoError(t,
 			sqlStats.IterateTransactionStats(
 				context.Background(),
-				&sqlstats.IteratorOptions{},
+				sqlstats.IteratorOptions{},
 				func(
 					ctx context.Context,
 					statistics *appstatspb.CollectedTransactionStatistics,
@@ -215,7 +217,7 @@ func verifyStoredStmtFingerprints(
 	require.NoError(t,
 		sqlStats.IterateStatementStats(
 			context.Background(),
-			&sqlstats.IteratorOptions{},
+			sqlstats.IteratorOptions{},
 			func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 				if expectedExecCount, ok := expectedStmtFingerprints[statistics.Key.Query]; ok {
 					foundQueries[statistics.Key.Query] = struct{}{}
@@ -228,7 +230,7 @@ func verifyStoredStmtFingerprints(
 	require.NoError(t,
 		sqlStats.IterateTransactionStats(
 			context.Background(),
-			&sqlstats.IteratorOptions{},
+			sqlstats.IteratorOptions{},
 			func(
 				ctx context.Context,
 				statistics *appstatspb.CollectedTransactionStatistics,

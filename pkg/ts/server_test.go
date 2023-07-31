@@ -39,7 +39,9 @@ import (
 
 func TestServerQuery(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	defer log.Scope(t).Close(t)
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableTimeSeriesMaintenanceQueue: true,
@@ -261,8 +263,10 @@ func TestServerQuery(t *testing.T) {
 // query request has more queries than the server's MaxWorkers count.
 func TestServerQueryStarvation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	workerCount := 20
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		TimeSeriesQueryWorkerMax: workerCount,
 	})
 	defer s.Stopper().Stop(context.Background())
@@ -298,25 +302,19 @@ func TestServerQueryStarvation(t *testing.T) {
 
 func TestServerQueryTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	testCluster := serverutils.StartNewTestCluster(t, 1, base.TestClusterArgs{
-		ServerArgs: base.TestServerArgs{
-			DefaultTestTenant: base.TestTenantDisabled,
-			Knobs: base.TestingKnobs{
-				Store: &kvserver.StoreTestingKnobs{
-					DisableTimeSeriesMaintenanceQueue: true,
-				},
+	defer log.Scope(t).Close(t)
+
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
+		DefaultTestTenant: base.TODOTestTenantDisabled,
+		Knobs: base.TestingKnobs{
+			Store: &kvserver.StoreTestingKnobs{
+				DisableTimeSeriesMaintenanceQueue: true,
 			},
 		},
 	})
-	defer testCluster.Stopper().Stop(context.Background())
-	tsrv := testCluster.Server(0).(*server.TestServer)
-	systemDB := serverutils.OpenDBConn(
-		t,
-		tsrv.ServingSQLAddr(),
-		"",    /* useDatabase */
-		false, /* insecure */
-		tsrv.Stopper(),
-	)
+	defer s.Stopper().Stop(context.Background())
+	tsrv := s.(*server.TestServer)
+	systemDB := s.SystemLayer().SQLConn(t, "")
 
 	// Populate data directly.
 	tsdb := tsrv.TsDB()
@@ -487,13 +485,13 @@ func TestServerQueryTenant(t *testing.T) {
 		},
 	}
 
-	tenant, _ := serverutils.StartTenant(t, testCluster.Server(0), base.TestTenantArgs{TenantID: tenantID})
+	tenant, _ := serverutils.StartTenant(t, s, base.TestTenantArgs{TenantID: tenantID})
 	_, err = systemDB.Exec("ALTER TENANT [2] GRANT CAPABILITY can_view_tsdb_metrics=true;\n")
 	if err != nil {
 		t.Fatal(err)
 	}
 	capability := map[tenantcapabilities.ID]string{tenantcapabilities.CanViewTSDBMetrics: "true"}
-	testCluster.WaitForTenantCapabilities(t, tenantID, capability)
+	serverutils.WaitForTenantCapabilities(t, s, tenantID, capability, "")
 	tenantConn, err := tenant.(*server.TestTenant).RPCContext().GRPCDialNode(tenant.(*server.TestTenant).Cfg.AdvertiseAddr, tsrv.NodeID(), rpc.DefaultClass).Connect(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -526,6 +524,7 @@ func TestServerQueryTenant(t *testing.T) {
 // constrained memory requirements.
 func TestServerQueryMemoryManagement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
 
 	// Number of workers that will be available to process data.
 	workerCount := 20
@@ -544,7 +543,7 @@ func TestServerQueryMemoryManagement(t *testing.T) {
 	sizeOfSlab := int64(unsafe.Sizeof(roachpb.InternalTimeSeriesData{})) + (int64(unsafe.Sizeof(roachpb.InternalTimeSeriesSample{})) * samplesPerSlab)
 	budget := 3 * sizeOfSlab * int64(sourceCount) * int64(workerCount)
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		TimeSeriesQueryWorkerMax:    workerCount,
 		TimeSeriesQueryMemoryBudget: budget,
 	})
@@ -581,6 +580,7 @@ func TestServerQueryMemoryManagement(t *testing.T) {
 func TestServerDump(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+
 	ctx := context.Background()
 
 	seriesCount := 10
@@ -614,7 +614,7 @@ func TestServerDump(t *testing.T) {
 
 	expTotalMsgCount := seriesCount * sourceCount * (endSlab - startSlab)
 
-	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{
+	s := serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableTimeSeriesMaintenanceQueue: true,
@@ -709,7 +709,7 @@ func TestServerDump(t *testing.T) {
 	s.Stopper().Stop(ctx)
 
 	// Start a new server, into which to write the raw dump.
-	s, _, _ = serverutils.StartServer(t, base.TestServerArgs{
+	s = serverutils.StartServerOnly(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableTimeSeriesMaintenanceQueue: true,
@@ -730,7 +730,7 @@ func TestServerDump(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		require.NoError(t, s.DB().Run(ctx, &b))
 
-		conn, err := s.RPCContext().GRPCDialNode(s.ServingRPCAddr(), s.NodeID(),
+		conn, err := s.RPCContext().GRPCDialNode(s.AdvRPCAddr(), s.NodeID(),
 			rpc.DefaultClass).Connect(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -752,7 +752,9 @@ func TestServerDump(t *testing.T) {
 }
 
 func BenchmarkServerQuery(b *testing.B) {
-	s, _, _ := serverutils.StartServer(b, base.TestServerArgs{})
+	defer log.Scope(b).Close(b)
+
+	s := serverutils.StartServerOnly(b, base.TestServerArgs{})
 	defer s.Stopper().Stop(context.Background())
 	tsrv := s.(*server.TestServer)
 

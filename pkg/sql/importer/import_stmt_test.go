@@ -135,7 +135,6 @@ ORDER BY table_name
 	sqlDB := sqlutils.MakeSQLRunner(db)
 
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.batch_size = '10KB'`)
-	sqlDB.Exec(t, `SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true`)
 
 	tests := []struct {
 		name     string
@@ -1699,7 +1698,7 @@ func TestImportRowLimit(t *testing.T) {
 	// Also create a pgx connection so we can check notices.
 	pgURL, cleanup := sqlutils.PGUrl(
 		t,
-		tc.Server(0).ServingSQLAddr(),
+		tc.ApplicationLayer(0).AdvSQLAddr(),
 		"TestImportRowLimit",
 		url.User(username.RootUser),
 	)
@@ -2040,7 +2039,7 @@ func TestFailedImportGC(t *testing.T) {
 		// Test fails within a test tenant. This may be because we're trying
 		// to access files in nodelocal://1, which is off node. More
 		// investigation is required. Tracked with #76378.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		SQLMemoryPoolSize: 256 << 20,
 		ExternalIODir:     baseDir,
 		Knobs: base.TestingKnobs{
@@ -2071,9 +2070,6 @@ func TestFailedImportGC(t *testing.T) {
 	kvDB := tc.Server(0).DB()
 
 	sqlDB.Exec(t, `SET CLUSTER SETTING kv.bulk_ingest.batch_size = '10KB'`)
-	// The test assumes we'll use the MVCC range tombstone in the GC job. We need
-	// to set this cluster setting to make that true.
-	sqlDB.Exec(t, `SET CLUSTER SETTING storage.mvcc.range_tombstones.enabled = true`)
 
 	forceFailure = true
 	defer func() { forceFailure = false }()
@@ -2149,7 +2145,7 @@ func TestImportIntoCSVCancel(t *testing.T) {
 			},
 			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 		},
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		ExternalIODir:     baseDir,
 	}})
 	defer tc.Stopper().Stop(ctx)
@@ -2206,7 +2202,7 @@ func TestImportCSVStmt(t *testing.T) {
 	tc := serverutils.StartNewTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
 		// Test fails when run within a test tenant. More
 		// investigation is required. Tracked with #76378.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		SQLMemoryPoolSize: 256 << 20,
 		ExternalIODir:     baseDir,
 	}})
@@ -2548,7 +2544,7 @@ func TestImportCSVStmt(t *testing.T) {
 		sqlDB.Exec(t, `CREATE USER testuser`)
 		sqlDB.Exec(t, `GRANT admin TO testuser`)
 		pgURL, cleanupFunc := sqlutils.PGUrl(
-			t, tc.Server(0).ServingSQLAddr(), "TestImportPrivileges-testuser",
+			t, tc.ApplicationLayer(0).AdvSQLAddr(), "TestImportPrivileges-testuser",
 			url.User("testuser"),
 		)
 		defer cleanupFunc()
@@ -2779,7 +2775,7 @@ func TestImportObjectLevelRBAC(t *testing.T) {
 	tc := serverutils.StartNewTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
 		// Test fails when run within a test tenant. More investigation
 		// is required. Tracked with #76378.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		ExternalIODir:     baseDir,
 		SQLMemoryPoolSize: 256 << 20,
 	}})
@@ -2789,7 +2785,7 @@ func TestImportObjectLevelRBAC(t *testing.T) {
 
 	rootDB.Exec(t, `CREATE USER testuser`)
 	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, tc.Server(0).ServingSQLAddr(), "TestImportPrivileges-testuser",
+		t, tc.ApplicationLayer(0).AdvSQLAddr(), "TestImportPrivileges-testuser",
 		url.User("testuser"),
 	)
 	defer cleanupFunc()
@@ -2958,7 +2954,7 @@ func TestImportRetriesBreakerOpenFailure(t *testing.T) {
 
 	ctx := context.Background()
 	tc := serverutils.StartNewTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: base.TestServerArgs{
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		ExternalIODir:     datapathutils.TestDataPath(t, "csv")}})
 	defer tc.Stopper().Stop(ctx)
 
@@ -3069,7 +3065,7 @@ func TestImportIntoCSV(t *testing.T) {
 		},
 		// Test fails when run within a test tenant. More investigation
 		// is required. Tracked with #76378.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		ExternalIODir:     baseDir}})
 	defer tc.Stopper().Stop(ctx)
 	conn := tc.ServerConn(0)
@@ -3950,6 +3946,7 @@ func TestImportIntoCSV(t *testing.T) {
 }
 
 func benchUserUpload(b *testing.B, uploadBaseURI string) {
+	defer log.Scope(b).Close(b)
 	const (
 		nodes = 3
 	)
@@ -4115,6 +4112,7 @@ var _ importRowProducer = &csvBenchmarkStream{}
 // BenchmarkConvertRecord-16    	  500000	      2376 ns/op	  50.49 MB/s	    3606 B/op	     101 allocs/op
 // BenchmarkConvertRecord-16    	  500000	      2390 ns/op	  50.20 MB/s	    3606 B/op	     101 allocs/op
 func BenchmarkCSVConvertRecord(b *testing.B) {
+	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 
 	tpchLineItemDataRows := [][]string{
@@ -4774,7 +4772,7 @@ func TestImportDefaultWithResume(t *testing.T) {
 		base.TestServerArgs{
 			// Test hangs when run within a test tenant. More investigation
 			// is required. Tracked with #76378.
-			DefaultTestTenant: base.TestTenantDisabled,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
 				DistSQL: &execinfra.TestingKnobs{
@@ -5065,6 +5063,7 @@ INSERT INTO users (a, b) VALUES (1, 2), (3, 4);
 // BenchmarkDelimitedConvertRecord-16    	  500000	      3004 ns/op	  39.94 MB/s
 // BenchmarkDelimitedConvertRecord-16    	  500000	      2966 ns/op	  40.45 MB/s
 func BenchmarkDelimitedConvertRecord(b *testing.B) {
+	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	_, _, db := serverutils.StartServer(b, base.TestServerArgs{})
 
@@ -5167,6 +5166,7 @@ func BenchmarkDelimitedConvertRecord(b *testing.B) {
 // BenchmarkPgCopyConvertRecord-16    	  339940	      3610 ns/op	  33.24 MB/s
 // BenchmarkPgCopyConvertRecord-16    	  307701	      3833 ns/op	  31.30 MB/s
 func BenchmarkPgCopyConvertRecord(b *testing.B) {
+	defer log.Scope(b).Close(b)
 	ctx := context.Background()
 	_, _, db := serverutils.StartServer(b, base.TestServerArgs{})
 
@@ -5295,19 +5295,19 @@ func TestImportControlJobRBAC(t *testing.T) {
 		ServerArgs: base.TestServerArgs{
 			// Test fails when run within a test tenant. More investigation
 			// is required. Tracked with #76378.
-			DefaultTestTenant: base.TestTenantDisabled,
+			DefaultTestTenant: base.TODOTestTenantDisabled,
 		},
 	})
 	defer tc.Stopper().Stop(ctx)
 	rootDB := sqlutils.MakeSQLRunner(tc.ServerConn(0))
 
-	registry := tc.Server(0).JobRegistry().(*jobs.Registry)
+	registry := tc.ApplicationLayer(0).JobRegistry().(*jobs.Registry)
 
 	// Create non-root user.
 	rootDB.Exec(t, `CREATE USER testuser`)
 	rootDB.Exec(t, `ALTER ROLE testuser CONTROLJOB`)
 	pgURL, cleanupFunc := sqlutils.PGUrl(
-		t, tc.Server(0).ServingSQLAddr(), "TestImportPrivileges-testuser",
+		t, tc.ApplicationLayer(0).AdvSQLAddr(), "TestImportPrivileges-testuser",
 		url.User("testuser"),
 	)
 	defer cleanupFunc()
@@ -6483,7 +6483,7 @@ func TestImportPgDumpSchemas(t *testing.T) {
 		// Test fails within a test tenant. More investigation is required.
 		// Tracked with #76378.
 		args := mkArgs()
-		args.DefaultTestTenant = base.TestTenantDisabled
+		args.DefaultTestTenant = base.TODOTestTenantDisabled
 		tc := serverutils.StartNewTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
 		defer tc.Stopper().Stop(ctx)
 		conn := tc.ServerConn(0)
@@ -6661,7 +6661,7 @@ func TestCreateStatsAfterImport(t *testing.T) {
 	stats.AutomaticStatisticsOnSystemTables.Override(context.Background(), &st.SV, false)
 	args := base.TestServerArgs{
 		Settings:          st,
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		ExternalIODir:     baseDir,
 	}
 	tc := serverutils.StartNewTestCluster(t, nodes, base.TestClusterArgs{ServerArgs: args})
@@ -6870,7 +6870,7 @@ func TestImportClientDisconnect(t *testing.T) {
 	// Make credentials for the new connection.
 	runner.Exec(t, `CREATE USER testuser`)
 	runner.Exec(t, `GRANT admin TO testuser`)
-	pgURL, cleanup := sqlutils.PGUrl(t, tc.Server(0).ServingSQLAddr(),
+	pgURL, cleanup := sqlutils.PGUrl(t, tc.ApplicationLayer(0).AdvSQLAddr(),
 		"TestImportClientDisconnect-testuser", url.User("testuser"))
 	defer cleanup()
 	runner.Exec(t, "CREATE TABLE foo (k INT PRIMARY KEY, v STRING)")
@@ -7128,7 +7128,7 @@ func TestImportJobEventLogging(t *testing.T) {
 	args := base.TestServerArgs{ExternalIODir: baseDir}
 	// Test fails within a test tenant. More investigation is required.
 	// Tracked with #76378.
-	args.DefaultTestTenant = base.TestTenantDisabled
+	args.DefaultTestTenant = base.TODOTestTenantDisabled
 	args.Knobs = base.TestingKnobs{JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals()}
 	params := base.TestClusterArgs{ServerArgs: args}
 	tc := serverutils.StartNewTestCluster(t, nodes, params)
@@ -7502,7 +7502,7 @@ CREATE TABLE f (
 )
 `)
 		data = "1,1\n1,2"
-		sqlDB.ExpectErr(t, "duplicate key in index: duplicate key: /Table/109/2/1/0",
+		sqlDB.ExpectErr(t, "duplicate key in index: duplicate key: (/Tenant/10)?/Table/109/2/1/0",
 			fmt.Sprintf(`IMPORT INTO f (a,b) CSV DATA ('%s')`, srv.URL))
 	})
 

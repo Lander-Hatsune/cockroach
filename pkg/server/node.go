@@ -37,7 +37,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvadmission"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitieswatcher"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -61,6 +64,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log/logpb"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/pprofutil"
+	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/startup"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -352,6 +356,7 @@ type Node struct {
 	tenantUsage multitenant.TenantUsageServer
 
 	tenantSettingsWatcher *tenantsettingswatcher.Watcher
+	tenantInfoWatcher     *tenantcapabilitieswatcher.Watcher
 
 	spanConfigAccessor spanconfig.KVAccessor // powers the span configuration RPCs
 
@@ -367,6 +372,14 @@ type Node struct {
 
 	// Used to collect samples for the key visualizer.
 	spanStatsCollector *spanstatscollector.SpanStatsCollector
+
+	// versionUpdateMu is used by the TenantSettings endpoint
+	// to inform tenant servers of storage version changes.
+	versionUpdateMu struct {
+		syncutil.Mutex
+		encodedVersion string
+		updateCh       chan struct{}
+	}
 }
 
 var _ kvpb.InternalServer = &Node{}
@@ -511,6 +524,7 @@ func NewNode(
 	storeGrantCoords *admission.StoreGrantCoordinators,
 	tenantUsage multitenant.TenantUsageServer,
 	tenantSettingsWatcher *tenantsettingswatcher.Watcher,
+	tenantInfoWatcher *tenantcapabilitieswatcher.Watcher,
 	spanConfigAccessor spanconfig.KVAccessor,
 	spanConfigReporter spanconfig.Reporter,
 ) *Node {
@@ -525,11 +539,13 @@ func NewNode(
 		clusterID:             clusterID,
 		tenantUsage:           tenantUsage,
 		tenantSettingsWatcher: tenantSettingsWatcher,
+		tenantInfoWatcher:     tenantInfoWatcher,
 		spanConfigAccessor:    spanConfigAccessor,
 		spanConfigReporter:    spanConfigReporter,
 		testingErrorEvent:     cfg.TestingKnobs.TestingResponseErrorEvent,
 		spanStatsCollector:    spanstatscollector.New(cfg.Settings),
 	}
+	n.versionUpdateMu.updateCh = make(chan struct{})
 	n.perReplicaServer = kvserver.MakeServer(&n.Descriptor, n.stores)
 	return n
 }
@@ -592,6 +608,11 @@ func (n *Node) start(
 		StartedAt:       n.startedAt,
 		HTTPAddress:     util.MakeUnresolvedAddr(httpAddr.Network(), httpAddr.String()),
 	}
+
+	// Track changes to the version setting to inform the tenant connector.
+	n.storeCfg.Settings.Version.SetOnChange(n.notifyClusterVersionChange)
+	// Also update the encoded copy immediately.
+	n.notifyClusterVersionChange(ctx, n.storeCfg.Settings.Version.ActiveVersion(ctx))
 
 	// Gossip the node descriptor to make this node addressable by node ID.
 	n.storeCfg.Gossip.NodeID.Set(ctx, n.Descriptor.NodeID)
@@ -1315,8 +1336,11 @@ func (n *Node) batchInternal(
 	// the request was doing at the time it noticed the cancellation.
 	if pErr != nil && ctx.Err() != nil {
 		if sp := tracing.SpanFromContext(ctx); sp != nil && !sp.IsNoop() {
-			log.Infof(ctx, "batch request %s failed with error: %s\ntrace:\n%s", args.String(),
-				pErr.GoError().Error(), sp.GetConfiguredRecording().String())
+			recording := sp.GetConfiguredRecording()
+			if recording.Len() != 0 {
+				log.Infof(ctx, "batch request %s failed with error: %v\ntrace:\n%s", args.String(),
+					pErr.GoError(), recording)
+			}
 		}
 	}
 
@@ -1347,10 +1371,10 @@ func (n *Node) getLocalityComparison(
 
 	comparisonResult, regionErr, zoneErr := n.Descriptor.Locality.CompareWithLocality(gatewayNodeDesc.Locality)
 	if regionErr != nil {
-		log.VEventf(ctx, 2, "unable to determine if the given nodes are cross region %+v", regionErr)
+		log.VEventf(ctx, 5, "unable to determine if the given nodes are cross region %v", regionErr)
 	}
 	if zoneErr != nil {
-		log.VEventf(ctx, 2, "unable to determine if the given nodes are cross zone %+v", zoneErr)
+		log.VEventf(ctx, 5, "unable to determine if the given nodes are cross zone %v", zoneErr)
 	}
 
 	return comparisonResult
@@ -1829,9 +1853,8 @@ func (n *Node) ResetQuorum(
 	log.Infof(ctx, "retrieved original range descriptor %s", desc)
 
 	// Check that we've actually lost quorum.
-	livenessMap := n.storeCfg.NodeLiveness.GetIsLiveMap()
 	available := desc.Replicas().CanMakeProgress(func(rDesc roachpb.ReplicaDescriptor) bool {
-		return livenessMap[rDesc.NodeID].IsLive
+		return n.storeCfg.NodeLiveness.GetNodeVitalityFromCache(rDesc.NodeID).IsLive(livenesspb.ReplicaProgress)
 	})
 	if available {
 		return nil, errors.Errorf("targeted range to recover has not lost quorum.")
@@ -2010,6 +2033,22 @@ func (n *Node) GossipSubscription(
 	}
 }
 
+func (n *Node) waitForTenantWatcherReadiness(
+	ctx context.Context,
+) (*tenantsettingswatcher.Watcher, *tenantcapabilitieswatcher.Watcher, error) {
+	settingsWatcher := n.tenantSettingsWatcher
+	if err := settingsWatcher.WaitForStart(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	infoWatcher := n.tenantInfoWatcher
+	if err := infoWatcher.WaitForStart(ctx); err != nil {
+		return nil, nil, err
+	}
+
+	return settingsWatcher, infoWatcher, nil
+}
+
 // TenantSettings implements the kvpb.InternalServer interface.
 func (n *Node) TenantSettings(
 	args *kvpb.TenantSettingsRequest, stream kvpb.Internal_TenantSettingsServer,
@@ -2017,19 +2056,58 @@ func (n *Node) TenantSettings(
 	ctx := n.storeCfg.AmbientCtx.AnnotateCtx(stream.Context())
 	ctxDone := ctx.Done()
 
-	w := n.tenantSettingsWatcher
-	if err := w.WaitForStart(ctx); err != nil {
+	settingsWatcher, infoWatcher, err := n.waitForTenantWatcherReadiness(ctx)
+	if err != nil {
 		return stream.Send(&kvpb.TenantSettingsEvent{
 			Error: errors.EncodeError(ctx, err),
 		})
 	}
 
-	send := func(precedence kvpb.TenantSettingsEvent_Precedence, overrides []kvpb.TenantSetting) error {
-		log.VInfof(ctx, 1, "sending precedence %d: %v", precedence, overrides)
+	// Do we even have a record for this tenant?
+	tInfo, infoCh, found := infoWatcher.GetInfo(args.TenantID)
+	if !found {
 		return stream.Send(&kvpb.TenantSettingsEvent{
+			Error: errors.EncodeError(ctx, &kvpb.MissingRecordError{}),
+		})
+	}
+
+	sendSettings := func(precedence kvpb.TenantSettingsEvent_Precedence, overrides []kvpb.TenantSetting, incremental bool) error {
+		log.VInfof(ctx, 1, "sending precedence %d (incremental=%v): %v", precedence, overrides, incremental)
+		return stream.Send(&kvpb.TenantSettingsEvent{
+			EventType:   kvpb.TenantSettingsEvent_SETTING_EVENT,
 			Precedence:  precedence,
-			Incremental: false,
+			Incremental: incremental,
 			Overrides:   overrides,
+		})
+	}
+
+	sendTenantInfo := func(
+		fakePrecedence kvpb.TenantSettingsEvent_Precedence,
+		tInfo tenantcapabilities.Entry,
+	) error {
+		log.VInfof(ctx, 1, "sending tenant info: %+v", tInfo)
+		// Note: we are piggy-backing on the TenantSetting streaming RPC
+		// to send non-setting data. This must be careful to work on
+		// SQL servers running previous versions of the CockroachDB code.
+		// To that end, we make the TenantSettingEvent "look like"
+		// a no-op setting change.
+		return stream.Send(&kvpb.TenantSettingsEvent{
+			EventType: kvpb.TenantSettingsEvent_METADATA_EVENT,
+			// IMPORTANT: setting Incremental to true ensures existing
+			// settings are preserved client-side in previous-version
+			// clients that do not know about the EventType field.
+			Incremental: true,
+			// An empty Overrides slice results in no-op client-side.
+			Overrides:  nil,
+			Precedence: fakePrecedence,
+
+			// These are the actual fields for our update.
+			Name:         tInfo.Name,
+			Capabilities: tInfo.TenantCapabilities,
+			// TODO(knz): remove the cast after we fix the dependency cycle
+			// between the protobufs.
+			ServiceMode: uint32(tInfo.ServiceMode),
+			DataState:   uint32(tInfo.DataState),
 		})
 	}
 
@@ -2042,30 +2120,89 @@ func (n *Node) TenantSettings(
 	}
 
 	// Send the initial state.
-	//
-	// The protocol defines that there is one initial response per
-	// precedence value, with Incremental set to false. This is important:
-	// the client waits for at least one non-incremental message
-	// for each predecende before continuing.
 
-	allOverrides, allCh := w.GetAllTenantOverrides()
-	if err := send(kvpb.TenantSettingsEvent_ALL_TENANTS_OVERRIDES, allOverrides); err != nil {
+	// Note: for compatibility with pre-23.1 tenant clients, it is
+	// important that all event types that convey data about the
+	// initial state of a tenant service be sent after the first
+	// SETTING_EVENT message that communicates overrides (for one of
+	// the two precedence levels), and before the second one (for the
+	// other precedence level).
+	//
+	// This is necessary because of a combination of factors:
+	//
+	// - For compatibility with older version tenant clients,
+	//   all non-setting event types must fake being a no-op
+	//   setting event (see the docstring on the EventType field).
+	//   A no-op fake setting event must have `Incremental` set to
+	//   `true`.
+	// - Meanwhile, older version tenant clients also assert that the
+	//   very first message sent by the server must have `Incremental`
+	//   set to `false`.
+	//
+	//   This means we can only send events of other types after the
+	//   first setting overrides event.
+	//
+	// - Then, separately, newer version tenant clients also
+	//   synchronize their startup on the reception of a tenant
+	//   setting event for each precedence level. This is because
+	//   these tenant clients must, in turn, remain compatible with
+	//   older version *KV servers* that do not send other event types
+	//   and send just 2 setting overrides events initially.
+	//
+	//   This means we cannot send other event types after the second
+	//   setting overrides event.
+
+	// Send the setting overrides for one precedence level.
+	const firstPrecedenceLevel = kvpb.TenantSettingsEvent_ALL_TENANTS_OVERRIDES
+	allOverrides, allCh := settingsWatcher.GetAllTenantOverrides()
+
+	// Inject the current storage logical version as an override; as the
+	// tenant server needs this to start up.
+	verSetting, versionUpdateCh := n.getVersionSettingWithUpdateCh(ctx)
+	allOverrides = append(allOverrides, verSetting)
+	if err := sendSettings(kvpb.TenantSettingsEvent_ALL_TENANTS_OVERRIDES, allOverrides, false /* incremental */); err != nil {
 		return err
 	}
 
-	tenantOverrides, tenantCh := w.GetTenantOverrides(args.TenantID)
-	if err := send(kvpb.TenantSettingsEvent_TENANT_SPECIFIC_OVERRIDES, tenantOverrides); err != nil {
+	// Send the initial tenant metadata. See the explanatory comment
+	// above for details.
+	if err := sendTenantInfo(firstPrecedenceLevel, tInfo); err != nil {
+		return err
+	}
+
+	// Then send the initial setting overrides for the other precedence
+	// level. This is the payload that will let the tenant client
+	// connector signal readiness.
+	tenantOverrides, tenantCh := settingsWatcher.GetTenantOverrides(args.TenantID)
+	if err := sendSettings(kvpb.TenantSettingsEvent_TENANT_SPECIFIC_OVERRIDES, tenantOverrides, false /* incremental */); err != nil {
 		return err
 	}
 
 	for {
 		select {
+		case <-versionUpdateCh:
+			// The storage version has changed, send it again.
+			verSetting, versionUpdateCh = n.getVersionSettingWithUpdateCh(ctx)
+			if err := sendSettings(kvpb.TenantSettingsEvent_ALL_TENANTS_OVERRIDES,
+				[]kvpb.TenantSetting{verSetting},
+				true /* incremental */); err != nil {
+				return err
+			}
+
+		case <-infoCh:
+			// Tenant metadata has changed, send it again.
+			tInfo, infoCh, _ = infoWatcher.GetInfo(args.TenantID)
+			const anyPrecedenceLevel = kvpb.TenantSettingsEvent_ALL_TENANTS_OVERRIDES
+			if err := sendTenantInfo(anyPrecedenceLevel, tInfo); err != nil {
+				return err
+			}
+
 		case <-allCh:
 			// All-tenant overrides have changed, send them again.
 			// TODO(multitenant): We can optimize this by only sending the delta since the last
 			// update, with Incremental set to true.
-			allOverrides, allCh = w.GetAllTenantOverrides()
-			if err := send(kvpb.TenantSettingsEvent_ALL_TENANTS_OVERRIDES, allOverrides); err != nil {
+			allOverrides, allCh = settingsWatcher.GetAllTenantOverrides()
+			if err := sendSettings(kvpb.TenantSettingsEvent_ALL_TENANTS_OVERRIDES, allOverrides, false /* incremental */); err != nil {
 				return err
 			}
 
@@ -2073,8 +2210,8 @@ func (n *Node) TenantSettings(
 			// Tenant-specific overrides have changed, send them again.
 			// TODO(multitenant): We can optimize this by only sending the delta since the last
 			// update, with Incremental set to true.
-			tenantOverrides, tenantCh = w.GetTenantOverrides(args.TenantID)
-			if err := send(kvpb.TenantSettingsEvent_TENANT_SPECIFIC_OVERRIDES, tenantOverrides); err != nil {
+			tenantOverrides, tenantCh = settingsWatcher.GetTenantOverrides(args.TenantID)
+			if err := sendSettings(kvpb.TenantSettingsEvent_TENANT_SPECIFIC_OVERRIDES, tenantOverrides, false /* incremental */); err != nil {
 				return err
 			}
 
@@ -2085,6 +2222,43 @@ func (n *Node) TenantSettings(
 			return stop.ErrUnavailable
 		}
 	}
+}
+
+// getVersionSettingWithUpdateCh returns the current encoded cluster
+// version as a TenantSetting, and a channel that is closed whenever
+// the version changes.
+func (n *Node) getVersionSettingWithUpdateCh(
+	ctx context.Context,
+) (kvpb.TenantSetting, <-chan struct{}) {
+	n.versionUpdateMu.Lock()
+	defer n.versionUpdateMu.Unlock()
+
+	setting := kvpb.TenantSetting{
+		Name: clusterversion.KeyVersionSetting,
+		Value: settings.EncodedValue{
+			Type:  settings.VersionSettingValueType,
+			Value: n.versionUpdateMu.encodedVersion,
+		},
+	}
+
+	return setting, n.versionUpdateMu.updateCh
+}
+
+func (n *Node) notifyClusterVersionChange(
+	ctx context.Context, activeVersion clusterversion.ClusterVersion,
+) {
+	n.versionUpdateMu.Lock()
+	defer n.versionUpdateMu.Unlock()
+
+	encodedVersion, err := protoutil.Marshal(&activeVersion)
+	if err != nil {
+		logcrash.ReportOrPanic(ctx, &n.execCfg.Settings.SV, "%w", err)
+		return
+	}
+	n.versionUpdateMu.encodedVersion = string(encodedVersion)
+	// Notify listeners.
+	close(n.versionUpdateMu.updateCh)
+	n.versionUpdateMu.updateCh = make(chan struct{})
 }
 
 // Join implements the kvpb.InternalServer service. This is the

@@ -1962,6 +1962,15 @@ func (m *CommonSQLExecDetails) AppendJSONFields(printComma bool, b redact.Redact
 		b = strconv.AppendUint(b, uint64(m.BulkJobId), 10)
 	}
 
+	if m.StmtPosInTxn != 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"StmtPosInTxn\":"...)
+		b = strconv.AppendUint(b, uint64(m.StmtPosInTxn), 10)
+	}
+
 	return printComma, b
 }
 
@@ -4828,6 +4837,21 @@ func (m *SampledQuery) AppendJSONFields(printComma bool, b redact.RedactableByte
 		b = append(b, "\"SchemaChangerMode\":\""...)
 		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(m.SchemaChangerMode)))
 		b = append(b, '"')
+	}
+
+	if len(m.SQLInstanceIDs) > 0 {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"SQLInstanceIDs\":["...)
+		for i, v := range m.SQLInstanceIDs {
+			if i > 0 {
+				b = append(b, ',')
+			}
+			b = strconv.AppendInt(b, int64(v), 10)
+		}
+		b = append(b, ']')
 	}
 
 	return printComma, b

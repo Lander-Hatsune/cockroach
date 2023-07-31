@@ -5,7 +5,7 @@ source [file join [file dirname $argv0] common.tcl]
 set ::env(COCKROACH_INSECURE) "false"
 set python "python2.7"
 
-spawn $argv demo --empty --no-line-editor --multitenant=true
+spawn $argv demo --empty --no-line-editor --multitenant=true --log-dir=logs
 eexpect "Welcome"
 
 start_test "Check that the cli connect instructions get printed out."
@@ -167,7 +167,7 @@ eexpect ":/# "
 # Check that the cookies work.
 set pyfile [file join [file dirname $argv0] test_auth_cookie.py]
 
-send "$python $pyfile cookie_system.txt 'http://localhost:8080/_admin/v1/users?tenant_name=system'\r"
+send "$python $pyfile cookie_system.txt 'http://localhost:8080/_admin/v1/users?cluster=system'\r"
 eexpect "username"
 eexpect "demo"
 # No tenant name specified -> use default tenant.
@@ -183,14 +183,14 @@ set spawn_id $demo_spawn_id
 send "\\q\r"
 eexpect eof
 
-spawn $argv demo --empty --no-line-editor --multitenant=true
+spawn $argv demo --empty --no-line-editor --multitenant=true --log-dir=logs
 set demo_spawn_id $spawn_id
 eexpect "Welcome"
 eexpect "defaultdb>"
 
 set spawn_id $shell_spawn_id
 
-send "$python $pyfile cookie_system.txt 'http://localhost:8080/_admin/v1/users?tenant_name=system'\r"
+send "$python $pyfile cookie_system.txt 'http://localhost:8080/_admin/v1/users?cluster=system'\r"
 eexpect "username"
 eexpect "demo"
 # No tenant name specified -> use default tenant.
@@ -208,7 +208,7 @@ eexpect eof
 
 
 start_test "Check that the warning for the system tenant is not printed when there are no secondary tenants"
-spawn $argv demo --empty --no-line-editor --multitenant=false
+spawn $argv demo --empty --no-line-editor --multitenant=false --log-dir=logs
 eexpect "Welcome"
 expect {
     "ATTENTION: YOU ARE CONNECTED TO THE SYSTEM TENANT" { exit 1 }

@@ -93,6 +93,7 @@ type ycsb struct {
 	flags     workload.Flags
 	connFlags *workload.ConnFlags
 
+	isoLevel    string
 	timeString  bool
 	insertHash  bool
 	zeroPadding int
@@ -125,8 +126,11 @@ var ycsbMeta = workload.Meta{
 		g := &ycsb{}
 		g.flags.FlagSet = pflag.NewFlagSet(`ycsb`, pflag.ContinueOnError)
 		g.flags.Meta = map[string]workload.FlagMeta{
-			`workload`: {RuntimeOnly: true},
+			`isolation-level`:          {RuntimeOnly: true},
+			`read-modify-write-in-txn`: {RuntimeOnly: true},
+			`workload`:                 {RuntimeOnly: true},
 		}
+		g.flags.StringVar(&g.isoLevel, `isolation-level`, ``, `Isolation level to run workload transactions under [serializable, snapshot, read_committed]. If unset, the workload will run with the default isolation level of the database.`)
 		g.flags.BoolVar(&g.timeString, `time-string`, false, `Prepend field[0-9] data with current time in microsecond precision.`)
 		g.flags.BoolVar(&g.insertHash, `insert-hash`, true, `Key to be hashed or ordered.`)
 		g.flags.IntVar(&g.zeroPadding, `zero-padding`, 1, `Key using "insert-hash=false" has zeros padded to left to make this length of digits.`)
@@ -135,7 +139,7 @@ var ycsbMeta = workload.Meta{
 		g.flags.IntVar(&g.recordCount, `record-count`, 0, `Key to start workload insertions from. Must be >= insert-start + insert-count. (Default: insert-start + insert-count)`)
 		g.flags.BoolVar(&g.json, `json`, false, `Use JSONB rather than relational data.`)
 		g.flags.BoolVar(&g.families, `families`, true, `Place each column in its own column family.`)
-		g.flags.BoolVar(&g.rmwInTxn, `read-modify-write-in-txn`, true, `Run workload F's read-modify-write operation in an explicit transaction.`)
+		g.flags.BoolVar(&g.rmwInTxn, `read-modify-write-in-txn`, false, `Run workload F's read-modify-write operation in an explicit transaction.`)
 		g.flags.BoolVar(&g.sfu, `select-for-update`, true, `Use SELECT FOR UPDATE syntax in read-modify-write operation, if run in an explicit transactions.`)
 		g.flags.IntVar(&g.splits, `splits`, 0, `Number of splits to perform before starting normal operations.`)
 		g.flags.StringVar(&g.workload, `workload`, `B`, `Workload type. Choose from A-F.`)
@@ -376,6 +380,9 @@ func (g *ycsb) Ops(
 ) (workload.QueryLoad, error) {
 	sqlDatabase, err := workload.SanitizeUrls(g, g.connFlags.DBOverride, urls)
 	if err != nil {
+		return workload.QueryLoad{}, err
+	}
+	if err := workload.SetDefaultIsolationLevel(urls, g.isoLevel); err != nil {
 		return workload.QueryLoad{}, err
 	}
 

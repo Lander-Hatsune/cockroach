@@ -21,12 +21,15 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
 )
 
 // TestTenantZip tests the operation of zip for a tenant server.
 func TestTenantZip(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
 	skip.UnderRace(t, "test too slow under race")
 
 	tenants := []struct {
@@ -34,7 +37,7 @@ func TestTenantZip(t *testing.T) {
 		addTenantArgs func(params TestCLIParams) TestCLIParams
 	}{
 		{
-			testName: "testzip tenant separate process",
+			testName: "testzip external process virtualization",
 			addTenantArgs: func(params TestCLIParams) TestCLIParams {
 				tenantDir, tenantDirCleanupFn := testutils.TempDir(t)
 				defer tenantDirCleanupFn()
@@ -47,7 +50,7 @@ func TestTenantZip(t *testing.T) {
 			},
 		},
 		{
-			testName: "testzip shared process tenant",
+			testName: "testzip shared process virtualization",
 			addTenantArgs: func(params TestCLIParams) TestCLIParams {
 				params.SharedProcessTenantArgs = &base.TestSharedProcessTenantArgs{
 					TenantName: "test-tenant",

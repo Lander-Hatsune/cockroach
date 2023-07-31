@@ -133,10 +133,6 @@ func (r *Replica) evalAndPropose(
 		return nil, nil, "", nil, pErr
 	}
 
-	// Attach the endCmds to the proposal and assume responsibility for
-	// releasing the concurrency guard if the proposal makes it to Raft.
-	proposal.ec = endCmds{repl: r, g: g, st: *st}
-
 	// Pull out proposal channel to return. proposal.doneCh may be set to
 	// nil if it is signaled in this function.
 	proposalCh := proposal.doneCh
@@ -156,15 +152,20 @@ func (r *Replica) evalAndPropose(
 		endTxns := proposal.Local.DetachEndTxns(pErr != nil /* alwaysOnly */)
 		r.handleReadWriteLocalEvalResult(ctx, *proposal.Local)
 
-		pr := proposalResult{
-			Reply:              proposal.Local.Reply,
-			Err:                pErr,
-			EncounteredIntents: intents,
-			EndTxns:            endTxns,
-		}
+		// NB: it is intentional that this returns both an error and results.
+		// Some actions should also be taken if the command itself fails. For
+		// example, discovered intents should be pushed to make sure they get
+		// dealt with proactively rather than waiting for a future command to
+		// find them.
+		proposal.ec = makeUnreplicatedEndCmds(r, g, *st)
+		pr := makeProposalResult(proposal.Local.Reply, pErr, intents, endTxns)
 		proposal.finishApplication(ctx, pr)
 		return proposalCh, func() {}, "", nil, nil
 	}
+
+	// Make it a truly replicated proposal. We measure the replication latency
+	// from this point on.
+	proposal.ec = makeReplicatedEndCmds(r, g, *st, timeutil.Now())
 
 	log.VEventf(proposal.ctx, 2,
 		"proposing command to write %d new keys, %d new values, %d new intents, "+
@@ -213,10 +214,7 @@ func (r *Replica) evalAndPropose(
 		// Signal the proposal's response channel immediately.
 		reply := *proposal.Local.Reply
 		reply.Responses = append([]kvpb.ResponseUnion(nil), reply.Responses...)
-		pr := proposalResult{
-			Reply:              &reply,
-			EncounteredIntents: proposal.Local.DetachEncounteredIntents(),
-		}
+		pr := makeProposalResult(&reply, nil /* pErr */, proposal.Local.DetachEncounteredIntents(), nil /* eti */)
 		proposal.signalProposalResult(pr)
 
 		// Continue with proposal...
@@ -321,6 +319,8 @@ func (r *Replica) evalAndPropose(
 		// directly. The raftMu must be locked to modify the context of a
 		// proposal because as soon as we propose a command to Raft, ownership
 		// passes to the "below Raft" machinery.
+		//
+		// See the comment on ProposalData.
 		r.raftMu.Lock()
 		defer r.raftMu.Unlock()
 		r.mu.Lock()
@@ -358,34 +358,11 @@ func (r *Replica) propose(
 ) (pErr *kvpb.Error) {
 	defer tok.DoneIfNotMoved(ctx)
 
-	// If an error occurs reset the command's MaxLeaseIndex to its initial value.
-	// Failure to propose will propagate to the client. An invariant of this
-	// package is that proposals which are finished carry a raft command with a
-	// MaxLeaseIndex equal to the proposal command's max lease index.
-	defer func(prev kvpb.LeaseAppliedIndex) {
-		if useReproposalsV2 {
-			// The following poorly understood code is not necessary in V2 since
-			// we never mutate MaxLeaseIndex and don't hit propose() twice for
-			// the same *ProposalData.
-			return
-		}
-		if pErr != nil {
-			p.command.MaxLeaseIndex = prev
-		}
-	}(p.command.MaxLeaseIndex)
-
-	if !useReproposalsV2 {
-		// Make sure the maximum lease index is unset. This field will be set in
-		// propBuf.Insert and its encoded bytes will be appended to the encoding
-		// buffer as a MaxLeaseFooter.
-		p.command.MaxLeaseIndex = 0
-	} else {
-		if p.command.MaxLeaseIndex > 0 {
-			// TODO: there are a number of other fields that should still be unset.
-			// Verify them all. Some architectural improvements where we pass in a
-			// subset of ProposalData and then complete it here would be even better.
-			return kvpb.NewError(errors.AssertionFailedf("MaxLeaseIndex is set: %+v", p))
-		}
+	if p.command.MaxLeaseIndex > 0 {
+		// TODO: there are a number of other fields that should still be unset.
+		// Verify them all. Some architectural improvements where we pass in a
+		// subset of ProposalData and then complete it here would be even better.
+		return kvpb.NewError(errors.AssertionFailedf("MaxLeaseIndex is set: %+v", p))
 	}
 
 	if crt := p.command.ReplicatedEvalResult.ChangeReplicas; crt != nil {
@@ -580,11 +557,11 @@ var errRemoved = errors.New("replica removed")
 // message. Before doing so, it assures that the replica is unquiesced and ready
 // to handle the request.
 func (r *Replica) stepRaftGroup(req *kvserverpb.RaftMessageRequest) error {
-	// We're processing an incoming raft message (from a batch that may
-	// include MsgVotes), so don't campaign if we wake up our raft
-	// group to avoid election ties.
-	const mayCampaign = false
-	return r.withRaftGroup(mayCampaign, func(raftGroup *raft.RawNode) (bool, error) {
+	return r.withRaftGroup(func(raftGroup *raft.RawNode) (bool, error) {
+		// We're processing an incoming raft message (from a batch that may
+		// include MsgVotes), so don't campaign if we wake up our raft
+		// group.
+		//
 		// If we're a follower, and we receive a message from a non-leader replica
 		// while quiesced, we wake up the leader too to prevent spurious elections.
 		//
@@ -606,7 +583,7 @@ func (r *Replica) stepRaftGroup(req *kvserverpb.RaftMessageRequest) error {
 			hasLeader := st.RaftState == raft.StateFollower && st.Lead != 0
 			fromLeader := uint64(req.FromReplica.ReplicaID) == st.Lead
 			wakeLeader := hasLeader && !fromLeader
-			r.maybeUnquiesceLocked(wakeLeader, mayCampaign)
+			r.maybeUnquiesceLocked(wakeLeader, false /* mayCampaign */)
 		}
 		r.mu.lastUpdateTimes.update(req.FromReplica.ReplicaID, timeutil.Now())
 		switch req.Message.Type {
@@ -792,7 +769,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	}
 	leaderID := r.mu.leaderID
 	lastLeaderID := leaderID
-	err := r.withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
+	err := r.withRaftGroupLocked(func(raftGroup *raft.RawNode) (bool, error) {
 		r.deliverLocalRaftMsgsRaftMuLockedReplicaMuLocked(ctx, raftGroup)
 
 		numFlushed, err := r.mu.proposalBuf.FlushLockedWithRaftGroup(ctx, raftGroup)
@@ -953,6 +930,18 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 			if err := r.applySnapshot(ctx, inSnap, snap, hs, subsumedRepls); err != nil {
 				return stats, errors.Wrap(err, "while applying snapshot")
 			}
+			for _, msg := range msgStorageAppend.Responses {
+				// The caller would like to see the MsgAppResp that usually results from
+				// applying the snapshot synchronously, so fish it out.
+				if msg.To == uint64(inSnap.FromReplica.ReplicaID) &&
+					msg.Type == raftpb.MsgAppResp &&
+					!msg.Reject &&
+					msg.Index == snap.Metadata.Index {
+
+					inSnap.msgAppRespCh <- msg
+					break
+				}
+			}
 			stats.tSnapEnd = timeutil.Now()
 			stats.snap.applied = true
 
@@ -1106,7 +1095,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	// replica ID ensures that our replica ID could not have changed.
 
 	r.mu.Lock()
-	err = r.withRaftGroupLocked(true, func(raftGroup *raft.RawNode) (bool, error) {
+	err = r.withRaftGroupLocked(func(raftGroup *raft.RawNode) (bool, error) {
 		r.deliverLocalRaftMsgsRaftMuLockedReplicaMuLocked(ctx, raftGroup)
 
 		if stats.apply.numConfChangeEntries > 0 {
@@ -1243,7 +1232,7 @@ func (r *Replica) tick(
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// If the raft group is uninitialized, do not initialize on tick.
+	// If the replica has been destroyed, don't tick it.
 	if r.mu.internalRaftGroup == nil {
 		return false, nil
 	}
@@ -1420,13 +1409,10 @@ func (r *Replica) refreshProposalsLocked(
 			if p.command.MaxLeaseIndex <= r.mu.state.LeaseAppliedIndex {
 				r.cleanupFailedProposalLocked(p)
 				log.Eventf(p.ctx, "retry proposal %x: %s", p.idKey, reason)
-				p.finishApplication(ctx, proposalResult{
-					Err: kvpb.NewError(
-						kvpb.NewAmbiguousResultErrorf(
-							"unable to determine whether command was applied via snapshot",
-						),
-					),
-				})
+				p.finishApplication(ctx, makeProposalResultErr(
+					kvpb.NewAmbiguousResultErrorf(
+						"unable to determine whether command was applied via snapshot",
+					)))
 			}
 			continue
 
@@ -1492,9 +1478,8 @@ func (r *Replica) refreshProposalsLocked(
 			p.idKey, p.command.MaxLeaseIndex, p.command.ClosedTimestamp, reason)
 		if err := r.mu.proposalBuf.ReinsertLocked(ctx, p); err != nil {
 			r.cleanupFailedProposalLocked(p)
-			p.finishApplication(ctx, proposalResult{
-				Err: kvpb.NewError(kvpb.NewAmbiguousResultError(err)),
-			})
+			p.finishApplication(ctx, makeProposalResultErr(
+				kvpb.NewAmbiguousResultError(err)))
 		}
 	}
 }
@@ -1512,7 +1497,7 @@ func (r *Replica) poisonInflightLatches(err error) {
 			aErr := kvpb.NewAmbiguousResultError(err)
 			// NB: this does not release the request's latches. It's important that
 			// the latches stay in place, since the command could still apply.
-			p.signalProposalResult(proposalResult{Err: kvpb.NewError(aErr)})
+			p.signalProposalResult(makeProposalResultErr(aErr))
 		}
 	}
 }
@@ -1757,7 +1742,7 @@ func (r *Replica) sendRaftMessage(ctx context.Context, msg raftpb.Message) {
 	fromReplica, fromErr := r.getReplicaDescriptorByIDRLocked(roachpb.ReplicaID(msg.From), lastToReplica)
 	toReplica, toErr := r.getReplicaDescriptorByIDRLocked(roachpb.ReplicaID(msg.To), lastFromReplica)
 	var startKey roachpb.RKey
-	if msg.Type == raftpb.MsgApp && r.mu.internalRaftGroup != nil {
+	if msg.Type == raftpb.MsgApp {
 		// When the follower is potentially an uninitialized replica waiting for
 		// a split trigger, send the replica's StartKey along. See the method
 		// below for more context:
@@ -1854,10 +1839,8 @@ func (r *Replica) reportSnapshotStatus(ctx context.Context, to roachpb.ReplicaID
 	// index it requested is now actually durable on the follower. Note also that
 	// the follower will generate an MsgAppResp reflecting the applied snapshot
 	// which typically moves the follower to StateReplicate when (if) received
-	// by the leader.
-	//
-	// See: https://github.com/cockroachdb/cockroach/issues/87581
-	if err := r.withRaftGroup(true, func(raftGroup *raft.RawNode) (bool, error) {
+	// by the leader, which as of #106793 we do synchronously.
+	if err := r.withRaftGroup(func(raftGroup *raft.RawNode) (bool, error) {
 		raftGroup.ReportSnapshot(uint64(to), snapStatus)
 		return true, nil
 	}); err != nil && !errors.Is(err, errRemoved) {
@@ -1993,48 +1976,26 @@ func (s pendingCmdSlice) Less(i, j int) bool {
 	return s[i].command.MaxLeaseIndex < s[j].command.MaxLeaseIndex
 }
 
-// withRaftGroupLocked calls the supplied function with the (lazily
-// initialized) Raft group. The supplied function should return true for the
-// unquiesceAndWakeLeader argument if the replica should be unquiesced (and the
-// leader awoken). See handleRaftReady for an instance of where this value
-// varies.
+// withRaftGroupLocked calls the supplied function with the Raft group. The
+// supplied function should return true for the unquiesceAndWakeLeader argument
+// if the replica should be unquiesced (and the leader awoken). See
+// handleRaftReady for an instance of where this value varies.
 //
 // Requires that Replica.mu is held.
 //
 // If this Replica is in the process of being removed this method will return
 // errRemoved.
 func (r *Replica) withRaftGroupLocked(
-	mayCampaignOnWake bool, f func(r *raft.RawNode) (unquiesceAndWakeLeader bool, _ error),
+	f func(r *raft.RawNode) (unquiesceAndWakeLeader bool, _ error),
 ) error {
 	if r.mu.destroyStatus.Removed() {
 		// Callers know to detect errRemoved as non-fatal.
 		return errRemoved
 	}
 
-	if r.mu.internalRaftGroup == nil {
-		ctx := r.AnnotateCtx(context.TODO())
-		raftGroup, err := raft.NewRawNode(newRaftConfig(
-			raft.Storage((*replicaRaftStorage)(r)),
-			uint64(r.replicaID),
-			r.mu.state.RaftAppliedIndex,
-			r.store.cfg,
-			&raftLogger{ctx: ctx},
-		))
-		if err != nil {
-			return err
-		}
-		r.mu.internalRaftGroup = raftGroup
+	// INVARIANT: !r.mu.destroyStatus.Removed() → internalRaftGroup != nil
 
-		if mayCampaignOnWake {
-			r.maybeCampaignOnWakeLocked(ctx)
-		}
-	}
-
-	// This wrapper function is a hack to add range IDs to stack traces
-	// using the same pattern as Replica.sendWithRangeID.
-	unquiesce, err := func(rangeID roachpb.RangeID, raftGroup *raft.RawNode) (bool, error) {
-		return f(raftGroup)
-	}(r.RangeID, r.mu.internalRaftGroup)
+	unquiesce, err := f(r.mu.internalRaftGroup)
 	if r.mu.internalRaftGroup.BasicStatus().Lead == 0 {
 		// If we don't know the leader, unquiesce unconditionally. As a
 		// follower, we can't wake up the leader if we don't know who that is,
@@ -2044,14 +2005,14 @@ func (r *Replica) withRaftGroupLocked(
 		// stricter about validating incoming Quiesce requests) but it's good
 		// defense-in-depth.
 		//
-		// Note that maybeUnquiesceAndWakeLeaderLocked won't manage to wake up the
-		// leader since it's unknown to this replica, and at the time of writing the
-		// heuristics for campaigning are defensive (won't campaign if there is a
-		// live leaseholder). But if we are trying to unquiesce because this
-		// follower was asked to propose something, then this means that a request
-		// is going to have to wait until the leader next contacts us, or, in the
-		// worst case, an election timeout. This is not ideal - if a node holds a
-		// live lease, we should direct the client to it immediately.
+		// Note that maybeUnquiesceLocked won't manage to wake up the leader since
+		// it's unknown to this replica, and at the time of writing the heuristics
+		// for campaigning are defensive (won't campaign if there is a live
+		// leaseholder). But if we are trying to unquiesce because this follower was
+		// asked to propose something, then this means that a request is going to
+		// have to wait until the leader next contacts us, or, in the worst case, an
+		// election timeout. This is not ideal - if a node holds a live lease, we
+		// should direct the client to it immediately.
 		unquiesce = true
 	}
 	if unquiesce {
@@ -2060,26 +2021,18 @@ func (r *Replica) withRaftGroupLocked(
 	return err
 }
 
-// withRaftGroup calls the supplied function with the (lazily initialized)
-// Raft group. It acquires and releases the Replica lock, so r.mu must not be
-// held (or acquired by the supplied function).
-//
-// If mayCampaignOnWake is true, the replica may initiate a raft
-// election if it was previously in a dormant state. Most callers
-// should set this to true, because the prevote feature minimizes the
-// disruption from unnecessary elections. The exception is that we
-// should not initiate an election while handling incoming raft
-// messages (which may include MsgVotes from an election in progress,
-// and this election would be disrupted if we started our own).
+// withRaftGroup calls the supplied function with the replica's Raft group. It
+// acquires and releases the Replica lock, so r.mu must not be held (or acquired
+// by the supplied function).
 //
 // If this Replica is in the process of being removed this method will return
 // errRemoved.
 func (r *Replica) withRaftGroup(
-	mayCampaignOnWake bool, f func(r *raft.RawNode) (unquiesceAndWakeLeader bool, _ error),
+	f func(r *raft.RawNode) (unquiesceAndWakeLeader bool, _ error),
 ) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.withRaftGroupLocked(mayCampaignOnWake, f)
+	return r.withRaftGroupLocked(f)
 }
 
 func shouldCampaignOnWake(
@@ -2089,6 +2042,7 @@ func shouldCampaignOnWake(
 	livenessMap livenesspb.IsLiveMap,
 	desc *roachpb.RangeDescriptor,
 	requiresExpirationLease bool,
+	now hlc.Timestamp,
 ) bool {
 	// When waking up a range, campaign unless we know that another
 	// node holds a valid lease (this is most important after a split,
@@ -2128,13 +2082,17 @@ func shouldCampaignOnWake(
 	if !ok {
 		return false
 	}
-	return !livenessEntry.IsLive
+	// NB: we intentionally do not look at the IsLiveMapEntry.IsLive field, which
+	// accounts for whether the leader is reachable from this node (see
+	// Store.updateLivenessMap). We only care whether the leader is currently live
+	// according to node liveness because this determines whether it will be able
+	// to hold an epoch-based lease.
+	return !livenessEntry.Liveness.IsLive(now)
 }
 
-// maybeCampaignOnWakeLocked is called when the replica wakes from a dormant
-// state (either the initial "raftGroup == nil" state or after being quiescent),
-// and campaigns for raft leadership if appropriate: if it has no leader, or it
-// finds a dead leader in liveness.
+// maybeCampaignOnWakeLocked is called when the replica wakes from a quiesced
+// state and campaigns for raft leadership if appropriate: if it has no leader,
+// or it finds a dead leader in liveness.
 //
 // This will use PreVote+CheckQuorum, so it won't disturb an established leader
 // if one currently exists. However, if other replicas wake up to find a dead
@@ -2156,10 +2114,12 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 		return
 	}
 
-	leaseStatus := r.leaseStatusAtRLocked(ctx, r.store.Clock().NowAsClockTimestamp())
+	now := r.store.Clock().NowAsClockTimestamp()
+	leaseStatus := r.leaseStatusAtRLocked(ctx, now)
 	raftStatus := r.mu.internalRaftGroup.BasicStatus()
 	livenessMap, _ := r.store.livenessMap.Load().(livenesspb.IsLiveMap)
-	if shouldCampaignOnWake(leaseStatus, r.store.StoreID(), raftStatus, livenessMap, r.descRLocked(), r.requiresExpirationLeaseRLocked()) {
+	if shouldCampaignOnWake(leaseStatus, r.store.StoreID(), raftStatus, livenessMap, r.descRLocked(),
+		r.requiresExpirationLeaseRLocked(), now.ToTimestamp()) {
 		r.campaignLocked(ctx)
 	}
 }
@@ -2192,13 +2152,17 @@ func (r *Replica) maybeCampaignOnWakeLocked(ctx context.Context) {
 func (r *Replica) maybeForgetLeaderOnVoteRequestLocked() {
 	raftStatus := r.mu.internalRaftGroup.BasicStatus()
 	livenessMap, _ := r.store.livenessMap.Load().(livenesspb.IsLiveMap)
-	if shouldForgetLeaderOnVoteRequest(raftStatus, livenessMap, r.descRLocked()) {
+	now := r.store.Clock().Now()
+	if shouldForgetLeaderOnVoteRequest(raftStatus, livenessMap, r.descRLocked(), now) {
 		r.forgetLeaderLocked(r.AnnotateCtx(context.TODO()))
 	}
 }
 
 func shouldForgetLeaderOnVoteRequest(
-	raftStatus raft.BasicStatus, livenessMap livenesspb.IsLiveMap, desc *roachpb.RangeDescriptor,
+	raftStatus raft.BasicStatus,
+	livenessMap livenesspb.IsLiveMap,
+	desc *roachpb.RangeDescriptor,
+	now hlc.Timestamp,
 ) bool {
 	// If we're not a follower with a leader, there's noone to forget.
 	if raftStatus.RaftState != raft.StateFollower || raftStatus.Lead == raft.None {
@@ -2219,7 +2183,13 @@ func shouldForgetLeaderOnVoteRequest(
 	}
 
 	// Forget the leader if it's no longer live.
-	return !livenessEntry.IsLive
+	//
+	// NB: we intentionally do not look at the IsLiveMapEntry.IsLive field, which
+	// accounts for whether the leader is reachable from this node (see
+	// Store.updateLivenessMap). We only care whether the leader is currently live
+	// according to node liveness because this determines whether it will be able
+	// to hold an epoch-based lease.
+	return !livenessEntry.Liveness.IsLive(now)
 }
 
 // shouldCampaignOnLeaseRequestRedirect returns whether a replica that is
@@ -2601,7 +2571,10 @@ func handleTruncatedStateBelowRaftPreApply(
 		// avoid allocating when constructing Raft log keys (16 bytes).
 		prefix := prefixBuf.RaftLogPrefix()
 		for idx := currentTruncatedState.Index + 1; idx <= suggestedTruncatedState.Index; idx++ {
-			if err := readWriter.ClearUnversioned(keys.RaftLogKeyFromPrefix(prefix, idx)); err != nil {
+			if err := readWriter.ClearUnversioned(
+				keys.RaftLogKeyFromPrefix(prefix, idx),
+				storage.ClearOptions{},
+			); err != nil {
 				return false, errors.Wrapf(err, "unable to clear truncated Raft entries for %+v at index %d",
 					suggestedTruncatedState, idx)
 			}
@@ -2613,12 +2586,10 @@ func handleTruncatedStateBelowRaftPreApply(
 	if err := storage.MVCCPutProto(
 		ctx,
 		readWriter,
-		nil, /* ms */
 		prefixBuf.RaftTruncatedStateKey(),
 		hlc.Timestamp{},
-		hlc.ClockTimestamp{},
-		nil, /* txn */
 		suggestedTruncatedState,
+		storage.MVCCWriteOptions{},
 	); err != nil {
 		return false, errors.Wrap(err, "unable to write RaftTruncatedState")
 	}
@@ -2658,9 +2629,9 @@ func ComputeRaftLogSize(
 }
 
 // shouldCampaignAfterConfChange returns true if the current replica should
-// campaign after a conf change. If the leader replica is removed, the
-// leaseholder should campaign. We don't want to campaign on multiple replicas,
-// since that would cause ties.
+// campaign after a conf change. If the leader replica is demoted or removed,
+// the leaseholder should campaign. We don't want to campaign on multiple
+// replicas, since that would cause ties.
 //
 // If there is no current leaseholder we'll have to wait out the election
 // timeout before someone campaigns, but that's ok -- either we'll have to wait
@@ -2677,7 +2648,7 @@ func shouldCampaignAfterConfChange(
 	raftStatus raft.BasicStatus,
 	leaseStatus kvserverpb.LeaseStatus,
 ) bool {
-	if raftStatus.Lead == 0 {
+	if raftStatus.Lead == raft.None {
 		// Leader unknown. We can't know if it was removed by the conf change, and
 		// because we force an election without prevote we don't want to risk
 		// throwing spurious elections.
@@ -2692,9 +2663,11 @@ func shouldCampaignAfterConfChange(
 		// don't expect to hit this, but let's be defensive.
 		return false
 	}
-	if _, ok := desc.GetReplicaDescriptorByID(roachpb.ReplicaID(raftStatus.Lead)); ok {
-		// The leader is still in the descriptor.
-		return false
+	if replDesc, ok := desc.GetReplicaDescriptorByID(roachpb.ReplicaID(raftStatus.Lead)); ok {
+		if replDesc.IsAnyVoter() {
+			// The leader is still a voter in the descriptor.
+			return false
+		}
 	}
 	// Prior to 23.2, the first voter in the descriptor campaigned, so we do
 	// the same in mixed-version clusters to avoid ties.

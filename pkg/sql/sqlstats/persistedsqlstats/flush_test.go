@@ -15,13 +15,10 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math"
-	"net/url"
 	"testing"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
@@ -35,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -88,37 +86,20 @@ func TestSQLStatsFlush(t *testing.T) {
 	stopper := stop.NewStopper()
 	defer stopper.Stop(ctx)
 
-	firstServer := testCluster.Server(0 /* idx */)
-	secondServer := testCluster.Server(1 /* idx */)
+	firstServer := testCluster.Server(0 /* idx */).ApplicationLayer()
+	secondServer := testCluster.Server(1 /* idx */).ApplicationLayer()
 
-	firstPgURL, firstServerConnCleanup := sqlutils.PGUrl(
-		t, firstServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(username.RootUser))
-	defer firstServerConnCleanup()
-
-	secondPgURL, secondServerConnCleanup := sqlutils.PGUrl(
-		t, secondServer.ServingSQLAddr(), "CreateConnections" /* prefix */, url.User(username.RootUser))
-	defer secondServerConnCleanup()
-
-	pgFirstSQLConn, err := gosql.Open("postgres", firstPgURL.String())
-	require.NoError(t, err)
+	pgFirstSQLConn := firstServer.SQLConn(t, "")
 	firstSQLConn := sqlutils.MakeSQLRunner(pgFirstSQLConn)
 
-	pgSecondSQLConn, err := gosql.Open("postgres", secondPgURL.String())
-	require.NoError(t, err)
+	pgSecondSQLConn := secondServer.SQLConn(t, "")
 	secondSQLConn := sqlutils.MakeSQLRunner(pgSecondSQLConn)
 
 	firstServerSQLStats := firstServer.SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
 	secondServerSQLStats := secondServer.SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
 
-	defer func() {
-		err := pgFirstSQLConn.Close()
-		require.NoError(t, err)
-		err = pgSecondSQLConn.Close()
-		require.NoError(t, err)
-	}()
 	firstSQLConn.Exec(t, "SET application_name = 'flush_unit_test'")
 	secondSQLConn.Exec(t, "SET application_name = 'flush_unit_test'")
-	require.NoError(t, err)
 
 	// Regular inserts.
 	{
@@ -140,8 +121,8 @@ func TestSQLStatsFlush(t *testing.T) {
 		// For each test case, we verify that it's being properly inserted exactly
 		// once and it is exactly executed tc.count number of times.
 		for _, tc := range testQueries {
-			verifyNumOfInsertedEntries(t, secondSQLConn, tc.fingerprint, firstServer.NodeID(), 1 /* expectedStmtEntryCnt */, 1 /* expectedTxnEntryCtn */)
-			verifyInsertedFingerprintExecCount(t, secondSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), firstServer.NodeID(), tc.count)
+			verifyNumOfInsertedEntries(t, secondSQLConn, tc.fingerprint, firstServer.SQLInstanceID(), 1 /* expectedStmtEntryCnt */, 1 /* expectedTxnEntryCtn */)
+			verifyInsertedFingerprintExecCount(t, secondSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), firstServer.SQLInstanceID(), tc.count)
 		}
 	}
 
@@ -165,10 +146,10 @@ func TestSQLStatsFlush(t *testing.T) {
 		verifyInMemoryStatsEmpty(t, testQueries, secondServerSQLStats)
 
 		for _, tc := range testQueries {
-			verifyNumOfInsertedEntries(t, secondSQLConn, tc.fingerprint, firstServer.NodeID(), 1 /* expectedStmtEntryCnt */, 1 /* expectedTxnEntryCtn */)
+			verifyNumOfInsertedEntries(t, secondSQLConn, tc.fingerprint, firstServer.SQLInstanceID(), 1 /* expectedStmtEntryCnt */, 1 /* expectedTxnEntryCtn */)
 			// The execution count is doubled here because we execute all of the
 			// statements here in the same aggregation interval.
-			verifyInsertedFingerprintExecCount(t, secondSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), firstServer.NodeID(), tc.count+tc.count-1 /* expectedCount */)
+			verifyInsertedFingerprintExecCount(t, secondSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), firstServer.SQLInstanceID(), tc.count+tc.count-1 /* expectedCount */)
 		}
 	}
 
@@ -192,8 +173,8 @@ func TestSQLStatsFlush(t *testing.T) {
 
 		for _, tc := range testQueries {
 			// We expect exactly 2 entries since we are in a different aggregation window.
-			verifyNumOfInsertedEntries(t, secondSQLConn, tc.fingerprint, firstServer.NodeID(), 2 /* expectedStmtEntryCnt */, 2 /* expectedTxnEntryCtn */)
-			verifyInsertedFingerprintExecCount(t, secondSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), firstServer.NodeID(), tc.count)
+			verifyNumOfInsertedEntries(t, secondSQLConn, tc.fingerprint, firstServer.SQLInstanceID(), 2 /* expectedStmtEntryCnt */, 2 /* expectedTxnEntryCtn */)
+			verifyInsertedFingerprintExecCount(t, secondSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), firstServer.SQLInstanceID(), tc.count)
 		}
 	}
 
@@ -202,7 +183,6 @@ func TestSQLStatsFlush(t *testing.T) {
 		for _, tc := range testQueries {
 			for i := int64(0); i < tc.count; i++ {
 				secondSQLConn.Exec(t, tc.query)
-				require.NoError(t, err)
 			}
 		}
 		verifyInMemoryStatsEmpty(t, testQueries, firstServerSQLStats)
@@ -217,10 +197,10 @@ func TestSQLStatsFlush(t *testing.T) {
 		// Ensure that we encode the correct node_id for the new entry and did not
 		// accidentally tamper the entries written by another server.
 		for _, tc := range testQueries {
-			verifyNumOfInsertedEntries(t, firstSQLConn, tc.fingerprint, secondServer.NodeID(), 1 /* expectedStmtEntryCnt */, 1 /* expectedTxnEntryCtn */)
-			verifyInsertedFingerprintExecCount(t, firstSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), secondServer.NodeID(), tc.count)
-			verifyNumOfInsertedEntries(t, secondSQLConn, tc.fingerprint, firstServer.NodeID(), 2 /* expectedStmtEntryCnt */, 2 /* expectedTxnEntryCtn */)
-			verifyInsertedFingerprintExecCount(t, secondSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), firstServer.NodeID(), tc.count)
+			verifyNumOfInsertedEntries(t, firstSQLConn, tc.fingerprint, secondServer.SQLInstanceID(), 1 /* expectedStmtEntryCnt */, 1 /* expectedTxnEntryCtn */)
+			verifyInsertedFingerprintExecCount(t, firstSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), secondServer.SQLInstanceID(), tc.count)
+			verifyNumOfInsertedEntries(t, secondSQLConn, tc.fingerprint, firstServer.SQLInstanceID(), 2 /* expectedStmtEntryCnt */, 2 /* expectedTxnEntryCtn */)
+			verifyInsertedFingerprintExecCount(t, secondSQLConn, tc.fingerprint, fakeTime.getAggTimeTs(), firstServer.SQLInstanceID(), tc.count)
 		}
 	}
 }
@@ -230,9 +210,9 @@ func TestSQLStatsInitialDelay(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	params, _ := tests.CreateTestServerParams()
-	s, _, _ := serverutils.StartServer(t, params)
-
-	defer s.Stopper().Stop(context.Background())
+	srv := serverutils.StartServerOnly(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	initialNextFlushAt := s.SQLServer().(*sql.Server).
 		GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats).GetNextFlushAt()
@@ -261,9 +241,9 @@ func TestSQLStatsMinimumFlushInterval(t *testing.T) {
 	params.Knobs.SQLStatsKnobs = &sqlstats.TestingKnobs{
 		StubTimeNow: fakeTime.Now,
 	}
-	s, conn, _ := serverutils.StartServer(t, params)
-
-	defer s.Stopper().Stop(context.Background())
+	srv, conn, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
 	sqlConn := sqlutils.MakeSQLRunner(conn)
 
@@ -324,11 +304,11 @@ func TestInMemoryStatsDiscard(t *testing.T) {
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
-	s, conn, _ := serverutils.StartServer(t, params)
-	observer :=
-		serverutils.OpenDBConn(t, s.ServingSQLAddr(), "", false /* insecure */, s.Stopper())
+	srv, conn, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
 
-	defer s.Stopper().Stop(context.Background())
+	observer := s.SQLConn(t, "")
 
 	sqlConn := sqlutils.MakeSQLRunner(conn)
 	sqlConn.Exec(t,
@@ -436,8 +416,10 @@ func TestSQLStatsGatewayNodeSetting(t *testing.T) {
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
-	s, conn, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, conn, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
+
 	sqlConn := sqlutils.MakeSQLRunner(conn)
 
 	// Gateway Node ID enabled, so should persist the value.
@@ -478,8 +460,10 @@ func TestSQLStatsPersistedLimitReached(t *testing.T) {
 
 	ctx := context.Background()
 	params, _ := tests.CreateTestServerParams()
-	s, conn, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(context.Background())
+	srv, conn, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
+
 	sqlConn := sqlutils.MakeSQLRunner(conn)
 	pss := s.SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
 
@@ -524,7 +508,172 @@ func TestSQLStatsPersistedLimitReached(t *testing.T) {
 	// 5. Assert that neither table has grown in length.
 	require.Equal(t, stmtStatsCountFlush3, stmtStatsCountFlush2)
 	require.Equal(t, txnStatsCountFlush3, txnStatsCountFlush2)
+}
 
+func TestSQLStatsReadLimitSizeOnLockedTable(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(context.Background())
+	s := srv.ApplicationLayer()
+
+	sqlConn := sqlutils.MakeSQLRunner(conn)
+	sqlConn.Exec(t, `INSERT INTO system.users VALUES ('node', NULL, true, 3); GRANT node TO root`)
+	waitForFollowerReadTimestamp(t, sqlConn)
+	pss := s.SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
+
+	const minNumExpectedStmts = int64(3)
+	// Maximum number of persisted rows less than minNumExpectedStmts/1.5
+	const maxNumPersistedRows = 1
+	sqlConn.Exec(t, "SELECT 1")
+	sqlConn.Exec(t, "SELECT 1, 2")
+	sqlConn.Exec(t, "SELECT 1, 2, 3")
+
+	pss.Flush(ctx)
+	stmtStatsCountFlush, _ := countStats(t, sqlConn)
+
+	// Ensure we have some rows in system.statement_statistics
+	require.GreaterOrEqual(t, stmtStatsCountFlush, minNumExpectedStmts)
+
+	// Set sql.stats.persisted_rows.max
+	sqlConn.Exec(t, fmt.Sprintf("SET CLUSTER SETTING sql.stats.persisted_rows.max=%d", maxNumPersistedRows))
+	testutils.SucceedsSoon(t, func() error {
+		var appliedSetting int
+		row := sqlConn.QueryRow(t, "SHOW CLUSTER SETTING sql.stats.persisted_rows.max")
+		row.Scan(&appliedSetting)
+		if appliedSetting != maxNumPersistedRows {
+			return errors.Newf("waiting for sql.stats.persisted_rows.max to be applied")
+		}
+		return nil
+	})
+
+	// Begin a transaction.
+	sqlConn.Exec(t, "BEGIN")
+	// Lock the table. Create a state of contention.
+	sqlConn.Exec(t, "SELECT * FROM system.statement_statistics FOR UPDATE")
+
+	// Ensure that we can read from the table despite it being locked, due to the follower read (AOST).
+	// Expect that the number of statements in the table exceeds sql.stats.persisted_rows.max * 1.5
+	// (meaning that the limit will be reached) and no error. We need SucceedsSoon here for the follower
+	// read timestamp to catch up enough for this state to be reached.
+	testutils.SucceedsSoon(t, func() error {
+		limitReached, err := pss.StmtsLimitSizeReached(ctx)
+		if limitReached != true {
+			return errors.New("waiting for limit reached to be true")
+		}
+		return err
+	})
+
+	// Close the transaction.
+	sqlConn.Exec(t, "COMMIT")
+}
+
+func TestSQLStatsPlanSampling(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	stubTime := &stubTime{}
+	setTime := func(inputTime string) {
+		parsedTime, err := time.Parse(time.RFC3339, inputTime)
+		require.NoError(t, err)
+		stubTime.setTime(parsedTime)
+	}
+
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs.SQLStatsKnobs.(*sqlstats.TestingKnobs).StubTimeNow = stubTime.Now
+
+	ctx := context.Background()
+	srv, conn, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	s := srv.ApplicationLayer()
+
+	sqlRun := sqlutils.MakeSQLRunner(conn)
+
+	dbName := "defaultdb"
+
+	appName := fmt.Sprintf("TestSQLStatsPlanSampling_%s", uuid.FastMakeV4().String())
+	sqlRun.Exec(t, "SET application_name = $1", appName)
+
+	sqlStats := s.SQLServer().(*sql.Server).GetSQLStatsProvider().(*persistedsqlstats.PersistedSQLStats)
+	appStats := sqlStats.GetApplicationStats(appName, false)
+
+	sqlRun.Exec(t, `SET CLUSTER SETTING sql.metrics.statement_details.plan_collection.enabled = true;`)
+	sqlRun.Exec(t, `SET CLUSTER SETTING sql.txn_stats.sample_rate = 0;`)
+
+	validateSample := func(fingerprint string, implicitTxn bool, expectedPreviouslySampledState bool, expectedSavePlanForStatsState bool) {
+
+		previouslySampled, savePlanForStats := appStats.ShouldSample(
+			fingerprint,
+			implicitTxn,
+			dbName,
+		)
+
+		errMessage := fmt.Sprintf("validate: %s, implicit: %t expected sample before: %t, actual sample before: %t, exptected save plan: %t actual save plan: %t\n",
+			fingerprint, implicitTxn, expectedPreviouslySampledState, previouslySampled, expectedSavePlanForStatsState, savePlanForStats)
+		require.Equal(t, expectedSavePlanForStatsState, savePlanForStats, errMessage)
+		require.Equal(t, expectedPreviouslySampledState, previouslySampled, errMessage)
+	}
+
+	setTime("2021-09-20T15:00:00Z")
+
+	// Logical plan should be sampled here, since we have not collected logical plan
+	// at all.
+	validateSample("SELECT _", true, false, true)
+
+	// Execute the query to trigger a collection of logical plan.
+	// (db_name=defaultdb implicitTxn=true fingerprint=SELECT _)
+	_, err := conn.ExecContext(ctx, "SELECT 1")
+	require.NoError(t, err)
+
+	// Ensure that if a query is to be subsequently executed, it will not cause
+	// logical plan sampling.
+	validateSample("SELECT _", true, true, false)
+
+	// However, if we are to execute the same statement but under explicit
+	// transaction, the plan will still need to be sampled.
+	validateSample("SELECT _", false, false, true)
+
+	// Execute the statement under explicit transaction.
+	// (db_name=defaultdb implicitTxn=false fingerprint=SELECT _)
+	tx, err := conn.BeginTx(ctx, &gosql.TxOptions{})
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, "SELECT 1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// Ensure that the subsequent execution of the query will not cause logical plan
+	// collection.
+	validateSample("SELECT _", false, true, false)
+
+	// Set the time to the future and ensure we will resample the logical plan.
+	setTime("2021-09-20T15:05:01Z")
+
+	// If tracing is not enabled the statement will not be sampled. To update the
+	// save plan for stats last sampled time the statement must have tracing enabled.
+	_, err = conn.ExecContext(ctx, "SET CLUSTER SETTING sql.txn_stats.sample_rate = 1;")
+	require.NoError(t, err)
+
+	validateSample("SELECT _", true, true, true)
+
+	// implicit txn
+	_, err = conn.ExecContext(ctx, "SELECT 1")
+	require.NoError(t, err)
+	validateSample("SELECT _", true, true, false)
+
+	// explicit txn
+	validateSample("SELECT _", false, true, true)
+
+	tx, err = conn.BeginTx(ctx, &gosql.TxOptions{})
+	require.NoError(t, err)
+	_, err = tx.ExecContext(ctx, "SELECT 1")
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+
+	// Ensure that the subsequent execution of the query will not cause logical plan
+	// collection.
+	validateSample("SELECT _", false, true, false)
 }
 
 type stubTime struct {
@@ -565,7 +714,7 @@ func verifyInsertedFingerprintExecCount(
 	sqlConn *sqlutils.SQLRunner,
 	fingerprint string,
 	ts time.Time,
-	nodeID roachpb.NodeID,
+	instanceID base.SQLInstanceID,
 	expectedCount int64,
 ) {
 	row := sqlConn.Query(t,
@@ -584,7 +733,7 @@ WHERE S.metadata ->> 'query' = $1
     AND S.node_id = T.node_id
     AND S.aggregated_ts = T.aggregated_ts
     AND S.app_name = T.app_name
-`, fingerprint, ts, nodeID)
+`, fingerprint, ts, instanceID)
 
 	require.True(t, row.Next(), "no stats found for fingerprint: %s", fingerprint)
 
@@ -602,7 +751,7 @@ func verifyNumOfInsertedEntries(
 	t *testing.T,
 	sqlConn *sqlutils.SQLRunner,
 	fingerprint string,
-	nodeID roachpb.NodeID,
+	instanceID base.SQLInstanceID,
 	expectedStmtEntryCnt, expectedTxnEntryCnt int64,
 ) {
 	row2 := sqlConn.DB.QueryRowContext(context.Background(),
@@ -618,7 +767,7 @@ WHERE
   app_name = 'flush_unit_test'
 GROUP BY
   (fingerprint_id, node_id)
-`, fingerprint, nodeID)
+`, fingerprint, instanceID)
 
 	var stmtFingerprintID string
 	var numOfInsertedStmtEntry int64
@@ -639,7 +788,7 @@ WHERE
   app_name = 'flush_unit_test'
 GROUP BY
   (fingerprint_id, node_id)
-`, stmtFingerprintID), nodeID)
+`, stmtFingerprintID), instanceID)
 
 	var numOfInsertedTxnEntry int64
 	err := row1.Scan(&numOfInsertedTxnEntry)
@@ -651,7 +800,7 @@ func verifyInMemoryStatsCorrectness(
 	t *testing.T, tcs []testCase, statsProvider *persistedsqlstats.PersistedSQLStats,
 ) {
 	for _, tc := range tcs {
-		err := statsProvider.SQLStats.IterateStatementStats(context.Background(), &sqlstats.IteratorOptions{}, func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
+		err := statsProvider.SQLStats.IterateStatementStats(context.Background(), sqlstats.IteratorOptions{}, func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 			if tc.fingerprint == statistics.Key.Query {
 				require.Equal(t, tc.count, statistics.Stats.Count, "fingerprint: %s", tc.fingerprint)
 			}
@@ -678,7 +827,7 @@ func verifyInMemoryStatsEmpty(
 	t *testing.T, tcs []testCase, statsProvider *persistedsqlstats.PersistedSQLStats,
 ) {
 	for _, tc := range tcs {
-		err := statsProvider.SQLStats.IterateStatementStats(context.Background(), &sqlstats.IteratorOptions{}, func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
+		err := statsProvider.SQLStats.IterateStatementStats(context.Background(), sqlstats.IteratorOptions{}, func(ctx context.Context, statistics *appstatspb.CollectedStatementStatistics) error {
 			if tc.fingerprint == statistics.Key.Query {
 				require.Equal(t, 0 /* expected */, statistics.Stats.Count, "fingerprint: %s", tc.fingerprint)
 			}
@@ -719,4 +868,18 @@ WHERE
 	}
 	require.Equal(t, nodeID, gatewayNodeID, "Gateway NodeID")
 	require.Equal(t, "[1]", allNodesIds, "All NodeIDs from statistics")
+}
+
+func waitForFollowerReadTimestamp(t *testing.T, sqlConn *sqlutils.SQLRunner) {
+	var hlcTimestamp time.Time
+	sqlConn.QueryRow(t, `SELECT hlc_to_timestamp(cluster_logical_timestamp())`).Scan(&hlcTimestamp)
+
+	testutils.SucceedsSoon(t, func() error {
+		var followerReadTimestamp time.Time
+		sqlConn.QueryRow(t, `SELECT follower_read_timestamp()`).Scan(&followerReadTimestamp)
+		if followerReadTimestamp.Before(hlcTimestamp) {
+			return errors.New("waiting for follower_read_timestamp to be passed hlc timestamp")
+		}
+		return nil
+	})
 }

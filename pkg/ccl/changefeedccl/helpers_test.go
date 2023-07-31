@@ -94,8 +94,7 @@ func readNextMessages(
 			return nil, ctx.Err()
 		}
 		if log.V(1) {
-			log.Infof(context.Background(), "About to read a message (%d out of %d) from %v (%T)",
-				len(actual), numMessages, f, f)
+			log.Infof(context.Background(), "About to read a message (%d out of %d)", len(actual), numMessages)
 		}
 		m, err := f.Next()
 		if log.V(1) {
@@ -395,7 +394,7 @@ func startTestFullServer(
 		Knobs: knobs,
 		// This test suite is already probabilistically running with
 		// tenants. No need for the test tenant.
-		DefaultTestTenant: base.TestTenantDisabled,
+		DefaultTestTenant: base.TODOTestTenantDisabled,
 		UseDatabase:       `d`,
 		ExternalIODir:     options.externalIODir,
 		Settings:          options.settings,
@@ -473,7 +472,7 @@ func startTestCluster(t testing.TB) (serverutils.TestClusterInterface, *gosql.DB
 }
 
 func waitForTenantPodsActive(
-	t testing.TB, tenantServer serverutils.TestTenantInterface, numPods int,
+	t testing.TB, tenantServer serverutils.ApplicationLayerInterface, numPods int,
 ) {
 	testutils.SucceedsWithin(t, func() error {
 		status := tenantServer.StatusServer().(serverpb.SQLStatusServer)
@@ -491,7 +490,7 @@ func waitForTenantPodsActive(
 
 func startTestTenant(
 	t testing.TB, systemServer serverutils.TestServerInterface, options feedTestOptions,
-) (roachpb.TenantID, serverutils.TestTenantInterface, *gosql.DB, func()) {
+) (roachpb.TenantID, serverutils.ApplicationLayerInterface, *gosql.DB, func()) {
 	knobs := base.TestingKnobs{
 		DistSQL:          &execinfra.TestingKnobs{Changefeed: &TestingKnobs{}},
 		JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
@@ -667,7 +666,9 @@ func serverArgsRegion(args base.TestServerArgs) string {
 // expectNotice creates a pretty crude database connection that doesn't involve
 // a lot of cdc test framework, use with caution. Driver-agnostic tools don't
 // have clean ways of inspecting incoming notices.
-func expectNotice(t *testing.T, s serverutils.TestTenantInterface, sql string, expected string) {
+func expectNotice(
+	t *testing.T, s serverutils.ApplicationLayerInterface, sql string, expected string,
+) {
 	url, cleanup := sqlutils.PGUrl(t, s.SQLAddr(), t.Name(), url.User(username.RootUser))
 	defer cleanup()
 	base, err := pq.NewConnector(url.String())
@@ -686,6 +687,19 @@ func expectNotice(t *testing.T, s serverutils.TestTenantInterface, sql string, e
 	sqlDB.Exec(t, sql)
 
 	require.Equal(t, expected, actual)
+}
+
+func loadProgress(
+	t *testing.T, jobFeed cdctest.EnterpriseTestFeed, jobRegistry *jobs.Registry,
+) jobspb.Progress {
+	t.Helper()
+	jobID := jobFeed.JobID()
+	job, err := jobRegistry.LoadJob(context.Background(), jobID)
+	require.NoError(t, err)
+	if job.Status().Terminal() {
+		t.Errorf("tried to load progress for job %v but it has reached terminal status %s with error %s", job, job.Status(), jobFeed.FetchTerminalJobErr())
+	}
+	return job.Progress()
 }
 
 func feed(
@@ -750,7 +764,7 @@ func closeFeedIgnoreError(t testing.TB, f cdctest.TestFeed) {
 // of a test running as the system tenant or a secondary tenant
 type TestServer struct {
 	DB           *gosql.DB
-	Server       serverutils.TestTenantInterface
+	Server       serverutils.ApplicationLayerInterface
 	Codec        keys.SQLCodec
 	TestingKnobs base.TestingKnobs
 }
@@ -900,7 +914,7 @@ func addCloudStorageOptions(t *testing.T, options *feedTestOptions) (cleanup fun
 func makeFeedFactory(
 	t *testing.T,
 	sinkType string,
-	s serverutils.TestTenantInterface,
+	s serverutils.ApplicationLayerInterface,
 	db *gosql.DB,
 	testOpts ...feedTestOption,
 ) (factory cdctest.TestFeedFactory, sinkCleanup func()) {
@@ -912,9 +926,9 @@ func makeFeedFactoryWithOptions(
 	t *testing.T, sinkType string, srvOrCluster interface{}, db *gosql.DB, options feedTestOptions,
 ) (factory cdctest.TestFeedFactory, sinkCleanup func()) {
 	t.Logf("making %s feed factory", sinkType)
-	s := func() serverutils.TestTenantInterface {
+	s := func() serverutils.ApplicationLayerInterface {
 		switch s := srvOrCluster.(type) {
-		case serverutils.TestTenantInterface:
+		case serverutils.ApplicationLayerInterface:
 			return s
 		case serverutils.TestClusterInterface:
 			return s.Server(0)
@@ -995,7 +1009,7 @@ func makeFeedFactoryWithOptions(
 }
 
 func getInitialDBForEnterpriseFactory(
-	t *testing.T, s serverutils.TestTenantInterface, rootDB *gosql.DB, opts feedTestOptions,
+	t *testing.T, s serverutils.ApplicationLayerInterface, rootDB *gosql.DB, opts feedTestOptions,
 ) (*gosql.DB, func()) {
 	// Instead of creating enterprise changefeeds on the root connection, we may
 	// choose to create them on a test user connection. This user should have the

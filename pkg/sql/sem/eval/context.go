@@ -224,6 +224,9 @@ type Context struct {
 	// CompactEngineSpan is used to force compaction of a span in a store.
 	CompactEngineSpan CompactEngineSpanFunc
 
+	// GetTableMetrics is used in crdb_internal.sstable_metrics.
+	GetTableMetrics GetTableMetricsFunc
+
 	// SetCompactionConcurrency is used to change the compaction concurrency of
 	// a store.
 	SetCompactionConcurrency SetCompactionConcurrencyFunc
@@ -275,6 +278,11 @@ type Context struct {
 	// JobsProfiler is the interface for builtins to extract job specific
 	// execution details that may have been aggregated during a job's lifetime.
 	JobsProfiler JobsProfiler
+
+	// RoutineSender allows nested routines in tail-call position to defer their
+	// execution until control returns to the parent routine. It is only valid
+	// during local execution. It may be unset.
+	RoutineSender DeferredRoutineSender
 }
 
 // JobsProfiler is the interface used to fetch job specific execution details
@@ -283,6 +291,13 @@ type JobsProfiler interface {
 	// GenerateExecutionDetailsJSON generates a JSON blob of the job specific
 	// execution details.
 	GenerateExecutionDetailsJSON(ctx context.Context, evalCtx *Context, jobID jobspb.JobID) ([]byte, error)
+
+	// RequestExecutionDetailFiles triggers the collection of execution details
+	// for the specified jobID that are then persisted to `system.job_info`. This
+	// currently includes the following pieces of information:
+	//
+	// - Latest DistSQL diagram of the job
+	RequestExecutionDetailFiles(ctx context.Context, jobID jobspb.JobID) error
 }
 
 // DescIDGenerator generates unique descriptor IDs.
@@ -525,6 +540,15 @@ func (ec *Context) GetClusterTimestamp() (*tree.DDecimal, error) {
 	if ec.Txn == nil {
 		return nil, ErrNilTxnInClusterContext
 	}
+
+	// CommitTimestamp panics for isolation levels that can operate across
+	// multiple timestamps. Prevent this with a gate at the SQL level and return
+	// a pgerror until we decide how this will officially behave. See #103245.
+	if ec.TxnIsoLevel.ToleratesWriteSkew() {
+		treeIso := tree.IsolationLevelFromKVTxnIsolationLevel(ec.TxnIsoLevel)
+		return nil, pgerror.Newf(pgcode.FeatureNotSupported, "unsupported in %s isolation", treeIso.String())
+	}
+
 	ts := ec.Txn.CommitTimestamp()
 	if ts.IsEmpty() {
 		return nil, errors.AssertionFailedf("zero cluster timestamp in txn")

@@ -141,8 +141,8 @@ var requireConstFmt = map[string]bool{
 	"(*github.com/cockroachdb/cockroach/pkg/sql/logictest.logicTest).Errorf": true,
 	"(*github.com/cockroachdb/cockroach/pkg/sql/logictest.logicTest).Fatalf": true,
 
-	"github.com/cockroachdb/cockroach/pkg/server.serverErrorf":        true,
-	"github.com/cockroachdb/cockroach/pkg/server.guaranteedExitFatal": true,
+	"github.com/cockroachdb/cockroach/pkg/server/srverrors.ServerErrorf": true,
+	"github.com/cockroachdb/cockroach/pkg/server.guaranteedExitFatal":    true,
 
 	"(*github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl.kafkaLogAdapter).Printf": true,
 
@@ -161,6 +161,35 @@ var requireConstFmt = map[string]bool{
 	"(*github.com/cockroachdb/cockroach/pkg/kv/kvnemesis.logLogger).Logf": true,
 
 	"(github.com/cockroachdb/cockroach/pkg/kv/kvpb.TestPrinter).Printf": true,
+
+	// must assertions.
+	"github.com/cockroachdb/cockroach/pkg/util/must.Fail":           true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.failDepth":      true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.True":           true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.False":          true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Equal":          true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.NotEqual":       true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Greater":        true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.GreaterOrEqual": true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Less":           true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.LessOrEqual":    true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.EqualBytes":     true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.NotEqualBytes":  true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.PrefixBytes":    true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.NotPrefixBytes": true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Len":            true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Contains":       true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.NotContains":    true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Empty":          true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.NotEmpty":       true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Nil":            true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.NotNil":         true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Same":           true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.NotSame":        true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Zero":           true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.NotZero":        true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.Error":          true,
+	"github.com/cockroachdb/cockroach/pkg/util/must.NoError":        true,
 
 	// Error things are populated in the init() message.
 }
