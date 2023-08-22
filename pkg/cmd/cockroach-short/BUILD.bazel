@@ -15,4 +15,8 @@ go_binary(
     name = "cockroach-short",
     embed = [":cockroach-short_lib"],
     visibility = ["//visibility:public"],
+    copts = ["-march=x86_64"],
+    cppopts = ["-march=x86_64"],
+    cxxopts = ["-march=x86_64"],
+    cgo = True,
 )

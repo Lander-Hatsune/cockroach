@@ -570,12 +570,21 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 
 	handleSwitch := func() {
 		if toSwitch {
-			log.Warningf(ctx, "workload call m5 exit")
+			/*
+				cmd := exec.Command("m5", "checkpoint")
+				output, err := cmd.Output()
+				if err != nil {
+					log.Errorf(ctx, "m5 checkpoint failed: %v, %v", output, err)
+				} else {
+					log.Warningf(ctx, "m5 checkpoint!, %v", output)
+				}
+			*/
+
 			cmd := exec.Command("m5", "exit")
 			err := cmd.Run()
-			time.Sleep(500 * time.Millisecond) // m5 exit may elapse different time
+			time.Sleep(10 * time.Millisecond)
 			if err != nil {
-				log.Errorf(ctx, "m5 exit failed")
+				log.Errorf(ctx, "m5 exit failed: %v", err)
 			} else {
 				log.Warningf(ctx, "m5 exit! (switch CPU)")
 			}
@@ -623,6 +632,7 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 		// Once the load generator is fully ramped up, we reset the histogram
 		// and the start time to throw away the stats for the ramp up period.
 		case <-rampDone:
+			handleSwitch()
 			rampDone = nil
 			start = timeutil.Now()
 			formatter.rampDone()
@@ -630,8 +640,6 @@ func runRun(gen workload.Generator, urls []string, dbName string) error {
 				t.Cumulative.Reset()
 				t.Hist.Reset()
 			})
-
-			handleSwitch()
 
 		case <-done:
 			cancelWorkers()
