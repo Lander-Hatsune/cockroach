@@ -14,11 +14,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
@@ -481,6 +483,7 @@ func (s *Stopper) RunAsyncTaskEx(ctx context.Context, opt TaskOpts, f func(conte
 		}
 
 		sp.UpdateGoroutineIDToCurrent()
+		runtime.SetInnerId(uint64(uintptr(unsafe.Pointer(&f))))
 		f(ctx)
 	}()
 	return nil
