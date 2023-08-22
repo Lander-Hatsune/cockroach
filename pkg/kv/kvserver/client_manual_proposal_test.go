@@ -117,7 +117,8 @@ LIMIT
 
 	// Determine LastIndex, LastTerm, and next MaxLeaseIndex by scanning
 	// existing log.
-	it := raftlog.NewIterator(rangeID, eng, raftlog.IterOptions{})
+	it, err := raftlog.NewIterator(rangeID, eng, raftlog.IterOptions{})
+	require.NoError(t, err)
 	defer it.Close()
 	rsl := logstore.NewStateLoader(rangeID)
 	lastIndex, err := rsl.LoadLastIndex(ctx, eng)
@@ -232,10 +233,10 @@ LIMIT
 			Settings:    st,
 			Metrics: logstore.Metrics{
 				RaftLogCommitLatency: metric.NewHistogram(metric.HistogramOptions{
-					Mode:     metric.HistogramModePrometheus,
-					Metadata: fakeMeta,
-					Duration: time.Millisecond,
-					Buckets:  metric.IOLatencyBuckets,
+					Mode:         metric.HistogramModePrometheus,
+					Metadata:     fakeMeta,
+					Duration:     time.Millisecond,
+					BucketConfig: metric.IOLatencyBuckets,
 				}),
 			},
 		}

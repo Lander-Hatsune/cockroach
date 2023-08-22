@@ -72,6 +72,7 @@ crdb_internal  kv_inherited_role_members               table  admin  NULL  NULL
 crdb_internal  kv_node_liveness                        table  admin  NULL  NULL
 crdb_internal  kv_node_status                          table  admin  NULL  NULL
 crdb_internal  kv_repairable_catalog_corruptions       view   admin  NULL  NULL
+crdb_internal  kv_protected_ts_records                 table  admin  NULL  NULL
 crdb_internal  kv_store_status                         table  admin  NULL  NULL
 crdb_internal  kv_system_privileges                    view   admin  NULL  NULL
 crdb_internal  leases                                  table  admin  NULL  NULL
@@ -225,10 +226,10 @@ SELECT * FROM crdb_internal.session_trace WHERE span_idx < 0
 ----
 span_idx  message_idx  timestamp  duration  operation  loc  tag  message age
 
-query TTTBTTT colnames
+query TTTBTTTT colnames
 SELECT * FROM crdb_internal.cluster_settings WHERE variable = ''
 ----
-variable  value  type  public  description default_value origin
+variable  value  type  public  description default_value origin key
 
 query TI colnames
 SELECT * FROM crdb_internal.feature_usage WHERE feature_name = ''
@@ -439,7 +440,7 @@ test  {}
 statement ok
 CREATE TABLE foo (a INT PRIMARY KEY, INDEX idx(a)); INSERT INTO foo VALUES(1)
 
-statement error tenant cluster setting sql.split_at.allow_for_secondary_tenant.enabled disabled
+statement error tenant cluster setting sql.virtual_cluster.feature_access.manual_range_split.enabled disabled
 ALTER TABLE foo SPLIT AT VALUES(2)
 
 # Make sure that the cluster id isn't unset.

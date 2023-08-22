@@ -387,7 +387,7 @@ func TestClosedTimestampCanServeAfterSplitAndMerges(t *testing.T) {
 	tc, db0, desc := setupClusterForClosedTSTesting(ctx, t, testingTargetDuration, 0, cArgs, "cttest", "kv")
 	repls := replsForRange(ctx, t, tc, desc)
 	// Disable the automatic merging.
-	if _, err := db0.Exec("SET CLUSTER SETTING kv.range_merge.queue_enabled = false"); err != nil {
+	if _, err := db0.Exec("SET CLUSTER SETTING kv.range_merge.queue.enabled = false"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -740,7 +740,7 @@ func TestClosedTimestampFrozenAfterSubsumption(t *testing.T) {
 			sqlDB.ExecMultiple(t, strings.Split(fmt.Sprintf(`
 SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s';
 SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '%s';
-SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true;
+SET CLUSTER SETTING kv.closed_timestamp.follower_reads.enabled = true;
 `, 5*time.Second, 100*time.Millisecond), ";")...)
 			leftDesc, rightDesc := splitDummyRangeInTestCluster(t, tc, "cttest", "kv", hlc.Timestamp{} /* splitExpirationTime */)
 
@@ -1226,7 +1226,7 @@ func setupClusterForClosedTSTesting(
 	sqlRunner.ExecMultiple(t, strings.Split(fmt.Sprintf(`
 SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s';
 SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '%s';
-SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true;
+SET CLUSTER SETTING kv.closed_timestamp.follower_reads.enabled = true;
 SET CLUSTER SETTING kv.allocator.load_based_rebalancing = 'off';
 `, targetDuration, sideTransportInterval),
 		";")...)
@@ -1242,7 +1242,7 @@ SET CLUSTER SETTING kv.allocator.load_based_rebalancing = 'off';
 func setupTestClusterWithDummyRange(
 	t *testing.T, clusterArgs base.TestClusterArgs, dbName, tableName string, numNodes int,
 ) (serverutils.TestClusterInterface, roachpb.RangeDescriptor) {
-	tc := serverutils.StartNewTestCluster(t, numNodes, clusterArgs)
+	tc := serverutils.StartCluster(t, numNodes, clusterArgs)
 	db0 := tc.ServerConn(0)
 
 	if _, err := db0.Exec(fmt.Sprintf(`

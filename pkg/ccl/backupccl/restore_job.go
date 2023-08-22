@@ -89,6 +89,7 @@ var useSimpleImportSpans = settings.RegisterBoolSetting(
 	"bulkio.restore.use_simple_import_spans",
 	"if set to true, restore will generate its import spans using the makeSimpleImportSpans algorithm",
 	false,
+	settings.WithName("bulkio.restore.simple_import_spans.enabled"),
 )
 
 var restoreStatsInsertionConcurrency = settings.RegisterIntSetting(
@@ -2239,8 +2240,7 @@ func (r *restoreResumer) publishDescriptors(
 				jobsKnobs,
 				jobs.ScheduledJobTxn(txn),
 				user,
-				mutTable.GetID(),
-				mutTable.GetRowLevelTTL(),
+				mutTable,
 			)
 			if err != nil {
 				return err
@@ -2376,7 +2376,7 @@ func prefetchDescriptors(
 		if got[i].GetVersion() != expVersion[id] {
 			return nstree.Catalog{}, errors.Errorf(
 				"version mismatch for descriptor %d, expected version %d, got %v",
-				got[i].GetID(), got[i].GetVersion(), expVersion[id],
+				got[i].GetID(), expVersion[id], got[i].GetVersion(),
 			)
 		}
 		all.UpsertDescriptor(got[i])

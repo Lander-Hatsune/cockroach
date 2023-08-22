@@ -52,8 +52,8 @@ type resultsBuffer interface {
 	get(context.Context) (_ []Result, allComplete bool, _ error)
 
 	// wait blocks until there is at least one Result available to be returned
-	// to the client or the passed-in context is canceled.
-	wait(context.Context) error
+	// to the client.
+	wait()
 
 	// releaseOne decrements the number of unreleased Results by one.
 	releaseOne()
@@ -227,13 +227,8 @@ func (b *resultsBufferBase) signal() {
 	}
 }
 
-func (b *resultsBufferBase) wait(ctx context.Context) error {
-	select {
-	case <-b.hasResults:
-		return b.error()
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+func (b *resultsBufferBase) wait() {
+	<-b.hasResults
 }
 
 func (b *resultsBufferBase) numUnreleased() int {
@@ -701,19 +696,18 @@ type inOrderBufferedResult struct {
 // spill updates r to represent a result that has been spilled to disk and is
 // identified by the provided ordinal in the disk buffer.
 func (r *inOrderBufferedResult) spill(diskResultID int) {
-	isScanComplete := r.scanComplete
 	*r = inOrderBufferedResult{
 		Result: Result{
 			memoryTok:      r.memoryTok,
 			Position:       r.Position,
 			subRequestIdx:  r.subRequestIdx,
 			subRequestDone: r.subRequestDone,
+			scanComplete:   r.scanComplete,
 		},
 		addEpoch:     r.addEpoch,
 		onDisk:       true,
 		diskResultID: diskResultID,
 	}
-	r.scanComplete = isScanComplete
 }
 
 // get returns the Result, deserializing it from disk if necessary. toConsume

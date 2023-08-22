@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/upgrade"
 	"github.com/cockroachdb/cockroach/pkg/upgrade/upgradebase"
 )
@@ -26,7 +27,7 @@ import (
 // SettingsDefaultOverrides documents the effect of several migrations that add
 // an explicit value for a setting, effectively changing the "default value"
 // from what was defined in code.
-var SettingsDefaultOverrides = map[string]string{
+var SettingsDefaultOverrides = map[settings.InternalKey]string{
 	"diagnostics.reporting.enabled": "true",
 	"cluster.secret":                "<random>",
 }
@@ -91,12 +92,6 @@ var upgrades = []upgradebase.Upgrade{
 		toCV(clusterversion.VPrimordial6),
 		createDefaultDbs,
 		"create default databases", // v22_2StartupMigrationName
-	),
-	upgrade.NewTenantUpgrade(
-		"update system.statement_diagnostics_requests to support sampling probabilities",
-		toCV(clusterversion.TODODelete_V22_2SampledStmtDiagReqs),
-		upgrade.NoPrecondition,
-		sampledStmtDiagReqsMigration,
 	),
 	upgrade.NewTenantUpgrade(
 		"add the system.external_connections table",
@@ -316,6 +311,12 @@ var upgrades = []upgradebase.Upgrade{
 		toCV(clusterversion.V23_2_PartiallyVisibleIndexes),
 		upgrade.NoPrecondition,
 		NoTenantUpgradeFunc,
+	),
+	upgrade.NewTenantUpgrade(
+		"update system.statement_diagnostics_requests to support plan gist matching",
+		toCV(clusterversion.V23_2_StmtDiagForPlanGist),
+		upgrade.NoPrecondition,
+		stmtDiagForPlanGistMigration,
 	),
 }
 

@@ -59,7 +59,7 @@ type PLpgSQLStmtBlock struct {
 	Label      string
 	Decls      []PLpgSQLDecl
 	Body       []PLpgSQLStatement
-	Exceptions *PLpgSQLExceptionBlock
+	Exceptions []PLpgSQLException
 }
 
 // TODO(drewk): format Label and Exceptions fields.
@@ -75,6 +75,12 @@ func (s *PLpgSQLStmtBlock) Format(ctx *tree.FmtCtx) {
 	ctx.WriteString("BEGIN\n")
 	for _, childStmt := range s.Body {
 		childStmt.Format(ctx)
+	}
+	if s.Exceptions != nil {
+		ctx.WriteString("EXCEPTION\n")
+		for _, e := range s.Exceptions {
+			e.Format(ctx)
+		}
 	}
 	ctx.WriteString("END\n")
 }
@@ -152,7 +158,7 @@ type PLpgSQLStmtIf struct {
 	PLpgSQLStatementImpl
 	Condition  PLpgSQLExpr
 	ThenBody   []PLpgSQLStatement
-	ElseIfList []*PLpgSQLStmtIfElseIfArm
+	ElseIfList []PLpgSQLStmtIfElseIfArm
 	ElseBody   []PLpgSQLStatement
 }
 
@@ -201,7 +207,6 @@ func (s *PLpgSQLStmtIf) WalkStmt(visitor PLpgSQLStmtVisitor) {
 
 type PLpgSQLStmtIfElseIfArm struct {
 	PLpgSQLStatementImpl
-	LineNo    int
 	Condition PLpgSQLExpr
 	Stmts     []PLpgSQLStatement
 }
@@ -682,21 +687,26 @@ func (s *PLpgSQLStmtAssert) WalkStmt(visitor PLpgSQLStmtVisitor) {
 // stmt_execsql
 type PLpgSQLStmtExecSql struct {
 	PLpgSQLStatementImpl
-	SqlStmt string
-	Into    bool // INTO provided?
+	SqlStmt tree.Statement
 	Strict  bool // INTO STRICT flag
+	Target  []PLpgSQLVariable
 }
 
 func (s *PLpgSQLStmtExecSql) Format(ctx *tree.FmtCtx) {
-	// TODO(drewk): Pretty print the sql statement
-	ctx.WriteString("EXECUTE bare sql query")
-	if s.Into {
-		ctx.WriteString(" WITH INTO")
+	s.SqlStmt.Format(ctx)
+	if s.Target != nil {
+		ctx.WriteString(" INTO ")
+		if s.Strict {
+			ctx.WriteString("STRICT ")
+		}
+		for i := range s.Target {
+			if i > 0 {
+				ctx.WriteString(", ")
+			}
+			s.Target[i].Format(ctx)
+		}
 	}
-	if s.Strict {
-		ctx.WriteString(" STRICT")
-	}
-	ctx.WriteString("\n")
+	ctx.WriteString(";\n")
 }
 
 func (s *PLpgSQLStmtExecSql) PlpgSQLStatementTag() string {

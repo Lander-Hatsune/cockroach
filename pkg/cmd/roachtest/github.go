@@ -18,6 +18,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/internal/issues"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/registry"
+	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/spec"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/test"
 	"github.com/cockroachdb/cockroach/pkg/internal/team"
 	rperrors "github.com/cockroachdb/cockroach/pkg/roachprod/errors"
@@ -49,7 +50,7 @@ func roachtestPrefix(p string) string {
 
 // generateHelpCommand creates a HelpCommand for createPostRequest
 func generateHelpCommand(
-	clusterName string, start time.Time, end time.Time,
+	clusterName string, cloud string, start time.Time, end time.Time,
 ) func(renderer *issues.Renderer) {
 	return func(renderer *issues.Renderer) {
 		issues.HelpCommandAsLink(
@@ -60,10 +61,14 @@ func generateHelpCommand(
 			"How To Investigate (internal)",
 			"https://cockroachlabs.atlassian.net/l/c/SSSBr8c7",
 		)(renderer)
-		issues.HelpCommandAsLink(
-			"Grafana",
-			fmt.Sprintf("https://go.crdb.dev/p/roachfana/%s/%d/%d", clusterName, start.UnixMilli(), end.UnixMilli()),
-		)(renderer)
+		// An empty clusterName corresponds to a cluster creation failure.
+		// We only scrape metrics from GCE clusters for now.
+		if spec.GCE == cloud && clusterName != "" {
+			issues.HelpCommandAsLink(
+				"Grafana",
+				fmt.Sprintf("https://go.crdb.dev/p/roachfana/%s/%d/%d", clusterName, start.UnixMilli(), end.UnixMilli()),
+			)(renderer)
+		}
 	}
 }
 
@@ -131,13 +136,14 @@ func (g *githubIssues) createPostRequest(
 
 	issueOwner := spec.Owner
 	issueName := testName
+	issueClusterName := ""
 
 	messagePrefix := ""
 	var infraFlake bool
 	// Overrides to shield eng teams from potential flakes
 	switch {
 	case failureContainsError(firstFailure, errClusterProvisioningFailed):
-		issueOwner = registry.OwnerDevInf
+		issueOwner = registry.OwnerTestEng
 		issueName = "cluster_creation"
 		messagePrefix = fmt.Sprintf("test %s was skipped due to ", testName)
 		infraFlake = true
@@ -153,7 +159,9 @@ func (g *githubIssues) createPostRequest(
 	// Issues posted from roachtest are identifiable as such, and they are also release blockers
 	// (this label may be removed by a human upon closer investigation).
 	labels := []string{"O-roachtest"}
-	if !spec.NonReleaseBlocker && !infraFlake {
+	if infraFlake {
+		labels = append(labels, "X-infra-flake")
+	} else if !spec.NonReleaseBlocker {
 		labels = append(labels, "release-blocker")
 	}
 
@@ -202,6 +210,7 @@ func (g *githubIssues) createPostRequest(
 			// Hence, we only emit when arch was unspecified.
 			clusterParams[roachtestPrefix("arch")] = string(g.cluster.arch)
 		}
+		issueClusterName = g.cluster.name
 	}
 
 	issueMessage := messagePrefix + message
@@ -210,15 +219,16 @@ func (g *githubIssues) createPostRequest(
 			"consult the logs for details. WARNING: DO NOT COPY UNREDACTED ARTIFACTS TO THIS ISSUE."
 	}
 	return issues.PostRequest{
-		MentionOnCreate: mention,
-		ProjectColumnID: projColID,
-		PackageName:     "roachtest",
-		TestName:        issueName,
-		Message:         issueMessage,
-		Artifacts:       artifacts,
-		ExtraLabels:     labels,
-		ExtraParams:     clusterParams,
-		HelpCommand:     generateHelpCommand(clusterName, start, end),
+		MentionOnCreate:      mention,
+		ProjectColumnID:      projColID,
+		PackageName:          "roachtest",
+		TestName:             issueName,
+		Message:              issueMessage,
+		SkipLabelTestFailure: infraFlake, // infra-flakes are not marked as C-test-failure
+		Artifacts:            artifacts,
+		ExtraLabels:          labels,
+		ExtraParams:          clusterParams,
+		HelpCommand:          generateHelpCommand(issueClusterName, spec.Cluster.Cloud, start, end),
 	}, nil
 }
 

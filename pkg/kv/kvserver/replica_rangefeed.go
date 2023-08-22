@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/intentresolver"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -28,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
+	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/future"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -47,7 +49,7 @@ var RangefeedEnabled = settings.RegisterBoolSetting(
 	"kv.rangefeed.enabled",
 	"if set, rangefeed registration is enabled",
 	false,
-).WithPublic()
+	settings.WithPublic)
 
 // RangeFeedRefreshInterval controls the frequency with which we deliver closed
 // timestamp updates to rangefeeds.
@@ -72,6 +74,32 @@ var RangeFeedSmearInterval = settings.RegisterDurationSetting(
 	1*time.Millisecond,
 	settings.NonNegativeDuration,
 )
+
+func init() {
+	// Inject into kvserverbase to allow usage from kvcoord.
+	kvserverbase.RangeFeedRefreshInterval = RangeFeedRefreshInterval
+}
+
+// defaultEventChanCap is the channel capacity of the rangefeed processor and
+// each registration.
+//
+// The size of an event is 72 bytes, so this will result in an allocation on the
+// order of ~300KB per RangeFeed. That's probably ok given the number of ranges
+// on a node that we'd like to support with active rangefeeds, but it's
+// certainly on the upper end of the range.
+//
+// TODO(dan): Everyone seems to agree that this memory limit would be better set
+// at a store-wide level, but there doesn't seem to be an easy way to accomplish
+// that.
+const defaultEventChanCap = 4096
+
+// defaultEventChanTimeout is the send timeout for events published to a
+// rangefeed processor or rangefeed client channels. When exceeded, the
+// rangefeed or client is disconnected to prevent blocking foreground traffic
+// for longer than this timeout. When set to 0, clients are never disconnected,
+// and slow consumers will backpressure writers up through Raft.
+var defaultEventChanTimeout = envutil.EnvOrDefaultDuration(
+	"COCKROACH_RANGEFEED_SEND_TIMEOUT", 50*time.Millisecond)
 
 // lockedRangefeedStream is an implementation of rangefeed.Stream which provides
 // support for concurrent calls to Send. Note that the default implementation of
@@ -241,25 +269,25 @@ func (r *Replica) RangeFeed(
 	return &done
 }
 
-func (r *Replica) getRangefeedProcessorAndFilter() (*rangefeed.Processor, *rangefeed.Filter) {
+func (r *Replica) getRangefeedProcessorAndFilter() (rangefeed.Processor, *rangefeed.Filter) {
 	r.rangefeedMu.RLock()
 	defer r.rangefeedMu.RUnlock()
 	return r.rangefeedMu.proc, r.rangefeedMu.opFilter
 }
 
-func (r *Replica) getRangefeedProcessor() *rangefeed.Processor {
+func (r *Replica) getRangefeedProcessor() rangefeed.Processor {
 	p, _ := r.getRangefeedProcessorAndFilter()
 	return p
 }
 
-func (r *Replica) setRangefeedProcessor(p *rangefeed.Processor) {
+func (r *Replica) setRangefeedProcessor(p rangefeed.Processor) {
 	r.rangefeedMu.Lock()
 	defer r.rangefeedMu.Unlock()
 	r.rangefeedMu.proc = p
 	r.store.addReplicaWithRangefeed(r.RangeID)
 }
 
-func (r *Replica) unsetRangefeedProcessorLocked(p *rangefeed.Processor) {
+func (r *Replica) unsetRangefeedProcessorLocked(p rangefeed.Processor) {
 	if r.rangefeedMu.proc != p {
 		// The processor was already unset.
 		return
@@ -269,7 +297,7 @@ func (r *Replica) unsetRangefeedProcessorLocked(p *rangefeed.Processor) {
 	r.store.removeReplicaWithRangefeed(r.RangeID)
 }
 
-func (r *Replica) unsetRangefeedProcessor(p *rangefeed.Processor) {
+func (r *Replica) unsetRangefeedProcessor(p rangefeed.Processor) {
 	r.rangefeedMu.Lock()
 	defer r.rangefeedMu.Unlock()
 	r.unsetRangefeedProcessorLocked(p)
@@ -292,16 +320,6 @@ func (r *Replica) updateRangefeedFilterLocked() bool {
 	}
 	return false
 }
-
-// The size of an event is 72 bytes, so this will result in an allocation on
-// the order of ~300KB per RangeFeed. That's probably ok given the number of
-// ranges on a node that we'd like to support with active rangefeeds, but it's
-// certainly on the upper end of the range.
-//
-// TODO(dan): Everyone seems to agree that this memory limit would be better set
-// at a store-wide level, but there doesn't seem to be an easy way to accomplish
-// that.
-const defaultEventChanCap = 4096
 
 // Rangefeed registration takes place under the raftMu, so log if we ever hold
 // the mutex for too long, as this could affect foreground traffic.
@@ -332,7 +350,7 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 	withDiff bool,
 	stream rangefeed.Stream,
 	done *future.ErrorFuture,
-) *rangefeed.Processor {
+) rangefeed.Processor {
 	defer logSlowRangefeedRegistration(ctx)()
 
 	// Attempt to register with an existing Rangefeed processor, if one exists.
@@ -358,9 +376,8 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 	}
 	r.rangefeedMu.Unlock()
 
-	feedBudget := r.store.GetStoreConfig().RangefeedBudgetFactory.CreateBudget(r.startKey)
-
 	// Create a new rangefeed.
+	feedBudget := r.store.GetStoreConfig().RangefeedBudgetFactory.CreateBudget(r.startKey)
 	desc := r.Desc()
 	tp := rangefeedTxnPusher{ir: r.store.intentResolver, r: r}
 	cfg := rangefeed.Config{
@@ -372,7 +389,7 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 		PushTxnsInterval: r.store.TestingKnobs().RangeFeedPushTxnsInterval,
 		PushTxnsAge:      r.store.TestingKnobs().RangeFeedPushTxnsAge,
 		EventChanCap:     defaultEventChanCap,
-		EventChanTimeout: 50 * time.Millisecond,
+		EventChanTimeout: defaultEventChanTimeout,
 		Metrics:          r.store.metrics.RangeFeedMetrics,
 		MemBudget:        feedBudget,
 	}
@@ -388,10 +405,14 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 
 		lowerBound, _ := keys.LockTableSingleKey(desc.StartKey.AsRawKey(), nil)
 		upperBound, _ := keys.LockTableSingleKey(desc.EndKey.AsRawKey(), nil)
-		iter := r.store.TODOEngine().NewEngineIterator(storage.IterOptions{
+		iter, err := r.store.TODOEngine().NewEngineIterator(storage.IterOptions{
 			LowerBound: lowerBound,
 			UpperBound: upperBound,
 		})
+		if err != nil {
+			done.Set(err)
+			return nil
+		}
 		return rangefeed.NewSeparatedIntentScanner(iter)
 	}
 
@@ -435,7 +456,7 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 
 // maybeDisconnectEmptyRangefeed tears down the provided Processor if it is
 // still active and if it no longer has any registrations.
-func (r *Replica) maybeDisconnectEmptyRangefeed(p *rangefeed.Processor) {
+func (r *Replica) maybeDisconnectEmptyRangefeed(p rangefeed.Processor) {
 	r.rangefeedMu.Lock()
 	defer r.rangefeedMu.Unlock()
 	if p == nil || p != r.rangefeedMu.proc {
@@ -452,7 +473,7 @@ func (r *Replica) maybeDisconnectEmptyRangefeed(p *rangefeed.Processor) {
 
 // disconnectRangefeedWithErr broadcasts the provided error to all rangefeed
 // registrations and tears down the provided rangefeed Processor.
-func (r *Replica) disconnectRangefeedWithErr(p *rangefeed.Processor, pErr *kvpb.Error) {
+func (r *Replica) disconnectRangefeedWithErr(p rangefeed.Processor, pErr *kvpb.Error) {
 	p.StopWithErr(pErr)
 	r.unsetRangefeedProcessor(p)
 }

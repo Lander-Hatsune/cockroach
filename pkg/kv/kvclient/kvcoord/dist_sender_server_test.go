@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -53,7 +52,7 @@ import (
 // starting a TestServer, which creates a "real" node and employs a
 // distributed sender server-side.
 
-func startNoSplitMergeServer(t *testing.T) (*server.TestServer, *kv.DB) {
+func startNoSplitMergeServer(t *testing.T) (serverutils.TestServerInterface, *kv.DB) {
 	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
@@ -62,7 +61,7 @@ func startNoSplitMergeServer(t *testing.T) (*server.TestServer, *kv.DB) {
 			},
 		},
 	})
-	return s.(*server.TestServer), db
+	return s, db
 }
 
 // TestRangeLookupWithOpenTransaction verifies that range lookups are
@@ -87,14 +86,15 @@ func TestRangeLookupWithOpenTransaction(t *testing.T) {
 	// Create a new DistSender and client.DB so that the Get below is guaranteed
 	// to not hit in the range descriptor cache forcing a RangeLookup operation.
 	ambient := s.AmbientCtx()
+	gs := s.GossipI().(*gossip.Gossip)
 	ds := kvcoord.NewDistSender(kvcoord.DistSenderConfig{
 		AmbientCtx:         ambient,
 		Settings:           cluster.MakeTestingClusterSettings(),
 		Clock:              s.Clock(),
-		NodeDescs:          s.Gossip(),
+		NodeDescs:          gs,
 		RPCContext:         s.RPCContext(),
-		NodeDialer:         nodedialer.New(s.RPCContext(), gossip.AddressResolver(s.Gossip())),
-		FirstRangeProvider: s.Gossip(),
+		NodeDialer:         nodedialer.New(s.RPCContext(), gossip.AddressResolver(gs)),
+		FirstRangeProvider: gs,
 	})
 	tsf := kvcoord.NewTxnCoordSenderFactory(
 		kvcoord.TxnCoordSenderFactoryConfig{
@@ -1120,16 +1120,17 @@ func TestMultiRangeScanReverseScanInconsistent(t *testing.T) {
 				// applied by time we execute the scan. If it has not run, then try the
 				// scan again. READ_UNCOMMITTED and INCONSISTENT reads to not push
 				// intents.
+				gs := s.GossipI().(*gossip.Gossip)
 				testutils.SucceedsSoon(t, func() error {
 					clock := hlc.NewClockForTesting(timeutil.NewManualTime(ts.GoTime().Add(1)))
 					ds := kvcoord.NewDistSender(kvcoord.DistSenderConfig{
 						AmbientCtx:         s.AmbientCtx(),
 						Settings:           s.ClusterSettings(),
 						Clock:              clock,
-						NodeDescs:          s.Gossip(),
+						NodeDescs:          gs,
 						RPCContext:         s.RPCContext(),
-						NodeDialer:         nodedialer.New(s.RPCContext(), gossip.AddressResolver(s.Gossip())),
-						FirstRangeProvider: s.Gossip(),
+						NodeDialer:         nodedialer.New(s.RPCContext(), gossip.AddressResolver(gs)),
+						FirstRangeProvider: gs,
 					})
 
 					reply, err := kv.SendWrappedWith(ctx, ds, kvpb.Header{ReadConsistency: rc}, request)
@@ -1650,14 +1651,15 @@ func TestBatchPutWithConcurrentSplit(t *testing.T) {
 
 	// Now, split further at the given keys, but use a new dist sender so
 	// we don't update the caches on the default dist sender-backed client.
+	gs := s.GossipI().(*gossip.Gossip)
 	ds := kvcoord.NewDistSender(kvcoord.DistSenderConfig{
 		AmbientCtx:         s.AmbientCtx(),
 		Clock:              s.Clock(),
-		NodeDescs:          s.Gossip(),
+		NodeDescs:          gs,
 		RPCContext:         s.RPCContext(),
-		NodeDialer:         nodedialer.New(s.RPCContext(), gossip.AddressResolver(s.Gossip())),
+		NodeDialer:         nodedialer.New(s.RPCContext(), gossip.AddressResolver(gs)),
 		Settings:           cluster.MakeTestingClusterSettings(),
-		FirstRangeProvider: s.Gossip(),
+		FirstRangeProvider: gs,
 	})
 	for _, key := range []string{"c"} {
 		req := &kvpb.AdminSplitRequest{
@@ -1834,7 +1836,8 @@ func TestPropagateTxnOnError(t *testing.T) {
 	epoch := 0
 	if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
 		// Observe the commit timestamp to prevent refreshes.
-		_ = txn.CommitTimestamp()
+		_, err := txn.CommitTimestamp()
+		require.NoError(t, err)
 
 		epoch++
 		proto := txn.TestingCloneTxn()
@@ -1856,7 +1859,7 @@ func TestPropagateTxnOnError(t *testing.T) {
 		b.Put(keyA, "val")
 		b.CPut(keyB, "new_val", origBytes)
 		b.Put(keyC, "val2")
-		err := txn.CommitInBatch(ctx, b)
+		err = txn.CommitInBatch(ctx, b)
 		if epoch == 1 {
 			if retErr := (*kvpb.TransactionRetryWithProtoRefreshError)(nil); errors.As(err, &retErr) {
 				if !testutils.IsError(retErr, "ReadWithinUncertaintyIntervalError") {
@@ -2009,6 +2012,11 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			}
 			return nil
 		}
+
+	// Disable load-based splitting to avoid unexpected range splits. The test
+	// operates between keys "a" and "z" and expects a single split point at "b".
+	// See the call to setupMultipleRanges below.
+	storeKnobs.DisableLoadBasedSplitting = true
 
 	var refreshSpansCondenseFilter atomic.Value
 	s := serverutils.StartServerOnly(t,
@@ -3179,10 +3187,10 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 			// This test is like the previous one in that the commit batch succeeds at
 			// an updated timestamp, but this time the EndTxn puts the
 			// transaction in the STAGING state instead of COMMITTED because there had
-			// been previous write in a different batch. Like above, the commit is
+			// been a previous write in a different batch. Like above, the commit is
 			// successful since there are no refresh spans (the request will succeed
 			// after a server-side refresh).
-			name: "write too old in staging commit",
+			name: "write too old with put in staging commit",
 			beforeTxnStart: func(ctx context.Context, db *kv.DB) error {
 				return db.Put(ctx, "a", "orig")
 			},
@@ -3885,7 +3893,8 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 				}
 				// Read the commit timestamp so the expectation is that
 				// this transaction cannot be restarted internally.
-				_ = txn.CommitTimestamp()
+				_, err := txn.CommitTimestamp()
+				require.NoError(t, err)
 			}
 
 			if tc.priorReads {
@@ -3931,11 +3940,9 @@ func TestTxnCoordSenderRetries(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, isoLevel := range isolation.Levels() {
-				t.Run(isoLevel.String(), func(t *testing.T) {
-					run(t, tc, isoLevel)
-				})
-			}
+			isolation.RunEachLevel(t, func(t *testing.T, isoLevel isolation.Level) {
+				run(t, tc, isoLevel)
+			})
 		})
 	}
 }
@@ -4042,11 +4049,10 @@ func TestTxnCoordSenderRetriesAcrossEndTxn(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run("", func(t *testing.T) {
-			si, _, db := serverutils.StartServer(t,
-				base.TestServerArgs{Knobs: base.TestingKnobs{Store: &storeKnobs}})
 			ctx := context.Background()
-			defer si.Stopper().Stop(ctx)
-			s := si.(*server.TestServer)
+			s, _, db := serverutils.StartServer(t,
+				base.TestServerArgs{Knobs: base.TestingKnobs{Store: &storeKnobs}})
+			defer s.Stopper().Stop(ctx)
 
 			keyA, keyA1, keyB, keyB1 := roachpb.Key("a"), roachpb.Key("a1"), roachpb.Key("b"), roachpb.Key("b1")
 			require.NoError(t, setupMultipleRanges(ctx, db, string(keyB)))
@@ -4280,4 +4286,67 @@ func BenchmarkReturnOnRangeBoundary(b *testing.B) {
 		}
 		require.NoError(b, txn.Commit(ctx))
 	}
+}
+
+func TestRefreshFailureIncludesConflictingTxn(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testutils.RunTrueAndFalse(t, "committed", func(t *testing.T, committed bool) {
+		testutils.RunTrueAndFalse(t, "range-refresh", func(t *testing.T, rangeRefresh bool) {
+			ctx := context.Background()
+			s, _, db := serverutils.StartServer(t, base.TestServerArgs{})
+			defer s.Stopper().Stop(ctx)
+
+			keyA := "a"
+			endRangeA := "a2"
+			keyB := "b"
+
+			err := db.Put(ctx, keyA, "put")
+			require.NoError(t, err)
+
+			txn1 := db.NewTxn(ctx, "original txn")
+			txn2 := db.NewTxn(ctx, "contending txn")
+
+			if rangeRefresh {
+				_, err = txn1.Scan(ctx, keyA, endRangeA, 10)
+				require.NoError(t, err)
+			} else {
+				_, err = txn1.Get(ctx, keyA)
+				require.NoError(t, err)
+			}
+
+			// This bumps the timestamp cache on keyB so that the next put from txn1
+			// causes its write timestamp to skew, thereby forcing a refresh.
+			_, err = txn2.Get(ctx, keyB)
+			require.NoError(t, err)
+
+			err = txn2.Put(ctx, keyA, "put")
+			require.NoError(t, err)
+
+			if committed {
+				require.NoError(t, txn2.Commit(ctx))
+				// Force intent clean up.
+				_, err = db.Get(ctx, keyA)
+				require.NoError(t, err)
+			}
+
+			err = txn1.Put(ctx, keyB, "put")
+			require.NoError(t, err)
+
+			err = txn1.Commit(ctx)
+			require.Error(t, err)
+
+			tErr := (*kvpb.TransactionRetryWithProtoRefreshError)(nil)
+			require.ErrorAs(t, err, &tErr)
+
+			if committed {
+				require.Nil(t, tErr.ConflictingTxn)
+			} else {
+				require.NotNil(t, tErr.ConflictingTxn)
+				require.Equal(t, txn2.ID(), tErr.ConflictingTxn.ID)
+				require.Equal(t, int32(1), tErr.ConflictingTxn.CoordinatorNodeID)
+			}
+		})
+	})
 }

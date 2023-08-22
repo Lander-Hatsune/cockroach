@@ -27,7 +27,6 @@ import (
 	"github.com/Azure/azure-sdk-for-go/profiles/latest/resources/mgmt/subscriptions"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/to"
-	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/flagstub"
@@ -157,6 +156,16 @@ func getAzureDefaultLabelMap(opts vm.CreateOpts) map[string]string {
 	m := vm.GetDefaultLabelMap(opts)
 	m[vm.TagCreated] = timeutil.Now().Format(time.RFC3339)
 	return m
+}
+
+func (p *Provider) AddLabels(l *logger.Logger, vms vm.List, labels map[string]string) error {
+	l.Printf("adding labels to Azure VMs not yet supported")
+	return nil
+}
+
+func (p *Provider) RemoveLabels(l *logger.Logger, vms vm.List, labels []string) error {
+	l.Printf("removing labels from Azure VMs not yet supported")
+	return nil
 }
 
 // Create implements vm.Provider.
@@ -484,9 +493,7 @@ func (p *Provider) List(l *logger.Logger, opts vm.ListOptions) (vm.List, error) 
 			MachineType: string(found.HardwareProfile.VMSize),
 			// We add a fake availability-zone suffix since other roachprod
 			// code assumes particular formats. For example, "eastus2z".
-			Zone:        *found.Location + "z",
-			SQLPort:     config.DefaultSQLPort,
-			AdminUIPort: config.DefaultAdminUIPort,
+			Zone: *found.Location + "z",
 		}
 
 		if createdPtr := found.Tags[vm.TagCreated]; createdPtr == nil {

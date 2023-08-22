@@ -14,7 +14,6 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdceval"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
-	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/kvfeed"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobsprofiler"
 	"github.com/cockroachdb/cockroach/pkg/kv"
@@ -122,6 +121,11 @@ func distChangefeedFlow(
 		}
 	}
 
+	if knobs, ok := execCtx.ExecCfg().DistSQLSrv.TestingKnobs.Changefeed.(*TestingKnobs); ok {
+		if knobs != nil && knobs.StartDistChangefeedInitialHighwater != nil {
+			knobs.StartDistChangefeedInitialHighwater(ctx, initialHighWater)
+		}
+	}
 	return startDistChangefeed(
 		ctx, execCtx, jobID, schemaTS, details, initialHighWater, localState, resultsCh)
 }
@@ -316,8 +320,9 @@ var enableBalancedRangeDistribution = settings.RegisterBoolSetting(
 	"changefeed.balance_range_distribution.enable",
 	"if enabled, the ranges are balanced equally among all nodes",
 	util.ConstantWithMetamorphicTestBool(
-		"changefeed.balance_range_distribution.enable", false),
-).WithPublic()
+		"changefeed.balance_range_distribution.enabled", false),
+	settings.WithName("changefeed.balance_range_distribution.enabled"),
+	settings.WithPublic)
 
 func makePlan(
 	execCtx sql.JobExecContext,
@@ -521,7 +526,7 @@ type distResolver struct {
 func (r *distResolver) getRangesForSpans(
 	ctx context.Context, spans []roachpb.Span,
 ) ([]roachpb.Span, error) {
-	spans, _, err := kvfeed.AllRangeSpans(ctx, r.DistSender, spans)
+	spans, _, err := r.DistSender.AllRangeSpans(ctx, spans)
 	return spans, err
 }
 

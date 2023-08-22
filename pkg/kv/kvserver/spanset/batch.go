@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/rangekey"
 )
 
 // MVCCIterator wraps an storage.MVCCIterator and ensures that it can
@@ -445,6 +446,17 @@ type spanSetReader struct {
 
 var _ storage.Reader = spanSetReader{}
 
+func (s spanSetReader) ScanInternal(
+	ctx context.Context,
+	lower, upper roachpb.Key,
+	visitPointKey func(key *pebble.InternalKey, value pebble.LazyValue, info pebble.IteratorLevel) error,
+	visitRangeDel func(start []byte, end []byte, seqNum uint64) error,
+	visitRangeKey func(start []byte, end []byte, keys []rangekey.Key) error,
+	visitSharedFile func(sst *pebble.SharedSSTMeta) error,
+) error {
+	return s.r.ScanInternal(ctx, lower, upper, visitPointKey, visitRangeDel, visitRangeKey, visitSharedFile)
+}
+
 func (s spanSetReader) Close() {
 	s.r.Close()
 }
@@ -473,20 +485,46 @@ func (s spanSetReader) MVCCIterate(
 
 func (s spanSetReader) NewMVCCIterator(
 	iterKind storage.MVCCIterKind, opts storage.IterOptions,
-) storage.MVCCIterator {
-	if s.spansOnly {
-		return NewIterator(s.r.NewMVCCIterator(iterKind, opts), s.spans)
+) (storage.MVCCIterator, error) {
+	mvccIter, err := s.r.NewMVCCIterator(iterKind, opts)
+	if err != nil {
+		return nil, err
 	}
-	return NewIteratorAt(s.r.NewMVCCIterator(iterKind, opts), s.spans, s.ts)
+	if s.spansOnly {
+		return NewIterator(mvccIter, s.spans), nil
+	}
+	return NewIteratorAt(mvccIter, s.spans, s.ts), nil
 }
 
-func (s spanSetReader) NewEngineIterator(opts storage.IterOptions) storage.EngineIterator {
+func (s spanSetReader) MustMVCCIterator(
+	iterKind storage.MVCCIterKind, opts storage.IterOptions,
+) storage.MVCCIterator {
+	iter, err := s.NewMVCCIterator(iterKind, opts)
+	if err != nil {
+		panic(err)
+	}
+	return iter
+}
+
+func (s spanSetReader) NewEngineIterator(opts storage.IterOptions) (storage.EngineIterator, error) {
+	engineIter, err := s.r.NewEngineIterator(opts)
+	if err != nil {
+		return nil, err
+	}
 	return &EngineIterator{
-		i:         s.r.NewEngineIterator(opts),
+		i:         engineIter,
 		spans:     s.spans,
 		spansOnly: s.spansOnly,
 		ts:        s.ts,
+	}, nil
+}
+
+func (s spanSetReader) MustEngineIterator(opts storage.IterOptions) storage.EngineIterator {
+	iter, err := s.NewEngineIterator(opts)
+	if err != nil {
+		panic(err)
 	}
+	return iter
 }
 
 // ConsistentIterators implements the storage.Reader interface.
@@ -539,15 +577,6 @@ func (s spanSetWriter) ClearUnversioned(key roachpb.Key, opts storage.ClearOptio
 		return err
 	}
 	return s.w.ClearUnversioned(key, opts)
-}
-
-func (s spanSetWriter) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts storage.ClearOptions,
-) error {
-	if err := s.checkAllowed(key); err != nil {
-		return err
-	}
-	return s.w.ClearIntent(key, txnDidNotUpdateMeta, txnUUID, opts)
 }
 
 func (s spanSetWriter) ClearEngineKey(key storage.EngineKey, opts storage.ClearOptions) error {
@@ -683,15 +712,6 @@ func (s spanSetWriter) PutUnversioned(key roachpb.Key, value []byte) error {
 	return s.w.PutUnversioned(key, value)
 }
 
-func (s spanSetWriter) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
-) error {
-	if err := s.checkAllowed(key); err != nil {
-		return err
-	}
-	return s.w.PutIntent(ctx, key, value, txnUUID)
-}
-
 func (s spanSetWriter) PutEngineKey(key storage.EngineKey, value []byte) error {
 	if !s.spansOnly {
 		panic("cannot do timestamp checking for putting EngineKey")
@@ -762,6 +782,18 @@ type spanSetBatch struct {
 
 var _ storage.Batch = spanSetBatch{}
 
+func (s spanSetBatch) ScanInternal(
+	ctx context.Context,
+	lower, upper roachpb.Key,
+	visitPointKey func(key *pebble.InternalKey, value pebble.LazyValue, info pebble.IteratorLevel) error,
+	visitRangeDel func(start []byte, end []byte, seqNum uint64) error,
+	visitRangeKey func(start []byte, end []byte, keys []rangekey.Key) error,
+	visitSharedFile func(sst *pebble.SharedSSTMeta) error,
+) error {
+	// Only used on Engine.
+	panic("unimplemented")
+}
+
 func (s spanSetBatch) Commit(sync bool) error {
 	return s.b.Commit(sync)
 }
@@ -792,6 +824,18 @@ func (s spanSetBatch) Repr() []byte {
 
 func (s spanSetBatch) CommitStats() storage.BatchCommitStats {
 	return s.b.CommitStats()
+}
+
+func (s spanSetBatch) PutInternalRangeKey(start, end []byte, key rangekey.Key) error {
+	return s.b.PutInternalRangeKey(start, end, key)
+}
+
+func (s spanSetBatch) PutInternalPointKey(key *pebble.InternalKey, value []byte) error {
+	return s.b.PutInternalPointKey(key, value)
+}
+
+func (s spanSetBatch) ClearRawEncodedRange(start, end []byte) error {
+	return s.b.ClearRawEncodedRange(start, end)
 }
 
 // NewBatch returns a storage.Batch that asserts access of the underlying

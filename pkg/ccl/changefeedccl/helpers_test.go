@@ -29,8 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/cdctest"
 	"github.com/cockroachdb/cockroach/pkg/ccl/changefeedccl/changefeedbase"
-	// Imported to allow locality-related table mutations
-	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl"
+	_ "github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl" // allow locality-related mutations
 	"github.com/cockroachdb/cockroach/pkg/ccl/multiregionccl/multiregionccltestutils"
 	_ "github.com/cockroachdb/cockroach/pkg/ccl/partitionccl"
 	"github.com/cockroachdb/cockroach/pkg/jobs"
@@ -41,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -58,11 +58,17 @@ import (
 
 var testSinkFlushFrequency = 100 * time.Millisecond
 
-// disableDeclarativeSchemaChangesForTest tests that are disabled due to differences
-// in changefeed behaviour and are tracked by issue #80545.
-func disableDeclarativeSchemaChangesForTest(t testing.TB, sqlDB *sqlutils.SQLRunner) {
-	sqlDB.Exec(t, "SET use_declarative_schema_changer='off'")
-	sqlDB.Exec(t, "SET CLUSTER SETTING  sql.defaults.use_declarative_schema_changer='off'")
+// maybeDisableDeclarativeSchemaChangesForTest will disable the declarative
+// schema changer with a probability of 10% using the provided SQL DB
+// connection. This returns true if the declarative schema changer is disabled.
+func maybeDisableDeclarativeSchemaChangesForTest(t testing.TB, sqlDB *sqlutils.SQLRunner) bool {
+	disable := rand.Float32() < 0.1
+	if disable {
+		t.Log("using legacy schema changer")
+		sqlDB.Exec(t, "SET use_declarative_schema_changer='off'")
+		sqlDB.Exec(t, "SET CLUSTER SETTING  sql.defaults.use_declarative_schema_changer='off'")
+	}
+	return disable
 }
 
 func waitForSchemaChange(
@@ -376,6 +382,14 @@ SET CLUSTER SETTING kv.rangefeed.enabled = true;
 SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s';
 SET CLUSTER SETTING changefeed.experimental_poll_interval = '10ms';
 SET CLUSTER SETTING sql.defaults.vectorize=on;
+ALTER TENANT ALL SET CLUSTER SETTING kv.rangefeed.enabled = true;
+ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '1s';
+ALTER TENANT ALL SET CLUSTER SETTING changefeed.experimental_poll_interval = '10ms';
+ALTER TENANT ALL SET CLUSTER SETTING sql.defaults.vectorize=on;
+CREATE DATABASE d;
+`
+
+var tenantSetupStatements = `
 CREATE DATABASE d;
 `
 
@@ -394,7 +408,7 @@ func startTestFullServer(
 		Knobs: knobs,
 		// This test suite is already probabilistically running with
 		// tenants. No need for the test tenant.
-		DefaultTestTenant: base.TODOTestTenantDisabled,
+		DefaultTestTenant: base.TestControlsTenantsExplicitly,
 		UseDatabase:       `d`,
 		ExternalIODir:     options.externalIODir,
 		Settings:          options.settings,
@@ -513,12 +527,15 @@ func startTestTenant(
 	tenantServer, tenantDB := serverutils.StartTenant(t, systemServer, tenantArgs)
 	// Re-run setup on the tenant as well
 	tenantRunner := sqlutils.MakeSQLRunner(tenantDB)
-	tenantRunner.ExecMultiple(t, strings.Split(serverSetupStatements, ";")...)
+	tenantRunner.ExecMultiple(t, strings.Split(tenantSetupStatements, ";")...)
 
+	ctx := context.Background()
+	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &tenantServer.ClusterSettings().SV, true)
+	sql.SecondaryTenantScatterEnabled.Override(ctx, &tenantServer.ClusterSettings().SV, true)
 	waitForTenantPodsActive(t, tenantServer, 1)
 	resetRetry := testingUseFastRetry()
 	return tenantID, tenantServer, tenantDB, func() {
-		tenantServer.Stopper().Stop(context.Background())
+		tenantServer.Stopper().Stop(ctx)
 		resetRetry()
 	}
 }
@@ -592,14 +609,6 @@ func (opts feedTestOptions) omitSinks(sinks ...string) feedTestOptions {
 // and not the sqlServer.
 func withArgsFn(fn updateArgsFn) feedTestOption {
 	return func(opts *feedTestOptions) { opts.argsFn = fn }
-}
-
-// withSettingsFn arranges for a feed option to set the settings for
-// both system and test tenant.
-func withSettings(st *cluster.Settings) feedTestOption {
-	return func(opts *feedTestOptions) {
-		opts.settings = st
-	}
 }
 
 // withKnobsFn is a feedTestOption that allows the caller to modify
@@ -796,7 +805,7 @@ func makeSystemServerWithOptions(
 			TestServer: TestServer{
 				DB:           systemDB,
 				Server:       systemServer,
-				TestingKnobs: systemServer.(*server.TestServer).Cfg.TestingKnobs,
+				TestingKnobs: *systemServer.SystemLayer().TestingKnobs(),
 				Codec:        keys.SystemSQLCodec,
 			},
 			SystemServer: systemServer,
@@ -822,7 +831,7 @@ func makeTenantServerWithOptions(
 			TestServer: TestServer{
 				DB:           tenantDB,
 				Server:       tenantServer,
-				TestingKnobs: tenantServer.(*server.TestTenant).Cfg.TestingKnobs,
+				TestingKnobs: *tenantServer.TestingKnobs(),
 				Codec:        keys.MakeSQLCodec(tenantID),
 			},
 			SystemDB:     systemDB,
@@ -878,9 +887,6 @@ func randomSinkTypeWithOptions(options feedTestOptions) string {
 		for _, sinkType := range options.disabledSinkTypes {
 			sinkWeights[sinkType] = 0
 		}
-	}
-	if weight, ok := sinkWeights["cloudstorage"]; ok && weight != 0 {
-		sinkWeights = map[string]int{"cloudstorage": 1}
 	}
 	weightTotal := 0
 	for _, weight := range sinkWeights {

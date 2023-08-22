@@ -18,9 +18,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
-	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/objstorage"
+	"github.com/cockroachdb/pebble/rangekey"
 	"github.com/cockroachdb/pebble/sstable"
 )
 
@@ -37,6 +38,7 @@ type SSTWriter struct {
 
 var _ Writer = &SSTWriter{}
 var _ ExportWriter = &SSTWriter{}
+var _ InternalWriter = &SSTWriter{}
 
 // noopFinishAbort is used to wrap io.Writers for sstable.Writer.
 type noopFinishAbort struct {
@@ -70,6 +72,9 @@ func MakeIngestionWriterOptions(ctx context.Context, cs *cluster.Settings) sstab
 	if cs.Version.IsActive(ctx, clusterversion.V23_1EnablePebbleFormatSSTableValueBlocks) &&
 		ValueBlocksEnabled.Get(&cs.SV) {
 		format = sstable.TableFormatPebblev3
+	}
+	if cs.Version.IsActive(ctx, clusterversion.V23_2_PebbleFormatVirtualSSTables) && ValueBlocksEnabled.Get(&cs.SV) {
+		format = sstable.TableFormatPebblev4
 	}
 	opts := DefaultPebbleOptions().MakeWriterOptions(0, format)
 	opts.MergerName = "nullptr"
@@ -228,6 +233,56 @@ func (fw *SSTWriter) ClearEngineRangeKey(start, end roachpb.Key, suffix []byte) 
 	return fw.fw.RangeKeyUnset(EngineKey{Key: start}.Encode(), EngineKey{Key: end}.Encode(), suffix)
 }
 
+// ClearRawEncodedRange implements the InternalWriter interface.
+func (fw *SSTWriter) ClearRawEncodedRange(start, end []byte) error {
+	startEngine, ok := DecodeEngineKey(start)
+	if !ok {
+		return errors.New("cannot decode start engine key")
+	}
+	endEngine, ok := DecodeEngineKey(end)
+	if !ok {
+		return errors.New("cannot decode end engine key")
+	}
+	fw.DataSize += int64(len(startEngine.Key)) + int64(len(endEngine.Key))
+	return fw.fw.DeleteRange(start, end)
+}
+
+// PutInternalRangeKey implements the InternalWriter interface.
+func (fw *SSTWriter) PutInternalRangeKey(start, end []byte, key rangekey.Key) error {
+	if !fw.supportsRangeKeys {
+		return errors.New("range keys not supported by SST writer")
+	}
+	startEngine, ok := DecodeEngineKey(start)
+	if !ok {
+		return errors.New("cannot decode engine key")
+	}
+	endEngine, ok := DecodeEngineKey(end)
+	if !ok {
+		return errors.New("cannot decode engine key")
+	}
+	fw.DataSize += int64(len(startEngine.Key)) + int64(len(endEngine.Key)) + int64(len(key.Value))
+	switch key.Kind() {
+	case pebble.InternalKeyKindRangeKeyUnset:
+		return fw.fw.RangeKeyUnset(start, end, key.Suffix)
+	case pebble.InternalKeyKindRangeKeySet:
+		return fw.fw.RangeKeySet(start, end, key.Suffix, key.Value)
+	case pebble.InternalKeyKindRangeKeyDelete:
+		return fw.fw.RangeKeyDelete(start, end)
+	default:
+		panic("unexpected range key kind")
+	}
+}
+
+// PutInternalPointKey implements the InternalWriter interface.
+func (fw *SSTWriter) PutInternalPointKey(key *pebble.InternalKey, value []byte) error {
+	ek, ok := DecodeEngineKey(key.UserKey)
+	if !ok {
+		return errors.New("cannot decode engine key")
+	}
+	fw.DataSize += int64(len(ek.Key)) + int64(len(value))
+	return fw.fw.Add(*key, value)
+}
+
 // clearRange clears all point keys in the given range by dropping a Pebble
 // range tombstone.
 //
@@ -290,16 +345,6 @@ func (fw *SSTWriter) PutUnversioned(key roachpb.Key, value []byte) error {
 	return fw.put(MVCCKey{Key: key}, value)
 }
 
-// PutIntent implements the Writer interface.
-// An error is returned if it is not greater than any previously added entry
-// (according to the comparator configured during writer creation). `Close`
-// cannot have been called.
-func (fw *SSTWriter) PutIntent(
-	ctx context.Context, key roachpb.Key, value []byte, txnUUID uuid.UUID,
-) error {
-	return fw.put(MVCCKey{Key: key}, value)
-}
-
 // PutEngineKey implements the Writer interface.
 // An error is returned if it is not greater than any previously added entry
 // (according to the comparator configured during writer creation). `Close`
@@ -347,16 +392,6 @@ func (fw *SSTWriter) ClearMVCC(key MVCCKey, opts ClearOptions) error {
 // cannot have been called.
 func (fw *SSTWriter) ClearUnversioned(key roachpb.Key, opts ClearOptions) error {
 	return fw.clear(MVCCKey{Key: key}, opts)
-}
-
-// ClearIntent implements the Writer interface. An error is returned if it is
-// not greater than any previous point key passed to this Writer (according to
-// the comparator configured during writer creation). `Close` cannot have been
-// called.
-func (fw *SSTWriter) ClearIntent(
-	key roachpb.Key, txnDidNotUpdateMeta bool, txnUUID uuid.UUID, opts ClearOptions,
-) error {
-	panic("ClearIntent is unsupported")
 }
 
 // ClearEngineKey implements the Writer interface. An error is returned if it is

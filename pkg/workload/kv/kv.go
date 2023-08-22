@@ -95,6 +95,7 @@ type kv struct {
 	enum                                 bool
 	keySize                              int
 	insertCount                          int
+	useBackgroundTxnQoS                  bool
 }
 
 func init() {
@@ -178,6 +179,8 @@ var kvMeta = workload.Meta{
 			`Use string key of appropriate size instead of int`)
 		g.flags.DurationVar(&g.sfuDelay, `sfu-wait-delay`, 10*time.Millisecond,
 			`Delay before sfu write transaction commits or aborts`)
+		g.flags.BoolVar(&g.useBackgroundTxnQoS, `background-qos`, false,
+			`Set default_transaction_quality_of_service session variable to "background".`)
 		g.connFlags = workload.NewConnFlags(&g.flags)
 		return g
 	},
@@ -282,17 +285,17 @@ func (w *kv) validateConfig() (err error) {
 // Note that sequence is only exposed for testing purposes and is used by
 // returned keyGenerators.
 func (w *kv) createKeyGenerator() (func() keyGenerator, *sequence, keyTransformer, keyRange) {
-	writeSeq := 0
+	var writeSeq atomic.Int64
 	if w.writeSeq != "" {
-		var err error
-		writeSeq, err = strconv.Atoi(w.writeSeq[1:])
+		writeSeqVal, err := strconv.Atoi(w.writeSeq[1:])
 		if err != nil {
 			panic("creating generator from unvalidated workload")
 		}
+		writeSeq.Store(int64(writeSeqVal))
 	}
 
 	// Sequence is shared between all generators.
-	seq := &sequence{max: w.cycleLength, val: int64(writeSeq)}
+	seq := &sequence{max: w.cycleLength, val: &writeSeq}
 
 	var gen func() keyGenerator
 	var kr keyRange
@@ -520,12 +523,12 @@ func (w *kv) Ops(
 
 	gen, _, kt, _ := w.createKeyGenerator()
 	ql := workload.QueryLoad{SQLDatabase: sqlDatabase}
-	numEmptyResults := new(int64)
+	var numEmptyResults atomic.Int64
 	for i := 0; i < w.connFlags.Concurrency; i++ {
 		op := &kvOp{
 			config:          w,
 			hists:           reg.GetHandle(),
-			numEmptyResults: numEmptyResults,
+			numEmptyResults: &numEmptyResults,
 		}
 		op.readStmt = op.sr.Define(readStmtStr)
 		op.writeStmt = op.sr.Define(writeStmtStr)
@@ -533,6 +536,10 @@ func (w *kv) Ops(
 			op.sfuStmt = op.sr.Define(sfuStmtStr)
 		}
 		op.spanStmt = op.sr.Define(spanStmtStr)
+		if w.useBackgroundTxnQoS {
+			stmt := op.sr.Define(" SET default_transaction_quality_of_service = background")
+			op.qosStmt = &stmt
+		}
 		op.delStmt = op.sr.Define(delStmtStr)
 		if err := op.sr.Init(ctx, "kv", mcp); err != nil {
 			return workload.QueryLoad{}, err
@@ -551,6 +558,7 @@ type kvOp struct {
 	hists           *histogram.Histograms
 	sr              workload.SQLRunner
 	mcp             *workload.MultiConnPool
+	qosStmt         *workload.StmtHandle
 	readStmt        workload.StmtHandle
 	writeStmt       workload.StmtHandle
 	spanStmt        workload.StmtHandle
@@ -558,7 +566,7 @@ type kvOp struct {
 	delStmt         workload.StmtHandle
 	g               keyGenerator
 	t               keyTransformer
-	numEmptyResults *int64 // accessed atomically
+	numEmptyResults *atomic.Int64
 }
 
 func (o *kvOp) run(ctx context.Context) (retErr error) {
@@ -568,6 +576,12 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 		defer cancel()
 	}
 
+	if o.qosStmt != nil {
+		_, err := o.qosStmt.Exec(ctx)
+		if err != nil {
+			return err
+		}
+	}
 	statementProbability := o.g.rand().Intn(100) // Determines what statement is executed.
 	if statementProbability < o.config.readPercent {
 		args := make([]interface{}, o.config.batchSize)
@@ -584,7 +598,7 @@ func (o *kvOp) run(ctx context.Context) (retErr error) {
 			empty = false
 		}
 		if empty {
-			atomic.AddInt64(o.numEmptyResults, 1)
+			o.numEmptyResults.Add(1)
 		}
 		elapsed := timeutil.Since(start)
 		o.hists.Get(`read`).Record(elapsed)
@@ -696,7 +710,7 @@ func (o *kvOp) tryHandleWriteErr(name string, start time.Time, err error) error 
 }
 
 func (o *kvOp) close(context.Context) {
-	if empty := atomic.LoadInt64(o.numEmptyResults); empty != 0 {
+	if empty := o.numEmptyResults.Load(); empty != 0 {
 		fmt.Printf("Number of reads that didn't return any results: %d.\n", empty)
 	}
 	fmt.Printf("Write sequence could be resumed by passing --write-seq=%s to the next run.\n",
@@ -704,18 +718,19 @@ func (o *kvOp) close(context.Context) {
 }
 
 type sequence struct {
-	val, max int64
+	val *atomic.Int64
+	max int64
 }
 
 func (s *sequence) write() int64 {
-	return (atomic.AddInt64(&s.val, 1) - 1) % s.max
+	return (s.val.Add(1) - 1) % s.max
 }
 
 // read returns the last key index that has been written. Note that the returned
 // index might not actually have been written yet, so a read operation cannot
 // require that the key is present.
 func (s *sequence) read() int64 {
-	return atomic.LoadInt64(&s.val) % s.max
+	return s.val.Load() % s.max
 }
 
 // Converts int64 based keys into database keys. Workload uses int64 based

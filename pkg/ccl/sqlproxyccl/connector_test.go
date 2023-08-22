@@ -381,10 +381,10 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		c := &connector{
 			TenantID: roachpb.MustMakeTenantID(42),
 			DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
-				Mode:     metric.HistogramModePrometheus,
-				Metadata: metaDialTenantLatency,
-				Duration: time.Millisecond,
-				Buckets:  metric.IOLatencyBuckets,
+				Mode:         metric.HistogramModePrometheus,
+				Metadata:     metaDialTenantLatency,
+				Duration:     time.Millisecond,
+				BucketConfig: metric.IOLatencyBuckets,
 			}),
 			DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
 		}
@@ -466,10 +466,10 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 
 		c := &connector{
 			DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
-				Mode:     metric.HistogramModePreferHdrLatency,
-				Metadata: metaDialTenantLatency,
-				Duration: time.Millisecond,
-				Buckets:  metric.IOLatencyBuckets,
+				Mode:         metric.HistogramModePreferHdrLatency,
+				Metadata:     metaDialTenantLatency,
+				Duration:     time.Millisecond,
+				BucketConfig: metric.IOLatencyBuckets,
 			}),
 			DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
 		}
@@ -500,10 +500,10 @@ func TestConnector_dialTenantCluster(t *testing.T) {
 		c := &connector{
 			TenantID: roachpb.MustMakeTenantID(42),
 			DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
-				Mode:     metric.HistogramModePreferHdrLatency,
-				Metadata: metaDialTenantLatency,
-				Duration: time.Millisecond,
-				Buckets:  metric.IOLatencyBuckets,
+				Mode:         metric.HistogramModePreferHdrLatency,
+				Metadata:     metaDialTenantLatency,
+				Duration:     time.Millisecond,
+				BucketConfig: metric.IOLatencyBuckets,
 			}),
 			DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
 		}
@@ -888,14 +888,14 @@ func TestConnector_dialSQLServer(t *testing.T) {
 				require.Equal(t, c.StartupMsg, msg)
 				require.Equal(t, "127.0.0.2:4567", serverAddress)
 				require.Nil(t, tlsConfig)
-				return nil, withCode(errors.New("bar"), codeBackendDown)
+				return nil, withCode(errors.New("bar"), codeBackendDialFailed)
 			},
 		)()
 		sa := balancer.NewServerAssignment(tenantID, tracker, nil, "127.0.0.2:4567")
 		defer sa.Close()
 
 		conn, err := c.dialSQLServer(ctx, sa)
-		require.EqualError(t, err, "codeBackendDown: bar")
+		require.EqualError(t, err, "codeBackendDialFailed: bar")
 		require.True(t, isRetriableConnectorError(err))
 		require.Nil(t, conn)
 	})

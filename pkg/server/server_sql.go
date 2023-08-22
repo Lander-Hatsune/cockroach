@@ -57,6 +57,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/autoconfig"
 	"github.com/cockroachdb/cockroach/pkg/server/diagnostics"
 	"github.com/cockroachdb/cockroach/pkg/server/pgurl"
+	"github.com/cockroachdb/cockroach/pkg/server/serverctl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
@@ -470,7 +471,7 @@ func (s *stopperSessionEventListener) OnSessionDeleted(
 	ctx context.Context,
 ) (createAnotherSession bool) {
 	s.trigger.signalStop(ctx,
-		MakeShutdownRequest(ShutdownReasonFatalError, errors.New("sql liveness session deleted")))
+		serverctl.MakeShutdownRequest(serverctl.ShutdownReasonFatalError, errors.New("sql liveness session deleted")))
 	// Return false in order to prevent the sqlliveness loop from creating a new
 	// session. We're shutting down the server and creating a new session would
 	// only cause confusion.
@@ -524,7 +525,7 @@ func (r *refreshInstanceSessionListener) OnSessionDeleted(
 }
 
 // newSQLServer constructs a new SQLServer. The caller is responsible for
-// listening to the server's ShutdownRequested() channel (which is the same as
+// listening to the server's serverctl.ShutdownRequested() channel (which is the same as
 // cfg.stopTrigger.C()) and stopping cfg.stopper when signaled.
 func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	// NB: ValidateAddrs also fills in defaults.
@@ -954,19 +955,23 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 		SessionInitCache: sessioninit.NewCache(
 			serverCacheMemoryMonitor.MakeBoundAccount(), cfg.stopper,
 		),
+		AuditConfig: &auditlogging.AuditConfigLock{
+			Config: auditlogging.EmptyAuditConfig(),
+		},
 		ClientCertExpirationCache: security.NewClientCertExpirationCache(
 			ctx, cfg.Settings, cfg.stopper, &timeutil.DefaultTimeSource{}, rootSQLMemoryMonitor,
 		),
-		RootMemoryMonitor:         rootSQLMemoryMonitor,
-		TestingKnobs:              sqlExecutorTestingKnobs,
-		CompactEngineSpanFunc:     storageEngineClient.CompactEngineSpan,
-		CompactionConcurrencyFunc: storageEngineClient.SetCompactionConcurrency,
-		GetTableMetricsFunc:       storageEngineClient.GetTableMetrics,
-		TraceCollector:            traceCollector,
-		TenantUsageServer:         cfg.tenantUsageServer,
-		KVStoresIterator:          cfg.kvStoresIterator,
-		InspectzServer:            cfg.inspectzServer,
-		RangeDescIteratorFactory:  cfg.rangeDescIteratorFactory,
+		RootMemoryMonitor:           rootSQLMemoryMonitor,
+		TestingKnobs:                sqlExecutorTestingKnobs,
+		CompactEngineSpanFunc:       storageEngineClient.CompactEngineSpan,
+		CompactionConcurrencyFunc:   storageEngineClient.SetCompactionConcurrency,
+		GetTableMetricsFunc:         storageEngineClient.GetTableMetrics,
+		ScanStorageInternalKeysFunc: storageEngineClient.ScanStorageInternalKeys,
+		TraceCollector:              traceCollector,
+		TenantUsageServer:           cfg.tenantUsageServer,
+		KVStoresIterator:            cfg.kvStoresIterator,
+		InspectzServer:              cfg.inspectzServer,
+		RangeDescIteratorFactory:    cfg.rangeDescIteratorFactory,
 		SyntheticPrivilegeCache: syntheticprivilegecache.New(
 			cfg.Settings, cfg.stopper, cfg.db,
 			serverCacheMemoryMonitor.MakeBoundAccount(),
@@ -1350,7 +1355,7 @@ func newSQLServer(ctx context.Context, cfg sqlServerArgs) (*SQLServer, error) {
 	vmoduleSetting.SetOnChange(&cfg.Settings.SV, fn)
 	fn(ctx)
 
-	auditlogging.ConfigureRoleBasedAuditClusterSettings(ctx, execCfg.SessionInitCache.AuditConfig, execCfg.Settings, &execCfg.Settings.SV)
+	auditlogging.ConfigureRoleBasedAuditClusterSettings(ctx, execCfg.AuditConfig, execCfg.Settings, &execCfg.Settings.SV)
 
 	return &SQLServer{
 		ambientCtx:                     cfg.BaseConfig.AmbientCtx,
@@ -1404,6 +1409,19 @@ func (s *SQLServer) preStart(
 	if s.tenantConnect != nil {
 		if err := s.tenantConnect.Start(ctx); err != nil {
 			return err
+		}
+		// Propagate the tenant name to the logging context, so the name
+		// appears in logging output.
+		//
+		// Note: we only need to do this once here, because the tenant name
+		// cannot change while the service mode is active.
+		//
+		// TODO(#77336): Instead of initializing a tenant server from the ID,
+		// and only then receiving the name from KV, prefer starting from the name,
+		// configuring that early on in the context bits, then look up the ID
+		// from KV (or elsewhere).
+		if entry, _ := s.tenantConnect.TenantInfo(); entry.Name != "" {
+			s.cfg.idProvider.SetTenantName(entry.Name)
 		}
 		if err := s.startCheckService(ctx, stopper); err != nil {
 			return err
@@ -1703,14 +1721,14 @@ func (s *SQLServer) startCheckService(ctx context.Context, stopper *stop.Stopper
 
 	var entry tenantcapabilities.Entry
 	var updateCh <-chan struct{}
-	check := func() error {
+	check := func() (useGracefulDrain bool, err error) {
 		entry, updateCh = s.tenantConnect.TenantInfo()
 		return checkServerModeMatchesEntry(s.serviceMode, entry)
 	}
 
 	// Do a synchronous check, to prevent starting the SQL service
 	// outright if the service mode is initially incorrect.
-	if err := check(); err != nil {
+	if _, err := check(); err != nil {
 		return err
 	}
 
@@ -1722,9 +1740,14 @@ func (s *SQLServer) startCheckService(ctx context.Context, stopper *stop.Stopper
 			case <-ctx.Done():
 				return
 			case <-updateCh:
-				if err := check(); err != nil {
-					s.stopTrigger.signalStop(ctx,
-						MakeShutdownRequest(ShutdownReasonFatalError, err))
+				if useGracefulDrain, err := check(); err != nil {
+					var req serverctl.ShutdownRequest
+					if useGracefulDrain {
+						req = serverctl.MakeShutdownRequest(serverctl.ShutdownReasonGracefulStopRequestedByOrchestration, err)
+					} else {
+						req = serverctl.MakeShutdownRequest(serverctl.ShutdownReasonFatalError, err)
+					}
+					s.stopTrigger.signalStop(ctx, req)
 				}
 			}
 		}
@@ -1733,7 +1756,7 @@ func (s *SQLServer) startCheckService(ctx context.Context, stopper *stop.Stopper
 
 func checkServerModeMatchesEntry(
 	expectedMode mtinfopb.TenantServiceMode, entry tenantcapabilities.Entry,
-) error {
+) (useGracefulDrain bool, err error) {
 	if !entry.Ready() {
 		// At the version this check was introduced, the server was
 		// already modified to provide metadata during the initial
@@ -1741,19 +1764,24 @@ func checkServerModeMatchesEntry(
 		//
 		// If we don't have the metadata here, this means that the
 		// connector is talking to an older-version server.
-		return errors.AssertionFailedf("storage layer did not communicate metadata, is it running an older binary version than the client?")
+		return false, errors.AssertionFailedf("storage layer did not communicate metadata, is it running an older binary version than the client?")
 	}
 
 	if actualMode := entry.ServiceMode; expectedMode != actualMode {
-		return errors.Newf("service check failed: expected service mode %v, record says %v", expectedMode, actualMode)
+		// We can only use a graceful drain if the data state is still ready.
+		useGracefulDrain = entry.DataState == mtinfopb.DataStateReady
+		return useGracefulDrain, errors.Newf("service check failed: expected service mode %v, record says %v", expectedMode, actualMode)
 	}
 	// Extra sanity check. This should never happen (we should enforce
 	// a valid data state when the service mode is not NONE) but it's
 	// cheap to check.
 	if expected, actual := mtinfopb.DataStateReady, entry.DataState; expected != actual {
-		return errors.AssertionFailedf("service check failed: expected data state %v, record says %v", expected, actual)
+		return false, errors.AssertionFailedf("service check failed: expected data state %v, record says %v", expected, actual)
 	}
-	return nil
+
+	// Note: the caller only looks at the first return value if the
+	// error return is non-nil. So any value is fine.
+	return true, nil
 }
 
 // SQLInstanceID returns the ephemeral ID assigned to each SQL instance. The ID
@@ -1959,7 +1987,7 @@ func (s *SQLServer) LogicalClusterID() uuid.UUID {
 
 // ShutdownRequested returns a channel that is signaled when a subsystem wants
 // the server to be shut down.
-func (s *SQLServer) ShutdownRequested() <-chan ShutdownRequest {
+func (s *SQLServer) ShutdownRequested() <-chan serverctl.ShutdownRequest {
 	return s.stopTrigger.C()
 }
 

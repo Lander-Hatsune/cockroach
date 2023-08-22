@@ -25,7 +25,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
@@ -90,15 +89,15 @@ func TestEvalAddSSTable(t *testing.T) {
 			requireReqTS: true,
 			expectErr:    "AddSSTable requests must set SSTTimestampToRequestTimestamp",
 		},
-		"blind returns WriteIntentError on conflict": {
+		"blind returns LockConflictError on conflict": {
 			data:      kvs{pointKV("b", intentTS, "b0")},
 			sst:       kvs{pointKV("b", 1, "sst")},
-			expectErr: &kvpb.WriteIntentError{},
+			expectErr: &kvpb.LockConflictError{},
 		},
-		"blind returns WriteIntentError in span": {
+		"blind returns LockConflictError in span": {
 			data:      kvs{pointKV("b", intentTS, "b0")},
 			sst:       kvs{pointKV("a", 1, "sst"), pointKV("c", 1, "sst")},
-			expectErr: &kvpb.WriteIntentError{},
+			expectErr: &kvpb.LockConflictError{},
 		},
 		"blind ignores intent outside span": {
 			data:           kvs{pointKV("b", intentTS, "b0")},
@@ -212,12 +211,12 @@ func TestEvalAddSSTable(t *testing.T) {
 			expect:         kvs{pointKV("a", 5, "sst"), pointKV("b", 7, "b7"), pointKV("b", 5, "sst")},
 			expectStatsEst: true,
 		},
-		"SSTTimestampToRequestTimestamp returns WriteIntentError for intents": {
+		"SSTTimestampToRequestTimestamp returns LockConflictError for intents": {
 			reqTS:     10,
 			toReqTS:   1,
 			data:      kvs{pointKV("a", intentTS, "intent")},
 			sst:       kvs{pointKV("a", 1, "a@1")},
-			expectErr: &kvpb.WriteIntentError{},
+			expectErr: &kvpb.LockConflictError{},
 		},
 		"SSTTimestampToRequestTimestamp errors with DisallowConflicts below existing": {
 			reqTS:      5,
@@ -363,17 +362,17 @@ func TestEvalAddSSTable(t *testing.T) {
 			sst:        kvs{pointKV("b", 1, "sst"), pointKV("d", 1, "sst"), pointKV("f", 1, "sst")},
 			expectErr:  &kvpb.WriteTooOldError{},
 		},
-		"DisallowConflicts returns WriteIntentError below intent": {
+		"DisallowConflicts returns LockConflictError below intent": {
 			noConflict: true,
 			data:       kvs{pointKV("a", intentTS, "intent")},
 			sst:        kvs{pointKV("a", 3, "sst")},
-			expectErr:  &kvpb.WriteIntentError{},
+			expectErr:  &kvpb.LockConflictError{},
 		},
-		"DisallowConflicts returns WriteIntentError below intent above range key": {
+		"DisallowConflicts returns LockConflictError below intent above range key": {
 			noConflict: true,
 			data:       kvs{pointKV("b", intentTS, "intent"), rangeKV("a", "d", 2, ""), pointKV("b", 1, "b1")},
 			sst:        kvs{pointKV("b", 3, "sst")},
-			expectErr:  &kvpb.WriteIntentError{},
+			expectErr:  &kvpb.LockConflictError{},
 		},
 		"DisallowConflicts ignores intents in span": { // inconsistent with blind writes
 			noConflict: true,
@@ -467,17 +466,17 @@ func TestEvalAddSSTable(t *testing.T) {
 			sst:      kvs{pointKV("a", 4, "sst")},
 			expect:   kvs{pointKV("a", 4, "sst"), pointKV("a", 3, "")},
 		},
-		"DisallowShadowing returns WriteIntentError below intent": {
+		"DisallowShadowing returns LockConflictError below intent": {
 			noShadow:  true,
 			data:      kvs{pointKV("a", intentTS, "intent")},
 			sst:       kvs{pointKV("a", 3, "sst")},
-			expectErr: &kvpb.WriteIntentError{},
+			expectErr: &kvpb.LockConflictError{},
 		},
-		"DisallowShadowing returns WriteIntentError below intent above range key": {
+		"DisallowShadowing returns LockConflictError below intent above range key": {
 			noShadow:  true,
 			data:      kvs{pointKV("b", intentTS, "intent"), rangeKV("a", "d", 2, ""), pointKV("b", 1, "b1")},
 			sst:       kvs{pointKV("b", 3, "sst")},
-			expectErr: &kvpb.WriteIntentError{},
+			expectErr: &kvpb.LockConflictError{},
 		},
 		"DisallowShadowing ignores intents in span": { // inconsistent with blind writes
 			noShadow: true,
@@ -595,17 +594,17 @@ func TestEvalAddSSTable(t *testing.T) {
 			sst:           kvs{pointKV("a", 4, "sst")},
 			expect:        kvs{pointKV("a", 4, "sst"), pointKV("a", 3, "")},
 		},
-		"DisallowShadowingBelow returns WriteIntentError below intent": {
+		"DisallowShadowingBelow returns LockConflictError below intent": {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("a", intentTS, "intent")},
 			sst:           kvs{pointKV("a", 3, "sst")},
-			expectErr:     &kvpb.WriteIntentError{},
+			expectErr:     &kvpb.LockConflictError{},
 		},
-		"DisallowShadowingBelow returns WriteIntentError below intent above range key": {
+		"DisallowShadowingBelow returns LockConflictError below intent above range key": {
 			noShadowBelow: 5,
 			data:          kvs{pointKV("b", intentTS, "intent"), rangeKV("a", "d", 2, ""), pointKV("b", 1, "b1")},
 			sst:           kvs{pointKV("b", 3, "sst")},
-			expectErr:     &kvpb.WriteIntentError{},
+			expectErr:     &kvpb.LockConflictError{},
 		},
 		"DisallowShadowingBelow ignores intents in span": { // inconsistent with blind writes
 			noShadowBelow: 5,
@@ -885,11 +884,11 @@ func TestEvalAddSSTable(t *testing.T) {
 			sst:        kvs{rangeKV("a", "b", 8, ""), rangeKV("c", "d", 8, "")},
 			expect:     kvs{rangeKV("a", "b", 8, ""), rangeKV("a", "b", 6, ""), rangeKV("c", "d", 8, ""), rangeKV("e", "f", 6, "")},
 		},
-		"DisallowConflicts returns engine intents below sst range keys as write intent errors": {
+		"DisallowConflicts returns engine intents below sst range keys as lock conflict errors": {
 			noConflict: true,
 			data:       kvs{pointKV("b", intentTS, "intent")},
 			sst:        kvs{rangeKV("a", "c", intentTS+8, "")},
-			expectErr:  &kvpb.WriteIntentError{},
+			expectErr:  &kvpb.LockConflictError{},
 		},
 		"DisallowConflicts disallows sst range keys below engine point key": {
 			noConflict: true,
@@ -1250,7 +1249,7 @@ func TestEvalAddSSTable(t *testing.T) {
 						} else {
 							require.NotNil(t, result.Replicated.AddSSTable)
 							require.NoError(t, fs.WriteFile(engine, "sst", result.Replicated.AddSSTable.Data))
-							require.NoError(t, engine.IngestExternalFiles(ctx, []string{"sst"}))
+							require.NoError(t, engine.IngestLocalFiles(ctx, []string{"sst"}))
 						}
 
 						var expect kvs
@@ -1653,7 +1652,7 @@ func TestAddSSTableMVCCStats(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, fs.WriteFile(engine, "sst", sst))
-	require.NoError(t, engine.IngestExternalFiles(ctx, []string{"sst"}))
+	require.NoError(t, engine.IngestLocalFiles(ctx, []string{"sst"}))
 
 	statsEvaled := statsBefore
 	statsEvaled.Add(*cArgs.Stats)
@@ -1880,7 +1879,8 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsTSCache(t *testing.T) {
 	txn := db.NewTxn(ctx, "txn")
 	require.NoError(t, txn.Put(ctx, "key", "txn"))
 	require.NoError(t, txn.Commit(ctx))
-	txnTS := txn.CommitTimestamp()
+	txnTS, err := txn.CommitTimestamp()
+	require.NoError(t, err)
 
 	// Add an SST writing below the previous write.
 	sst, start, end := storageutils.MakeSST(t, s.ClusterSettings(), kvs{pointKV("key", 1, "sst")})
@@ -1924,15 +1924,14 @@ func TestAddSSTableSSTTimestampToRequestTimestampRespectsClosedTS(t *testing.T) 
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	si, _, db := serverutils.StartServer(t, base.TestServerArgs{
+	s, _, db := serverutils.StartServer(t, base.TestServerArgs{
 		Knobs: base.TestingKnobs{
 			Store: &kvserver.StoreTestingKnobs{
 				DisableCanAckBeforeApplication: true,
 			},
 		},
 	})
-	defer si.Stopper().Stop(ctx)
-	s := si.(*server.TestServer)
+	defer s.Stopper().Stop(ctx)
 
 	// Issue a write to trigger a closed timestamp.
 	require.NoError(t, db.Put(ctx, "someKey", "someValue"))

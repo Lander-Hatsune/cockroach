@@ -60,12 +60,7 @@ var GCJitter = settings.RegisterFloatSetting(
 	"server.sqlliveness.gc_jitter",
 	"jitter fraction on the duration between attempts to delete extant sessions that have expired",
 	.15,
-	func(f float64) error {
-		if f < 0 || f > 1 {
-			return errors.Errorf("%f is not in [0, 1]", f)
-		}
-		return nil
-	},
+	settings.Fraction,
 )
 
 // CacheSize is the size of the entries to store in the cache.
@@ -202,33 +197,41 @@ const (
 func (s *Storage) isAlive(
 	ctx context.Context, sid sqlliveness.SessionID, syncOrAsync readType,
 ) (alive bool, _ error) {
-	s.mu.Lock()
-	if !s.mu.started {
-		s.mu.Unlock()
-		return false, sqlliveness.NotStartedError
-	}
-	if _, ok := s.mu.deadSessions.Get(sid); ok {
-		s.mu.Unlock()
-		s.metrics.IsAliveCacheHits.Inc(1)
-		return false, nil
-	}
-	if expiration, ok := s.mu.liveSessions.Get(sid); ok {
-		expiration := expiration.(hlc.Timestamp)
-		// The record exists and is valid.
-		if s.clock.Now().Less(expiration) {
-			s.mu.Unlock()
-			s.metrics.IsAliveCacheHits.Inc(1)
-			return true, nil
+
+	// If wait is false, alive is set and future is unset.
+	// If wait is true, alive is unset and future is set.
+	alive, wait, future, err := func() (bool, bool, singleflight.Future, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		if !s.mu.started {
+			return false, false, singleflight.Future{}, sqlliveness.NotStartedError
 		}
+		if _, ok := s.mu.deadSessions.Get(sid); ok {
+			s.metrics.IsAliveCacheHits.Inc(1)
+			return false, false, singleflight.Future{}, nil
+		}
+		if expiration, ok := s.mu.liveSessions.Get(sid); ok {
+			expiration := expiration.(hlc.Timestamp)
+			// The record exists and is valid.
+			if s.clock.Now().Less(expiration) {
+				s.metrics.IsAliveCacheHits.Inc(1)
+				return true, false, singleflight.Future{}, nil
+			}
+		}
+
+		// We think that the session is expired; check, and maybe delete it.
+		future := s.deleteOrFetchSessionSingleFlightLocked(ctx, sid)
+
+		// At this point, we know that the singleflight goroutine has been launched.
+		// Releasing the lock when we return ensures that callers will either join
+		// the singleflight or see the result.
+		return false, true, future, nil
+	}()
+	if err != nil || !wait {
+		return alive, err
 	}
 
-	// We think that the session is expired; check, and maybe delete it.
-	future := s.deleteOrFetchSessionSingleFlightLocked(ctx, sid)
-
-	// At this point, we know that the singleflight goroutine has been launched.
-	// Releasing the lock here ensures that callers will either join the single-
-	// flight or see the result.
-	s.mu.Unlock()
 	s.metrics.IsAliveCacheMisses.Inc(1)
 
 	// If we do not want to wait for the result, assume that the session is

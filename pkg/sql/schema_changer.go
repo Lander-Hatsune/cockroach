@@ -51,6 +51,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -156,6 +157,7 @@ type SchemaChanger struct {
 	clock                *hlc.Clock
 	settings             *cluster.Settings
 	execCfg              *ExecutorConfig
+	sessionData          *sessiondatapb.SessionData
 }
 
 // NewSchemaChangerForTesting only for tests.
@@ -291,6 +293,8 @@ func (sc *SchemaChanger) refreshMaterializedView(
 	return sc.backfillQueryIntoTable(ctx, tableToRefresh, table.GetViewQuery(), refresh.AsOf(), "refreshView")
 }
 
+const schemaChangerBackfillTxnDebugName = "schemaChangerBackfill"
+
 func (sc *SchemaChanger) backfillQueryIntoTable(
 	ctx context.Context, table catalog.TableDescriptor, query string, ts hlc.Timestamp, desc string,
 ) error {
@@ -300,11 +304,18 @@ func (sc *SchemaChanger) backfillQueryIntoTable(
 		}
 	}
 
+	isTxnRetry := false
 	return sc.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+		defer func() {
+			isTxnRetry = true
+		}()
+		txn.KV().SetDebugName(schemaChangerBackfillTxnDebugName)
 		if err := txn.KV().SetFixedTimestamp(ctx, ts); err != nil {
 			return err
 		}
 
+		sd := NewInternalSessionData(ctx, sc.execCfg.Settings, "backfillQueryIntoTable")
+		sd.SessionData = *sc.sessionData
 		// Create an internal planner as the planner used to serve the user query
 		// would have committed by this point.
 		p, cleanup := NewInternalPlanner(
@@ -313,11 +324,28 @@ func (sc *SchemaChanger) backfillQueryIntoTable(
 			username.RootUserName(),
 			&MemoryMetrics{},
 			sc.execCfg,
-			NewInternalSessionData(ctx, sc.execCfg.Settings, "backfillQueryIntoTable"),
+			sd,
 		)
 
 		defer cleanup()
 		localPlanner := p.(*planner)
+
+		// Delete existing span before ingestion to prevent key collisions.
+		// BulkRowWriter adds SSTables non-transactionally so the writes are not
+		// rolled back.
+		if isTxnRetry {
+			request := kvpb.BatchRequest{
+				Header: kvpb.Header{
+					Timestamp: ts,
+				},
+			}
+			tableSpan := table.TableSpan(localPlanner.EvalContext().Codec)
+			request.Add(kvpb.NewDeleteRange(tableSpan.Key, tableSpan.EndKey, false))
+			if _, err := localPlanner.execCfg.DB.NonTransactionalSender().Send(ctx, &request); err != nil {
+				return err.GoError()
+			}
+		}
+
 		stmt, err := parser.ParseOne(query)
 		if err != nil {
 			return err
@@ -1598,8 +1626,7 @@ func (sc *SchemaChanger) done(ctx context.Context) error {
 							sc.execCfg.JobsKnobs(),
 							scheduledJobs,
 							scTable.GetPrivileges().Owner(),
-							scTable.GetID(),
-							modify.RowLevelTTL(),
+							scTable,
 						)
 						if err != nil {
 							return err
@@ -2156,6 +2183,7 @@ func (sc *SchemaChanger) updateJobForRollback(
 			TableMutationID: sc.mutationID,
 			ResumeSpanList:  spanList,
 			FormatVersion:   oldDetails.FormatVersion,
+			SessionData:     sc.sessionData,
 		},
 	); err != nil {
 		return err
@@ -2612,6 +2640,7 @@ func (r schemaChangeResumer) Resume(ctx context.Context, execCtx interface{}) er
 			settings:             p.ExecCfg().Settings,
 			execCfg:              p.ExecCfg(),
 			metrics:              p.ExecCfg().SchemaChangerMetrics,
+			sessionData:          details.SessionData,
 		}
 		opts := retry.Options{
 			InitialBackoff: 20 * time.Millisecond,
@@ -2829,6 +2858,7 @@ func (r schemaChangeResumer) OnFailOrCancel(
 		clock:                p.ExecCfg().Clock,
 		settings:             p.ExecCfg().Settings,
 		execCfg:              p.ExecCfg(),
+		sessionData:          details.SessionData,
 	}
 
 	if r.job.Payload().FinalResumeError == nil {
@@ -2932,6 +2962,7 @@ func (sc *SchemaChanger) queueCleanupJob(
 				// The version distinction for database jobs doesn't matter for jobs on
 				// tables.
 				FormatVersion: jobspb.DatabaseJobFormatVersion,
+				SessionData:   sc.sessionData,
 			},
 			Progress:      jobspb.SchemaChangeProgress{},
 			NonCancelable: true,

@@ -185,7 +185,7 @@ var bulkIOWriteLimit = settings.RegisterByteSizeSetting(
 	"kv.bulk_io_write.max_rate",
 	"the rate limit (bytes/sec) to use for writes to disk on behalf of bulk io ops",
 	1<<40, // 1 TiB
-).WithPublic()
+	settings.WithPublic)
 
 // addSSTableRequestLimit limits concurrent AddSSTable requests.
 var addSSTableRequestLimit = settings.RegisterIntSetting(
@@ -240,25 +240,16 @@ var queueAdditionOnSystemConfigUpdateBurst = settings.RegisterIntSetting(
 )
 
 // leaseTransferWait is the timeout for a single iteration of draining range leases.
-var leaseTransferWait = func() *settings.DurationSetting {
-	s := settings.RegisterDurationSetting(
-		settings.SystemOnly,
-		leaseTransferWaitSettingName,
-		"the timeout for a single iteration of the range lease transfer phase of draining "+
-			"(note that the --drain-wait parameter for cockroach node drain may need adjustment "+
-			"after changing this setting)",
-		5*time.Second,
-		func(v time.Duration) error {
-			if v < 0 {
-				return errors.Errorf("cannot set %s to a negative duration: %s",
-					leaseTransferWaitSettingName, v)
-			}
-			return nil
-		},
-	)
-	s.SetVisibility(settings.Public)
-	return s
-}()
+var leaseTransferWait = settings.RegisterDurationSetting(
+	settings.SystemOnly,
+	leaseTransferWaitSettingName,
+	"the timeout for a single iteration of the range lease transfer phase of draining "+
+		"(note that the --drain-wait parameter for cockroach node drain may need adjustment "+
+		"after changing this setting)",
+	5*time.Second,
+	settings.NonNegativeDuration,
+	settings.WithPublic,
+)
 
 const leaseTransferWaitSettingName = "server.shutdown.lease_transfer_wait"
 
@@ -1198,6 +1189,9 @@ type StoreConfig struct {
 	// data structure useful for retrieving span configs. Only available if
 	// SpanConfigsDisabled is unset.
 	SpanConfigSubscriber spanconfig.KVSubscriber
+	// SharedStorageEnabled stores whether this store is configured with a
+	// shared.Storage instance and can accept shared snapshots.
+	SharedStorageEnabled bool
 
 	// KVAdmissionController is used for admission control.
 	KVAdmissionController kvadmission.Controller
@@ -1229,18 +1223,14 @@ type StoreConfig struct {
 // (e.g., split, merge, add/remove voter/non-voter) into the system.rangelog
 // table and node join and restart events into system.eventolog table.
 // Decommissioning events are not controlled by this setting.
-var logRangeAndNodeEventsEnabled = func() *settings.BoolSetting {
-	s := settings.RegisterBoolSetting(
-		settings.SystemOnly,
-		"kv.log_range_and_node_events.enabled",
-		"set to true to transactionally log range events"+
-			" (e.g., split, merge, add/remove voter/non-voter) into system.rangelog"+
-			"and node join and restart events into system.eventolog",
-		true,
-	)
-	s.SetVisibility(settings.Public)
-	return s
-}()
+var logRangeAndNodeEventsEnabled = settings.RegisterBoolSetting(
+	settings.SystemOnly,
+	"kv.log_range_and_node_events.enabled",
+	"set to true to transactionally log range events"+
+		" (e.g., split, merge, add/remove voter/non-voter) into system.rangelog"+
+		"and node join and restart events into system.eventolog",
+	true,
+	settings.WithPublic)
 
 // ConsistencyTestingKnobs is a BatchEvalTestingKnobs struct used to control the
 // behavior of the consistency checker for tests.
@@ -2386,6 +2376,12 @@ func (s *Store) onSpanConfigUpdate(ctx context.Context, updated roachpb.Span) {
 
 	now := s.cfg.Clock.NowAsClockTimestamp()
 
+	// The replicate queue has a relatively more expensive queue check
+	// (shouldQueue), because it scales with the number of stores, and
+	// performs more checks.
+	enqueueToReplicateQueueEnabled := EnqueueInReplicateQueueOnSpanConfigUpdateEnabled.Get(
+		&s.GetStoreConfig().Settings.SV)
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if err := s.mu.replicasByKey.VisitKeyRange(ctx, sp.Key, sp.EndKey, AscendingKeyOrder,
@@ -2444,9 +2440,12 @@ func (s *Store) onSpanConfigUpdate(ctx context.Context, updated roachpb.Span) {
 			s.mergeQueue.Async(replCtx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
 				h.MaybeAdd(ctx, repl, now)
 			})
-			s.replicateQueue.Async(replCtx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
-				h.MaybeAdd(ctx, repl, now)
-			})
+
+			if enqueueToReplicateQueueEnabled {
+				s.replicateQueue.Async(replCtx, "span config update", true /* wait */, func(ctx context.Context, h queueHelper) {
+					h.MaybeAdd(ctx, repl, now)
+				})
+			}
 			return nil // more
 		},
 	); err != nil {
@@ -3410,11 +3409,13 @@ func (s *Store) ReplicateQueueDryRun(
 		s.cfg.AmbientCtx.Tracer, "replicate queue dry run",
 	)
 	defer collectAndFinish()
-	canTransferLease := func(ctx context.Context, repl plan.LeaseCheckReplica) bool {
+	canTransferLease := func(ctx context.Context, repl plan.LeaseCheckReplica, conf roachpb.SpanConfig) bool {
 		return true
 	}
+	desc := repl.Desc()
+	conf := repl.SpanConfig()
 	_, err := s.replicateQueue.processOneChange(
-		ctx, repl, canTransferLease, false /* scatter */, true, /* dryRun */
+		ctx, repl, desc, conf, canTransferLease, false /* scatter */, true, /* dryRun */
 	)
 	if err != nil {
 		log.Eventf(ctx, "error simulating allocator on replica %s: %s", repl, err)

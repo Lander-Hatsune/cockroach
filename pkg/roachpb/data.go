@@ -32,13 +32,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/isolation"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/must"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timetz"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -810,10 +810,18 @@ func (v Value) computeChecksum(key []byte) uint32 {
 // In `1:3:Float/6.28`, the `1` is the column id diff as stored, `3` is the
 // computed (i.e. not stored) actual column id, `Float` is the type, and `6.28`
 // is the encoded value.
-func (v Value) PrettyPrint() string {
+func (v Value) PrettyPrint() (ret string) {
 	if len(v.RawBytes) == 0 {
 		return "/<empty>"
 	}
+	// In certain cases untagged bytes could be malformed because they are
+	// coming from user input, in which case recover with an error instead
+	// of crashing.
+	defer func() {
+		if r := recover(); r != nil {
+			ret = fmt.Sprintf("/<err: paniced parsing with %v>", r)
+		}
+	}()
 	var buf bytes.Buffer
 	t := v.GetTag()
 	buf.WriteRune('/')
@@ -1160,7 +1168,7 @@ func (t *Transaction) Restart(
 	// Reset all epoch-scoped state.
 	t.Sequence = 0
 	t.WriteTooOld = false
-	t.CommitTimestampFixed = false
+	t.ReadTimestampFixed = false
 	t.LockSpans = nil
 	t.InFlightWrites = nil
 	t.IgnoredSeqNums = nil
@@ -1230,7 +1238,7 @@ func (t *Transaction) Update(o *Transaction) {
 		t.Epoch = o.Epoch
 		t.Status = o.Status
 		t.WriteTooOld = o.WriteTooOld
-		t.CommitTimestampFixed = o.CommitTimestampFixed
+		t.ReadTimestampFixed = o.ReadTimestampFixed
 		t.Sequence = o.Sequence
 		t.LockSpans = o.LockSpans
 		t.InFlightWrites = o.InFlightWrites
@@ -1256,7 +1264,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// If neither of the transactions has a bumped ReadTimestamp, then the
 			// WriteTooOld flag is cumulative.
 			t.WriteTooOld = t.WriteTooOld || o.WriteTooOld
-			t.CommitTimestampFixed = t.CommitTimestampFixed || o.CommitTimestampFixed
+			t.ReadTimestampFixed = t.ReadTimestampFixed || o.ReadTimestampFixed
 		} else if t.ReadTimestamp.Less(o.ReadTimestamp) {
 			// If `o` has a higher ReadTimestamp (i.e. it's the result of a refresh,
 			// which refresh generally clears the WriteTooOld field), then it dictates
@@ -1264,7 +1272,7 @@ func (t *Transaction) Update(o *Transaction) {
 			// concurrently with any requests whose response's WriteTooOld field
 			// matters.
 			t.WriteTooOld = o.WriteTooOld
-			t.CommitTimestampFixed = o.CommitTimestampFixed
+			t.ReadTimestampFixed = o.ReadTimestampFixed
 		}
 		// If t has a higher ReadTimestamp, than it gets to dictate the
 		// WriteTooOld field - so there's nothing to update.
@@ -1960,7 +1968,7 @@ func (l *Lease) Equal(that interface{}) bool {
 }
 
 // MakeIntent makes an intent with the given txn and key.
-// This is suitable for use when constructing WriteIntentError.
+// This is suitable for use when constructing LockConflictError.
 func MakeIntent(txn *enginepb.TxnMeta, key Key) Intent {
 	var i Intent
 	i.Key = key
@@ -2464,9 +2472,11 @@ var _ sort.Interface = SequencedWriteBySeq{}
 // Find searches for the index of the SequencedWrite with the provided
 // sequence number. Returns -1 if no corresponding write is found.
 func (s SequencedWriteBySeq) Find(seq enginepb.TxnSeq) int {
-	_ = must.Expensive(func() error {
-		return must.True(context.TODO(), sort.IsSorted(s), "SequencedWriteBySeq not sorted")
-	})
+	if util.RaceEnabled {
+		if !sort.IsSorted(s) {
+			panic("SequencedWriteBySeq must be sorted")
+		}
+	}
 	if i := sort.Search(len(s), func(i int) bool {
 		return s[i].Sequence >= seq
 	}); i < len(s) && s[i].Sequence == seq {

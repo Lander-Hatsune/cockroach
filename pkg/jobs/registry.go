@@ -651,18 +651,6 @@ func (r *Registry) CreateJobWithTxn(
 		override := sessiondata.RootUserSessionDataOverride
 		override.Database = catconstants.SystemDatabaseName
 		hasJobTypeColumn := r.settings.Version.IsActive(ctx, clusterversion.V23_1AddTypeColumnToJobsTable)
-		if hasJobTypeColumn {
-			// Relying on the version gate may not be sufficient.
-			const pgAttributeStmt = `
-			SELECT * FROM system.pg_catalog.pg_attribute
-			         WHERE attrelid = 'system.public.jobs'::REGCLASS
-			         AND attname = 'job_type'`
-			row, err := txn.QueryRowEx(ctx, "job-columns-get", txn.KV(), override, pgAttributeStmt)
-			if err != nil {
-				return err
-			}
-			hasJobTypeColumn = row != nil
-		}
 		if !hasJobTypeColumn {
 			numCols -= 1
 		}
@@ -1256,11 +1244,29 @@ func (r *Registry) cleanupOldJobs(ctx context.Context, olderThan time.Time) erro
 
 // The ordering is important as we keep track of the maximum ID we've seen.
 const expiredJobsQuery = `
-SELECT id, payload, status, created FROM "".crdb_internal.system_jobs
+SELECT id, payload, status FROM "".crdb_internal.system_jobs
 WHERE (created < $1) AND (id > $2)
 ORDER BY id
-LIMIT $3
-	`
+LIMIT $3`
+
+const expiredJobsQueryWithJobInfoTable = `
+WITH
+latestpayload AS (
+    SELECT job_id, value
+    FROM system.job_info AS payload
+    WHERE job_id > $2 AND info_key = 'legacy_payload'
+    ORDER BY written desc
+),
+jobpage AS (
+    SELECT id, status
+    FROM system.jobs
+    WHERE (created < $1) and (id > $2)
+    ORDER BY id
+    LIMIT $3
+)
+SELECT distinct (id), latestpayload.value AS payload, status
+FROM jobpage AS j
+INNER JOIN latestpayload ON j.id = latestpayload.job_id`
 
 // cleanupOldJobsPage deletes up to cleanupPageSize job rows with ID > minID.
 // minID is supposed to be the maximum ID returned by the previous page (0 if no
@@ -1268,8 +1274,15 @@ LIMIT $3
 func (r *Registry) cleanupOldJobsPage(
 	ctx context.Context, olderThan time.Time, minID jobspb.JobID, pageSize int,
 ) (done bool, maxID jobspb.JobID, retErr error) {
+	var query string
+	if r.settings.Version.IsActive(ctx, clusterversion.V23_1JobInfoTableIsBackfilled) {
+		query = expiredJobsQueryWithJobInfoTable
+	} else {
+		query = expiredJobsQuery
+	}
+
 	it, err := r.db.Executor().QueryIterator(ctx, "gc-jobs", nil, /* txn */
-		expiredJobsQuery, olderThan, minID, pageSize)
+		query, olderThan, minID, pageSize)
 	if err != nil {
 		return false, 0, err
 	}

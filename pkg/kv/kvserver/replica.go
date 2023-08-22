@@ -860,7 +860,7 @@ type Replica struct {
 		// Requires Replica.raftMu be held when providing logical ops and
 		//  informing the processor of closed timestamp updates. This properly
 		//  synchronizes updates that are linearized and driven by the Raft log.
-		proc *rangefeed.Processor
+		proc rangefeed.Processor
 		// opFilter is a best-effort filter that informs the raft processing
 		// goroutine of which logical operations the rangefeed processor is
 		// interested in based on the processor's current registrations.
@@ -922,7 +922,7 @@ func (r *Replica) String() string {
 // SafeFormat implements the redact.SafeFormatter interface.
 func (r *Replica) SafeFormat(w redact.SafePrinter, _ rune) {
 	w.Printf("[n%d,s%d,r%s]",
-		r.store.Ident.NodeID, r.store.Ident.StoreID, r.rangeStr.get())
+		r.store.Ident.NodeID, r.store.Ident.StoreID, &r.rangeStr)
 }
 
 // ReplicaID returns the ID for the Replica. This value is fixed for the

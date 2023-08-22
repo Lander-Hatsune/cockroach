@@ -20,8 +20,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/rangetestutils"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
@@ -34,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/grunning"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -42,7 +39,7 @@ import (
 func TestAdminAPINonTableStats(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
 	s := testCluster.Server(0)
 
@@ -83,7 +80,7 @@ func TestAdminAPINonTableStats(t *testing.T) {
 func TestRangeCount(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	require.NoError(t, testCluster.WaitForFullReplication())
 	defer testCluster.Stopper().Stop(context.Background())
 	s := testCluster.Server(0)
@@ -168,7 +165,7 @@ func TestRangeCount(t *testing.T) {
 func TestStatsforSpanOnLocalMax(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
 	firstServer := testCluster.Server(0)
 
@@ -187,7 +184,7 @@ func TestAdminAPIDataDistribution(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	testCluster := serverutils.StartNewTestCluster(t, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(t, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
 
 	firstServer := testCluster.Server(0)
@@ -195,7 +192,7 @@ func TestAdminAPIDataDistribution(t *testing.T) {
 
 	// TODO(irfansharif): The data-distribution page and underyling APIs don't
 	// know how to deal with coalesced ranges. See #97942.
-	sqlDB.Exec(t, `SET CLUSTER SETTING spanconfig.storage_coalesce_adjacent.enabled = false`)
+	sqlDB.Exec(t, `SET CLUSTER SETTING spanconfig.range_coalescing.system.enabled = false`)
 
 	// Create some tables.
 	sqlDB.Exec(t, `CREATE DATABASE roachblog`)
@@ -299,7 +296,7 @@ func TestAdminAPIDataDistribution(t *testing.T) {
 
 func BenchmarkAdminAPIDataDistribution(b *testing.B) {
 	skip.UnderShort(b, "TODO: fix benchmark")
-	testCluster := serverutils.StartNewTestCluster(b, 3, base.TestClusterArgs{})
+	testCluster := serverutils.StartCluster(b, 3, base.TestClusterArgs{})
 	defer testCluster.Stopper().Stop(context.Background())
 
 	firstServer := testCluster.Server(0)
@@ -455,11 +452,7 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 	ctx := context.Background()
 	s := serverutils.StartServerOnly(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
-	ts := s.(*server.TestServer)
 
-	rpcStopper := stop.NewStopper()
-	defer rpcStopper.Stop(ctx)
-	rpcContext := srvtestutils.NewRPCTestContext(ctx, ts, ts.RPCContext().Config)
 	span := roachpb.Span{
 		Key:    roachpb.RKeyMin.AsRawKey(),
 		EndKey: roachpb.RKeyMax.AsRawKey(),
@@ -469,19 +462,13 @@ func TestSpanStatsGRPCResponse(t *testing.T) {
 		Spans:  []roachpb.Span{span},
 	}
 
-	url := ts.AdvRPCAddr()
-	nodeID := ts.NodeID()
-	conn, err := rpcContext.GRPCDialNode(url, nodeID, rpc.DefaultClass).Connect(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := serverpb.NewStatusClient(conn)
+	client := s.GetStatusClient(t)
 
 	response, err := client.SpanStats(ctx, &request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	initialRanges, err := ts.ExpectedInitialRangeCount()
+	initialRanges, err := s.ExpectedInitialRangeCount()
 	if err != nil {
 		t.Fatal(err)
 	}

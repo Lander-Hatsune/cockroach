@@ -42,7 +42,7 @@ type state struct {
 	stores                  map[StoreID]*store
 	load                    map[RangeID]ReplicaLoad
 	loadsplits              map[StoreID]LoadSplitter
-	quickLivenessMap        livenesspb.TestNodeVitality
+	nodeLiveness            MockNodeLiveness
 	capacityChangeListeners []CapacityChangeListener
 	newCapacityListeners    []NewCapacityListener
 	configChangeListeners   []ConfigChangeListener
@@ -71,13 +71,17 @@ func newState(settings *config.SimulationSettings) *state {
 		nodes:             make(map[NodeID]*node),
 		stores:            make(map[StoreID]*store),
 		loadsplits:        make(map[StoreID]LoadSplitter),
-		quickLivenessMap:  livenesspb.TestNodeVitality{},
 		capacityOverrides: make(map[StoreID]CapacityOverride),
 		clock:             &ManualSimClock{nanos: settings.StartTime.UnixNano()},
 		ranges:            newRMap(),
 		usageInfo:         newClusterUsageInfo(),
 		settings:          settings,
 	}
+	s.nodeLiveness = MockNodeLiveness{
+		clock:     hlc.NewClockForTesting(s.clock),
+		statusMap: map[NodeID]livenesspb.NodeLivenessStatus{},
+	}
+
 	s.load = map[RangeID]ReplicaLoad{FirstRangeID: NewReplicaLoadCounter(s.clock)}
 	return s
 }
@@ -178,7 +182,13 @@ func (s *state) ClusterInfo() ClusterInfo {
 // Stores returns all stores that exist in this state.
 func (s *state) Stores() []Store {
 	stores := make([]Store, 0, len(s.stores))
-	for _, store := range s.stores {
+	keys := make([]StoreID, 0, len(s.stores))
+	for key := range s.stores {
+		keys = append(keys, key)
+	}
+
+	for _, key := range keys {
+		store := s.stores[key]
 		stores = append(stores, store)
 	}
 	sort.Slice(stores, func(i, j int) bool { return stores[i].StoreID() < stores[j].StoreID() })
@@ -344,7 +354,12 @@ func (s *state) Replicas(storeID StoreID) []Replica {
 	}
 
 	repls := make(replicaList, 0, len(store.replicas))
+	var rangeIDs RangeIDSlice
 	for rangeID := range store.replicas {
+		rangeIDs = append(rangeIDs, rangeID)
+	}
+	sort.Sort(rangeIDs)
+	for _, rangeID := range rangeIDs {
 		rng := s.ranges.rangeMap[rangeID]
 		if replica := rng.replicas[storeID]; replica != nil {
 			repls = append(repls, replica)
@@ -366,7 +381,7 @@ func (s *state) AddNode() Node {
 		stores: []StoreID{},
 	}
 	s.nodes[nodeID] = node
-	s.quickLivenessMap.AddNode(roachpb.NodeID(nodeID))
+	s.SetNodeLiveness(nodeID, livenesspb.NodeLivenessStatus_LIVE)
 	return node
 }
 func (s *state) SetNodeLocality(nodeID NodeID, locality roachpb.Locality) {
@@ -1017,7 +1032,13 @@ func (s *state) TickClock(tick time.Time) {
 func (s *state) UpdateStorePool(
 	storeID StoreID, storeDescriptors map[roachpb.StoreID]*storepool.StoreDetail,
 ) {
-	for gossipStoreID, detail := range storeDescriptors {
+	var storeIDs roachpb.StoreIDSlice
+	for storeIDA := range storeDescriptors {
+		storeIDs = append(storeIDs, storeIDA)
+	}
+	sort.Sort(storeIDs)
+	for _, gossipStoreID := range storeIDs {
+		detail := storeDescriptors[gossipStoreID]
 		copiedDetail := *detail
 		copiedDesc := *detail.Desc
 		copiedDetail.Desc = &copiedDesc
@@ -1037,18 +1058,7 @@ func (s *state) NextReplicasFn(storeID StoreID) func() []Replica {
 // SetNodeLiveness sets the liveness status of the node with ID NodeID to be
 // the status given.
 func (s *state) SetNodeLiveness(nodeID NodeID, status livenesspb.NodeLivenessStatus) {
-	switch status {
-	case livenesspb.NodeLivenessStatus_DRAINING:
-		s.quickLivenessMap.Draining(roachpb.NodeID(nodeID), true)
-	case livenesspb.NodeLivenessStatus_DECOMMISSIONED:
-		s.quickLivenessMap.Decommissioned(roachpb.NodeID(nodeID), false)
-	case livenesspb.NodeLivenessStatus_DECOMMISSIONING:
-		s.quickLivenessMap.Decommissioning(roachpb.NodeID(nodeID), true)
-	case livenesspb.NodeLivenessStatus_LIVE:
-		s.quickLivenessMap.RestartNode(roachpb.NodeID(nodeID))
-	case livenesspb.NodeLivenessStatus_DEAD:
-		s.quickLivenessMap.DownNode(roachpb.NodeID(nodeID))
-	}
+	s.nodeLiveness.statusMap[nodeID] = status
 }
 
 // NodeLivenessFn returns a function, that when called will return the
@@ -1056,18 +1066,23 @@ func (s *state) SetNodeLiveness(nodeID NodeID, status livenesspb.NodeLivenessSta
 // TODO(kvoli): Find a better home for this method, required by the storepool.
 func (s *state) NodeLivenessFn() storepool.NodeLivenessFunc {
 	return func(nid roachpb.NodeID) livenesspb.NodeLivenessStatus {
-		return s.quickLivenessMap[nid].Convert().LivenessStatus()
+		return s.nodeLiveness.statusMap[NodeID(nid)]
 	}
 }
 
 // NodeCountFn returns a function, that when called will return the current
 // number of nodes that exist in this state.
 // TODO(kvoli): Find a better home for this method, required by the storepool.
+// TODO(wenyihu6): introduce the concept of membership separated from the
+// liveness map.
 func (s *state) NodeCountFn() storepool.NodeCountFunc {
 	return func() int {
 		count := 0
-		for _, entry := range s.quickLivenessMap {
-			if entry.Convert().IsLive(livenesspb.Rebalance) {
+		for _, status := range s.nodeLiveness.statusMap {
+			// Nodes with a liveness status other than decommissioned or
+			// decommissioning are considered active members (see
+			// liveness.MembershipStatus).
+			if status != livenesspb.NodeLivenessStatus_DECOMMISSIONED && status != livenesspb.NodeLivenessStatus_DECOMMISSIONING {
 				count++
 			}
 		}
@@ -1224,7 +1239,7 @@ func (s *state) Scan(
 // state of ranges.
 func (s *state) Report() roachpb.SpanConfigConformanceReport {
 	reporter := spanconfigreporter.New(
-		s.quickLivenessMap, s, s, s,
+		s.nodeLiveness, s, s, s,
 		cluster.MakeClusterSettings(), &spanconfig.TestingKnobs{})
 	report, err := reporter.SpanConfigConformance(context.Background(), []roachpb.Span{{}})
 	if err != nil {

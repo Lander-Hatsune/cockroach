@@ -69,7 +69,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -338,9 +337,11 @@ func TestBackupRestorePartitioned(t *testing.T) {
 
 	// Disabled to run within tenant as certain MR features are not available to tenants.
 	args := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TODOTestTenantDisabled,
+		},
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {
-				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "region", Value: "west"},
 					// NB: This has the same value as an az in the east region
@@ -350,7 +351,6 @@ func TestBackupRestorePartitioned(t *testing.T) {
 				}},
 			},
 			1: {
-				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "region", Value: "east"},
 					// NB: This has the same value as an az in the west region
@@ -360,7 +360,6 @@ func TestBackupRestorePartitioned(t *testing.T) {
 				}},
 			},
 			2: {
-				DefaultTestTenant: base.TODOTestTenantDisabled,
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "region", Value: "east"},
 					{Key: "az", Value: "az2"},
@@ -491,34 +490,33 @@ func TestBackupRestoreExecLocality(t *testing.T) {
 
 	// Disabled to run within tenant as certain MR features are not available to tenants.
 	args := base.TestClusterArgs{
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TODOTestTenantDisabled,
+		},
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: {
-				ExternalIODir:     "/west0",
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir: "/west0",
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "tier", Value: "0"},
 					{Key: "region", Value: "west"},
 				}},
 			},
 			1: {
-				ExternalIODir:     "/west1",
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir: "/west1",
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "tier", Value: "1"},
 					{Key: "region", Value: "west"},
 				}},
 			},
 			2: {
-				ExternalIODir:     "/east0",
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir: "/east0",
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "tier", Value: "0"},
 					{Key: "region", Value: "east"},
 				}},
 			},
 			3: {
-				ExternalIODir:     "/east1",
-				DefaultTestTenant: base.TODOTestTenantDisabled,
+				ExternalIODir: "/east1",
 				Locality: roachpb.Locality{Tiers: []roachpb.Tier{
 					{Key: "tier", Value: "1"},
 					{Key: "region", Value: "east"},
@@ -604,7 +602,8 @@ func TestBackupRestoreAppend(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.UnderStressRace(t, "test is too large to run under stress race")
+	skip.UnderStress(t, "test is too large to run under stress")
+	skip.UnderRace(t, "test is too large to run under race")
 
 	const numAccounts = 1000
 	ctx := context.Background()
@@ -848,7 +847,7 @@ func TestBackupAndRestoreJobDescription(t *testing.T) {
 				collections[1], collections[2])},
 			{fmt.Sprintf("BACKUP INTO '%s' IN ('%s', '%s', '%s')", full1,
 				collections[0], collections[1], collections[2])},
-			{fmt.Sprintf("BACKUP INTO '%s' IN ('%s', '%s', '%s') WITH incremental_location = ('%s', '%s', '%s')",
+			{fmt.Sprintf("BACKUP INTO '%s' IN ('%s', '%s', '%s') WITH OPTIONS (incremental_location = ('%s', '%s', '%s'))",
 				full1, collections[0], collections[1], collections[2], incrementals[0],
 				incrementals[1], incrementals[2])},
 			{fmt.Sprintf("BACKUP INTO '%s' IN ('%s', '%s', '%s') AS OF SYSTEM TIME '-1s'", asOf1, collections[0],
@@ -904,7 +903,7 @@ func TestBackupAndRestoreJobDescription(t *testing.T) {
 			{fmt.Sprintf("RESTORE DATABASE data FROM ('%s', '%s', '%s')",
 				resolvedCollectionURIs[0], resolvedCollectionURIs[1],
 				resolvedCollectionURIs[2])},
-			{fmt.Sprintf("RESTORE DATABASE data FROM ('%s', '%s', '%s') WITH incremental_location = ('%s', '%s', '%s')",
+			{fmt.Sprintf("RESTORE DATABASE data FROM ('%s', '%s', '%s') WITH OPTIONS (incremental_location = ('%s', '%s', '%s'))",
 				resolvedCollectionURIs[0], resolvedCollectionURIs[1], resolvedCollectionURIs[2],
 				resolvedIncURIs[0], resolvedIncURIs[1], resolvedIncURIs[2])},
 			{fmt.Sprintf("RESTORE DATABASE data FROM ('%s', '%s', '%s')",
@@ -1308,7 +1307,7 @@ func TestBackupRestoreSystemJobs(t *testing.T) {
 	if err := jobutils.VerifySystemJob(t, sqlDB, 0, jobspb.TypeRestore, jobs.StatusSucceeded, jobs.Record{
 		Username: username.RootUserName(),
 		Description: fmt.Sprintf(
-			`RESTORE TABLE bank FROM '%s', '%s' WITH into_db = 'restoredb'`,
+			`RESTORE TABLE bank FROM '%s', '%s' WITH OPTIONS (into_db = 'restoredb')`,
 			sanitizedFullDir+"redacted", sanitizedIncDir+"redacted",
 		),
 		DescriptorIDs: descpb.IDs{
@@ -1395,7 +1394,7 @@ func TestEncryptedBackupRestoreSystemJobs(t *testing.T) {
 				jobs.Record{
 					Username: username.RootUserName(),
 					Description: fmt.Sprintf(
-						`BACKUP DATABASE data TO '%s' WITH %s`,
+						`BACKUP DATABASE data TO '%s' WITH OPTIONS (%s)`,
 						backupLoc1, sanitizedEncryptionOption),
 					DescriptorIDs: descpb.IDs{
 						descpb.ID(backupDatabaseID),
@@ -1414,7 +1413,7 @@ into_db='restoredb', %s)`, encryptionOption), backupLoc1)
 			if err := jobutils.VerifySystemJob(t, sqlDB, 0, jobspb.TypeRestore, jobs.StatusSucceeded, jobs.Record{
 				Username: username.RootUserName(),
 				Description: fmt.Sprintf(
-					`RESTORE TABLE data.bank FROM '%s' WITH %s, into_db = 'restoredb'`,
+					`RESTORE TABLE data.bank FROM '%s' WITH OPTIONS (%s, into_db = 'restoredb')`,
 					backupLoc1, sanitizedEncryptionOption,
 				),
 				DescriptorIDs: descpb.IDs{
@@ -5700,8 +5699,8 @@ func TestBackupRestoreShowJob(t *testing.T) {
 	sqlDB.CheckQueryResults(
 		t, "SELECT description FROM [SHOW JOBS] WHERE job_type != 'MIGRATION' AND description != 'updating privileges' ORDER BY description",
 		[][]string{
-			{"BACKUP DATABASE data TO 'nodelocal://1/foo' WITH revision_history = true"},
-			{"RESTORE TABLE data.bank FROM 'nodelocal://1/foo' WITH into_db = 'data 2', skip_missing_foreign_keys"},
+			{"BACKUP DATABASE data TO 'nodelocal://1/foo' WITH OPTIONS (revision_history = true)"},
+			{"RESTORE TABLE data.bank FROM 'nodelocal://1/foo' WITH OPTIONS (into_db = 'data 2', skip_missing_foreign_keys)"},
 		},
 	)
 }
@@ -6059,7 +6058,7 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 
 	conn := tc.ServerConn(0)
 	systemTenantRunner := sqlutils.MakeSQLRunner(conn)
-	setAndWaitForTenantReadOnlyClusterSetting(t, sql.SecondaryTenantZoneConfigsEnabled.Key(),
+	setAndWaitForTenantReadOnlyClusterSetting(t, sql.SecondaryTenantZoneConfigsEnabled.Name(),
 		systemTenantRunner, ttSQLDB, tenantID, "true")
 
 	// Run the test as the system tenant, and as the secondary tenant.
@@ -6079,8 +6078,9 @@ func TestProtectedTimestampsDuringBackup(t *testing.T) {
 		startPretty := tablePrefix.String()
 
 		// Speeds up the test.
-		runner.Exec(t, "SET CLUSTER SETTING kv.protectedts.poll_interval = '10ms';")
-		runner.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'")
+		systemTenantRunner.Exec(t, "SET CLUSTER SETTING kv.protectedts.poll_interval = '10ms';")
+		systemTenantRunner.Exec(t, "SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'")
+		systemTenantRunner.Exec(t, "ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'")
 
 		// Run a full backup.
 		baseBackupURI := "userfile:///foo"
@@ -6456,6 +6456,15 @@ func TestProtectedTimestampsFailDueToLimits(t *testing.T) {
 	})
 }
 
+// Check if export request is from a lease for a descriptor to avoid picking
+// up on wrong export requests
+func isLeasingExportRequest(r *kvpb.ExportRequest) bool {
+	_, tenantID, _ := keys.DecodeTenantPrefix(r.Key)
+	codec := keys.MakeSQLCodec(tenantID)
+	return bytes.HasPrefix(r.Key, codec.DescMetadataPrefix()) &&
+		r.EndKey.Equal(r.Key.PrefixEnd())
+}
+
 func TestPaginatedBackupTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -6491,14 +6500,6 @@ func TestPaginatedBackupTenant(t *testing.T) {
 		return fmt.Sprintf("%v%s", span.String(), spanStr)
 	}
 
-	// Check if export request is from a lease for a descriptor to avoid picking
-	// up on wrong export requests
-	isLeasingExportRequest := func(r *kvpb.ExportRequest) bool {
-		_, tenantID, _ := keys.DecodeTenantPrefix(r.Key)
-		codec := keys.MakeSQLCodec(tenantID)
-		return bytes.HasPrefix(r.Key, codec.DescMetadataPrefix()) &&
-			r.EndKey.Equal(r.Key.PrefixEnd())
-	}
 	params.ServerArgs.Knobs.Store = &kvserver.StoreTestingKnobs{
 		TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
 			for _, ru := range request.Requests {
@@ -6939,6 +6940,78 @@ func TestBackupRestoreInsideMultiPodTenant(t *testing.T) {
 	})
 }
 
+// TestBackupRestoreCreatedAndDroppedTenant ensures that a restore of a tenant works if a
+// incremental backups captured the creation or deletion of a tenant.
+func TestBackupRestoreCreatedAndDroppedTenant(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	params := base.TestClusterArgs{ServerArgs: base.TestServerArgs{
+		Knobs: base.TestingKnobs{
+			JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
+			TenantTestingKnobs: &sql.TenantTestingKnobs{
+				// The tests expect specific tenant IDs to show up.
+				EnableTenantIDReuse: true,
+			},
+		},
+
+		DefaultTestTenant: base.TestControlsTenantsExplicitly},
+	}
+
+	const numAccounts = 1
+	tc, systemDB, _, cleanupFn := backupRestoreTestSetupWithParams(
+		t, singleNode, numAccounts, InitManualReplication, params,
+	)
+	_, _ = tc, systemDB
+	defer cleanupFn()
+
+	// NB: tenant certs for 10, 11, 20 are embedded. See:
+	_ = security.EmbeddedTenantIDs()
+
+	systemDB.Exec(t, "CREATE TENANT foo")
+
+	systemDB.Exec(t, "SET sql_safe_updates =off;")
+
+	getAOST := func() string {
+		var ts string
+		systemDB.QueryRow(t, `SELECT cluster_logical_timestamp()`).Scan(&ts)
+		return ts
+	}
+	t1 := getAOST()
+
+	systemDB.Exec(t, fmt.Sprintf("BACKUP INTO 'nodelocal://1/clusterwide' AS OF SYSTEM TIME '%s' with include_all_virtual_clusters;", t1))
+
+	systemDB.Exec(t, "CREATE TENANT baz")
+
+	t2 := getAOST()
+	systemDB.Exec(t, fmt.Sprintf("BACKUP INTO LATEST IN 'nodelocal://1/clusterwide' AS OF SYSTEM TIME %s with include_all_virtual_clusters;", t2))
+
+	systemDB.Exec(t, "DROP TENANT baz")
+
+	// Make GC job scheduled by DROP TENANT run in 1 second.
+	systemDB.Exec(t, "SET CLUSTER SETTING kv.range_merge.queue.enabled = false")
+	systemDB.Exec(t, "ALTER RANGE tenants CONFIGURE ZONE USING gc.ttlseconds = 1;")
+	// Wait for tenant GC job to complete.
+	systemDB.CheckQueryResultsRetry(
+		t,
+		"SELECT status FROM [SHOW JOBS] WHERE description LIKE 'GC for tenant%'",
+		[][]string{{"succeeded"}},
+	)
+
+	t3 := getAOST()
+	systemDB.Exec(t, fmt.Sprintf("BACKUP INTO LATEST IN 'nodelocal://1/clusterwide' AS OF SYSTEM TIME %s with include_all_virtual_clusters;", t3))
+
+	restoreCmd := func(aost string, name string) string {
+		return fmt.Sprintf("RESTORE TENANT 2 FROM LATEST IN 'nodelocal://1/clusterwide' AS OF SYSTEM TIME %s with tenant_name = '%s'", aost, name)
+	}
+
+	systemDB.Exec(t, restoreCmd(t1, "full"))
+
+	systemDB.Exec(t, restoreCmd(t2, "after-create"))
+
+	systemDB.Exec(t, restoreCmd(t3, "after-drop"))
+}
+
 // Ensure that backing up and restoring tenants succeeds.
 func TestBackupRestoreTenant(t *testing.T) {
 	defer leaktest.AfterTest(t)()
@@ -7115,7 +7188,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		)
 
 		// Make GC job scheduled by DROP TENANT run in 1 second.
-		restoreDB.Exec(t, "SET CLUSTER SETTING kv.range_merge.queue_enabled = false")
+		restoreDB.Exec(t, "SET CLUSTER SETTING kv.range_merge.queue.enabled = false")
 		restoreDB.Exec(t, "ALTER RANGE tenants CONFIGURE ZONE USING gc.ttlseconds = 1;")
 		// Wait for tenant GC job to complete.
 		restoreDB.CheckQueryResultsRetry(
@@ -7150,7 +7223,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		)
 
 		tenantID := roachpb.MustMakeTenantID(10)
-		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+		if err := restoreTC.Server(0).TenantController().WaitForTenantReadiness(ctx, tenantID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -7242,7 +7315,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		)
 
 		tenantID := roachpb.MustMakeTenantID(10)
-		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+		if err := restoreTC.Server(0).TenantController().WaitForTenantReadiness(ctx, tenantID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -7316,7 +7389,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		)
 
 		tenantID := roachpb.MustMakeTenantID(10)
-		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+		if err := restoreTC.Server(0).TenantController().WaitForTenantReadiness(ctx, tenantID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -7334,7 +7407,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreTenant10.CheckQueryResults(t, `SHOW CLUSTER SETTING tenant_cost_model.write_payload_cost_per_mebibyte`, [][]string{{"456"}})
 
 		tenantID = roachpb.MustMakeTenantID(11)
-		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+		if err := restoreTC.Server(0).TenantController().WaitForTenantReadiness(ctx, tenantID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -7355,7 +7428,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreDB.Exec(t, `RESTORE TENANT 11 FROM 'nodelocal://1/clusterwide' WITH virtual_cluster = '20', virtual_cluster_name = 'tenant-20'`)
 
 		tenantID = roachpb.MustMakeTenantID(20)
-		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+		if err := restoreTC.Server(0).TenantController().WaitForTenantReadiness(ctx, tenantID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -7392,7 +7465,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreDB.Exec(t, `RESTORE TENANT 10 FROM 'nodelocal://1/t10' AS OF SYSTEM TIME `+ts1)
 
 		tenantID := roachpb.MustMakeTenantID(10)
-		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+		if err := restoreTC.Server(0).TenantController().WaitForTenantReadiness(ctx, tenantID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -7418,7 +7491,7 @@ func TestBackupRestoreTenant(t *testing.T) {
 		restoreDB.Exec(t, `RESTORE TENANT 20 FROM 'nodelocal://1/t20'`)
 
 		tenantID := roachpb.MustMakeTenantID(20)
-		if err := restoreTC.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+		if err := restoreTC.Server(0).TenantController().WaitForTenantReadiness(ctx, tenantID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -9439,6 +9512,8 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	var exportReqsAtomic int64
+
 	tc, sqlDB, iodir, cleanupFn := backupRestoreTestSetupWithParams(t, singleNode, 10,
 		InitManualReplication, base.TestClusterArgs{
 			ServerArgs: base.TestServerArgs{
@@ -9449,6 +9524,17 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 					JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(), // speeds up test
 					SpanConfig: &spanconfig.TestingKnobs{
 						SQLWatcherCheckpointNoopsEveryDurationOverride: 100 * time.Millisecond,
+					},
+					Store: &kvserver.StoreTestingKnobs{
+						TestingRequestFilter: func(ctx context.Context, request *kvpb.BatchRequest) *kvpb.Error {
+							for _, ru := range request.Requests {
+								if exportRequest, ok := ru.GetInner().(*kvpb.ExportRequest); ok &&
+									!isLeasingExportRequest(exportRequest) {
+									atomic.AddInt64(&exportReqsAtomic, 1)
+								}
+							}
+							return nil
+						},
 					},
 				},
 			},
@@ -9470,8 +9556,11 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 	conn := tc.Conns[0]
 
 	sqlDB.Exec(t, `CREATE TABLE data.foo (id INT, INDEX bar(id))`)
-	sqlDB.Exec(t, `INSERT INTO data.foo select * from generate_series(1,10)`)
+	sqlDB.Exec(t, `INSERT INTO data.foo select * from generate_series(1,5)`)
 
+	sqlDB.Exec(t, `BACKUP DATABASE data INTO $1`, localFoo)
+
+	sqlDB.Exec(t, `INSERT INTO data.foo select * from generate_series(6,10)`)
 	// Create another table.
 	sqlDB.Exec(t, `CREATE TABLE data.bar (id INT, INDEX bar(id))`)
 	sqlDB.Exec(t, `INSERT INTO data.bar select * from generate_series(1,10)`)
@@ -9491,11 +9580,30 @@ func TestExcludeDataFromBackupAndRestore(t *testing.T) {
 		}
 		return true, nil
 	})
-	sqlDB.Exec(t, `BACKUP DATABASE data INTO $1`, localFoo)
+
+	sqlDB.Exec(t, `BACKUP DATABASE data INTO LATEST IN $1`, localFoo)
+	sqlDB.Exec(t, `CREATE TABLE data.baz (id INT)`)
+	sqlDB.Exec(t, `ALTER TABLE data.baz SET (exclude_data_from_backup = true)`)
+	sqlDB.Exec(t, `INSERT INTO data.baz select * from generate_series(1,10)`)
+
+	waitForReplicaFieldToBeSet(t, tc, conn, "baz", "data", func(r *kvserver.Replica) (bool, error) {
+		if !r.ExcludeDataFromBackup() {
+			return false, errors.New("waiting for the range containing table data.foo to split")
+		}
+		return true, nil
+	})
+
+	sqlDB.Exec(t, `BACKUP DATABASE data INTO LATEST IN $1`, localFoo)
 
 	restoreDB.Exec(t, `RESTORE DATABASE data FROM LATEST IN $1`, localFoo)
-	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.foo`), 0)
+	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.foo`), 5)
 	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.bar`), 10)
+	require.Len(t, restoreDB.QueryStr(t, `SELECT * FROM data.baz`), 0)
+
+	before := atomic.LoadInt64(&exportReqsAtomic)
+	sqlDB.Exec(t, `BACKUP data.foo TO $1`, localFoo+"/tbl")
+	after := atomic.LoadInt64(&exportReqsAtomic)
+	require.Equal(t, before, after)
 }
 
 // TestExportRequestBelowGCThresholdOnDataExcludedFromBackup tests that a
@@ -11192,7 +11300,7 @@ func TestRestoreMemoryMonitoringWithShadowing(t *testing.T) {
 	defer cleanupFn()
 
 	sqlDB.Exec(t, "SET CLUSTER SETTING kv.bulk_io_write.restore_node_concurrency = 1")
-	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.memory_monitor_ssts=true")
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.sst_memory_limit.enabled=true")
 	sqlDB.Exec(t, "BACKUP data.bank INTO 'userfile:///backup'")
 
 	// Repeatedly alter a single row and do an incremental backup.
@@ -11233,7 +11341,7 @@ func TestRestoreMemoryMonitoringMinWorkerMemory(t *testing.T) {
 
 	// 4 restore workers means we need minimum 2 workers to start restore.
 	sqlDB.Exec(t, "SET CLUSTER SETTING kv.bulk_io_write.restore_node_concurrency=4")
-	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.memory_monitor_ssts=true")
+	sqlDB.Exec(t, "SET CLUSTER SETTING bulkio.restore.sst_memory_limit.enabled=true")
 
 	sqlDB.Exec(t, "BACKUP data.bank INTO 'userfile:///backup'")
 

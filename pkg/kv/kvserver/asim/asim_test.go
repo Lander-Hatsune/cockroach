@@ -21,7 +21,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/metrics"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/state"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/asim/workload"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,17 +38,17 @@ func TestRunAllocatorSimulator(t *testing.T) {
 	sim.RunSim(ctx)
 }
 
-func TestAllocatorSimulatorDeterministic(t *testing.T) {
-	skip.WithIssue(t, 105904, "asim is non-deterministic")
+func TestAsimDeterministic(t *testing.T) {
 	settings := config.DefaultSimulationSettings()
 
 	runs := 3
 	duration := 15 * time.Minute
 	settings.TickInterval = 2 * time.Second
 
-	stores := 7
+	stores := 21
 	replsPerRange := 3
-	replicasPerStore := 100
+	replicasPerStore := 600
+
 	// NB: We want 100 replicas per store, so the number of ranges required
 	// will be 1/3 of the total replicas.
 	ranges := (replicasPerStore * stores) / replsPerRange

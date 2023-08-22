@@ -114,8 +114,8 @@ func (u *plpgsqlSymUnion) pLpgSQLStmtGetDiagItemList() plpgsqltree.PLpgSQLStmtGe
     return u.val.(plpgsqltree.PLpgSQLStmtGetDiagItemList)
 }
 
-func (u *plpgsqlSymUnion) pLpgSQLStmtIfElseIfArmList() []*plpgsqltree.PLpgSQLStmtIfElseIfArm {
-    return u.val.([]*plpgsqltree.PLpgSQLStmtIfElseIfArm)
+func (u *plpgsqlSymUnion) pLpgSQLStmtIfElseIfArmList() []plpgsqltree.PLpgSQLStmtIfElseIfArm {
+    return u.val.([]plpgsqltree.PLpgSQLStmtIfElseIfArm)
 }
 
 func (u *plpgsqlSymUnion) pLpgSQLStmtOpen() *plpgsqltree.PLpgSQLStmtOpen {
@@ -147,6 +147,23 @@ func (u *plpgsqlSymUnion) plpgsqlOptionExpr() *plpgsqltree.PLpgSQLStmtRaiseOptio
 
 func (u *plpgsqlSymUnion) plpgsqlOptionExprs() []plpgsqltree.PLpgSQLStmtRaiseOption {
     return u.val.([]plpgsqltree.PLpgSQLStmtRaiseOption)
+}
+
+
+func (u *plpgsqlSymUnion) plpgsqlException() *plpgsqltree.PLpgSQLException {
+    return u.val.(*plpgsqltree.PLpgSQLException)
+}
+
+func (u *plpgsqlSymUnion) plpgsqlExceptions() []plpgsqltree.PLpgSQLException {
+    return u.val.([]plpgsqltree.PLpgSQLException)
+}
+
+func (u *plpgsqlSymUnion) plpgsqlCondition() *plpgsqltree.PLpgSQLCondition {
+    return u.val.(*plpgsqltree.PLpgSQLCondition)
+}
+
+func (u *plpgsqlSymUnion) plpgsqlConditions() []plpgsqltree.PLpgSQLCondition {
+    return u.val.([]plpgsqltree.PLpgSQLCondition)
 }
 
 %}
@@ -315,7 +332,7 @@ func (u *plpgsqlSymUnion) plpgsqlOptionExprs() []plpgsqltree.PLpgSQLStmtRaiseOpt
 %type <str> opt_error_level option_type
 
 %type <[]plpgsqltree.PLpgSQLStatement> proc_sect
-%type <[]*plpgsqltree.PLpgSQLStmtIfElseIfArm> stmt_elsifs
+%type <[]plpgsqltree.PLpgSQLStmtIfElseIfArm> stmt_elsifs
 %type <[]plpgsqltree.PLpgSQLStatement> stmt_else loop_body // TODO is this a list of statement?
 %type <plpgsqltree.PLpgSQLStatement>  pl_block
 %type <plpgsqltree.PLpgSQLStatement>	proc_stmt
@@ -329,9 +346,10 @@ func (u *plpgsqlSymUnion) plpgsqlOptionExprs() []plpgsqltree.PLpgSQLStmtRaiseOpt
 %type <*plpgsqltree.PLpgSQLDecl> decl_stmt decl_statement
 %type <[]plpgsqltree.PLpgSQLDecl> decl_sect opt_decl_stmts decl_stmts
 
-%type <*plpgsqltree.PLpgSQLExceptionBlock> exception_sect
+%type <[]plpgsqltree.PLpgSQLException> exception_sect proc_exceptions
 %type <*plpgsqltree.PLpgSQLException>	proc_exception
-%type <*plpgsqltree.PLpgSQLCondition>	proc_conditions proc_condition
+%type <[]plpgsqltree.PLpgSQLCondition> proc_conditions
+%type <*plpgsqltree.PLpgSQLCondition> proc_condition
 
 %type <*plpgsqltree.PLpgSQLStmtCaseWhenArm>	case_when
 %type <[]*plpgsqltree.PLpgSQLStmtCaseWhenArm>	case_when_list
@@ -372,6 +390,7 @@ pl_block: opt_block_label decl_sect BEGIN proc_sect exception_sect END opt_label
       Label: $1,
       Decls: $2.plpgsqlDecls(),
       Body: $4.plpgsqlStatements(),
+      Exceptions: $5.plpgsqlExceptions(),
     }
   }
 ;
@@ -625,7 +644,9 @@ proc_stmt:pl_block ';'
     $$.val = $1.plpgsqlStatement()
   }
 | stmt_loop
-  { }
+  {
+    $$.val = $1.plpgsqlStatement()
+  }
 | stmt_while
   { }
 | stmt_for
@@ -822,7 +843,7 @@ stmt_if: IF expr_until_then THEN proc_sect stmt_elsifs stmt_else END_IF IF ';'
 
 stmt_elsifs:
   {
-    $$.val = []*plpgsqltree.PLpgSQLStmtIfElseIfArm{};
+    $$.val = []plpgsqltree.PLpgSQLStmtIfElseIfArm{};
   }
 | stmt_elsifs ELSIF expr_until_then THEN proc_sect
   {
@@ -830,7 +851,7 @@ stmt_elsifs:
     if err != nil {
       return setErr(plpgsqllex, err)
     }
-    newStmt := &plpgsqltree.PLpgSQLStmtIfElseIfArm{
+    newStmt := plpgsqltree.PLpgSQLStmtIfElseIfArm{
       Condition: cond,
       Stmts: $5.plpgsqlStatements(),
     }
@@ -1196,23 +1217,21 @@ loop_body: proc_sect END LOOP
   }
 ;
 
-// MakeExecSqlStmt read until a ';'
-stmt_execsql: IMPORT
+stmt_execsql: stmt_execsql_start
   {
-    $$.val = plpgsqllex.(*lexer).MakeExecSqlStmt(IMPORT)
+    stmt, err := plpgsqllex.(*lexer).MakeExecSqlStmt()
+    if err != nil {
+      return setErr(plpgsqllex, err)
+    }
+    $$.val = stmt
   }
+;
+
+stmt_execsql_start:
+  IMPORT
 | INSERT
-  {
-    $$.val = plpgsqllex.(*lexer).MakeExecSqlStmt(INSERT)
-  }
 | MERGE
-  {
-    $$.val = plpgsqllex.(*lexer).MakeExecSqlStmt(MERGE)
-  }
 | IDENT
-  {
-    $$.val = plpgsqllex.(*lexer).MakeExecSqlStmt(IDENT)
-  }
 ;
 
 stmt_dynexecute: EXECUTE
@@ -1285,44 +1304,56 @@ cursor_variable: IDENT
   }
 ;
 
-exception_sect:
-  { }
-| EXCEPTION
+exception_sect: /* EMPTY */
   {
-    return unimplemented(plpgsqllex, "exception")
+    $$.val = []plpgsqltree.PLpgSQLException(nil)
   }
-  proc_exceptions
+| EXCEPTION proc_exceptions
   {
-    unimplemented(plpgsqllex, "exception")
+    $$.val = $2.plpgsqlExceptions()
   }
 ;
 
 proc_exceptions: proc_exceptions proc_exception
   {
+    e := $2.plpgsqlException()
+    $$.val = append($1.plpgsqlExceptions(), *e)
   }
 | proc_exception
   {
+    e := $1.plpgsqlException()
+    $$.val = []plpgsqltree.PLpgSQLException{*e}
   }
 ;
 
 proc_exception: WHEN proc_conditions THEN proc_sect
   {
+    $$.val = &plpgsqltree.PLpgSQLException{
+      Conditions: $2.plpgsqlConditions(),
+      Action: $4.plpgsqlStatements(),
+    }
   }
 ;
 
 proc_conditions: proc_conditions OR proc_condition
   {
+    c := $3.plpgsqlCondition()
+    $$.val = append($1.plpgsqlConditions(), *c)
   }
 | proc_condition
   {
+    c := $1.plpgsqlCondition()
+    $$.val = []plpgsqltree.PLpgSQLCondition{*c}
   }
 ;
 
 proc_condition: any_identifier
   {
+    $$.val = &plpgsqltree.PLpgSQLCondition{SqlErrName: $1}
   }
 | SQLSTATE SCONST
   {
+    $$.val = &plpgsqltree.PLpgSQLCondition{SqlErrState: $2}
   }
 ;
 

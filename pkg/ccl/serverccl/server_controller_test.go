@@ -26,7 +26,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
-	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -63,7 +62,7 @@ func TestSharedProcessTenantNodeLocalAccess(t *testing.T) {
 		}
 	}()
 
-	tc := serverutils.StartNewTestCluster(t, nodeCount, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, nodeCount, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			DefaultTestTenant: base.TestControlsTenantsExplicitly,
 		},
@@ -125,32 +124,6 @@ ALTER TENANT application START SERVICE SHARED`)
 	}
 }
 
-func TestSharedProcessServerInheritsTempStorageLimit(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	defer log.Scope(t).Close(t)
-
-	const specialSize = 123123123
-
-	// Start a server with a custom temp storage limit.
-	ctx := context.Background()
-	st := cluster.MakeClusterSettings()
-	s := serverutils.StartServerOnly(t, base.TestServerArgs{
-		Settings:          st,
-		TempStorageConfig: base.DefaultTestTempStorageConfigWithSize(st, specialSize),
-		DefaultTestTenant: base.TestControlsTenantsExplicitly,
-	})
-	defer s.Stopper().Stop(ctx)
-
-	// Start a shared process tenant server.
-	ts, _, err := s.StartSharedProcessTenant(ctx, base.TestSharedProcessTenantArgs{
-		TenantName: "hello",
-	})
-	require.NoError(t, err)
-
-	tss := ts.(*server.TestTenant)
-	require.Equal(t, int64(specialSize), tss.SQLCfg.TempStorageConfig.Mon.Limit())
-}
-
 func TestServerControllerHTTP(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -184,7 +157,7 @@ func TestServerControllerHTTP(t *testing.T) {
 	t.Logf("waking up a test tenant")
 
 	// Create our own test tenant with a known name.
-	_, _, err = s.(*server.TestServer).StartSharedProcessTenant(ctx,
+	_, _, err = s.TenantController().StartSharedProcessTenant(ctx,
 		base.TestSharedProcessTenantArgs{
 			TenantName: "hello",
 		})
@@ -418,7 +391,7 @@ func TestServerControllerMultiNodeTenantStartup(t *testing.T) {
 
 	t.Logf("starting test cluster")
 	numNodes := 3
-	tc := serverutils.StartNewTestCluster(t, numNodes, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, numNodes, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs: base.TestingKnobs{
 				JobsTestingKnobs: jobs.NewTestingKnobsWithShortIntervals(),
@@ -643,7 +616,7 @@ func TestServiceShutdownUsesGracefulDrain(t *testing.T) {
 	drainCh := make(chan struct{})
 
 	// Start a shared process server.
-	_, _, err := s.(*server.TestServer).StartSharedProcessTenant(ctx,
+	_, _, err := s.TenantController().StartSharedProcessTenant(ctx,
 		base.TestSharedProcessTenantArgs{
 			TenantName: "hello",
 			Knobs: base.TestingKnobs{

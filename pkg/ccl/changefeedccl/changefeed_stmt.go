@@ -67,7 +67,7 @@ var featureChangefeedEnabled = settings.RegisterBoolSetting(
 	"feature.changefeed.enabled",
 	"set to true to enable changefeeds, false to disable; default is true",
 	featureflag.FeatureFlagEnabledDefault,
-).WithPublic()
+	settings.WithPublic)
 
 func init() {
 	sql.AddPlanHook("changefeed", changefeedPlanHook, changefeedTypeCheck)
@@ -634,7 +634,7 @@ func createChangefeedJobRecord(
 		if !status.ChildMetricsEnabled.Get(&p.ExecCfg().Settings.SV) {
 			p.BufferClientNotice(ctx, pgnotice.Newf(
 				"%s is set to false, metrics will only be published to the '%s' label when it is set to true",
-				status.ChildMetricsEnabled.Key(),
+				status.ChildMetricsEnabled.Name(),
 				scope,
 			))
 		}
@@ -904,6 +904,25 @@ func validateSink(
 	if err != nil {
 		return err
 	}
+	u, err := url.Parse(details.SinkURI)
+	if err != nil {
+		return err
+	}
+
+	ambiguousSchemes := map[string][2]string{
+		changefeedbase.DeprecatedSinkSchemeHTTP:  {changefeedbase.SinkSchemeCloudStorageHTTP, changefeedbase.SinkSchemeWebhookHTTP},
+		changefeedbase.DeprecatedSinkSchemeHTTPS: {changefeedbase.SinkSchemeCloudStorageHTTPS, changefeedbase.SinkSchemeWebhookHTTPS},
+	}
+
+	if disambiguations, isAmbiguous := ambiguousSchemes[u.Scheme]; isAmbiguous {
+		p.BufferClientNotice(ctx, pgnotice.Newf(
+			`Interpreting deprecated URI scheme %s as %s. For webhook semantics, use %s.`,
+			u.Scheme,
+			disambiguations[0],
+			disambiguations[1],
+		))
+	}
+
 	var nilOracle timestampLowerBoundOracle
 	canarySink, err := getAndDialSink(ctx, &p.ExecCfg().DistSQLSrv.ServerConfig, details,
 		nilOracle, p.User(), jobID, sli)
@@ -1343,6 +1362,12 @@ func reconcileJobStateWithLocalState(
 		log.Warningf(ctx, `CHANGEFEED job %d could not reload job progress (%s); `+
 			`job should be retried later`, jobID, reloadErr)
 		return reloadErr
+	}
+	knobs, _ := execCfg.DistSQLSrv.TestingKnobs.Changefeed.(*TestingKnobs)
+	if knobs != nil && knobs.LoadJobErr != nil {
+		if err := knobs.LoadJobErr(); err != nil {
+			return err
+		}
 	}
 
 	localState.progress = reloadedJob.Progress()

@@ -83,8 +83,6 @@ func BenchmarkRangefeedBudget(b *testing.B) {
 // runBenchmarkRangefeed runs a rangefeed benchmark, emitting b.N events across
 // a rangefeed.
 func runBenchmarkRangefeed(b *testing.B, opts benchmarkRangefeedOpts) {
-	defer log.Scope(b).Close(b)
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stopper := stop.NewStopper()
@@ -168,7 +166,7 @@ func runBenchmarkRangefeed(b *testing.B, opts benchmarkRangefeedOpts) {
 	}
 
 	// Wait for catchup scans and flush checkpoint events.
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	// Run the benchmark. We accounted for b.N when constructing events.
 	b.ResetTimer()
@@ -183,7 +181,7 @@ func runBenchmarkRangefeed(b *testing.B, opts benchmarkRangefeedOpts) {
 			b.Fatal("failed to forward closed timestamp")
 		}
 	}
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	// Check that all registrations ended successfully, and emitted the expected
 	// number of events.

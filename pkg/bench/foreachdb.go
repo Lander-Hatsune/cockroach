@@ -26,7 +26,6 @@ import (
 	_ "github.com/cockroachdb/cockroach/pkg/ccl"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -71,7 +70,7 @@ func benchmarkSharedProcessTenantCockroach(b *testing.B, f BenchmarkFn) {
 
 	// Create our own test tenant with a known name.
 	tenantName := "benchtenant"
-	_, tenantDB, err := s.(*server.TestServer).StartSharedProcessTenant(ctx,
+	_, tenantDB, err := s.TenantController().StartSharedProcessTenant(ctx,
 		base.TestSharedProcessTenantArgs{
 			TenantName:  roachpb.TenantName(tenantName),
 			UseDatabase: "bench",
@@ -128,7 +127,7 @@ func benchmarkSepProcessTenantCockroach(b *testing.B, f BenchmarkFn) {
 	// The benchmarks sometime hit the default span limit, so we increase it.
 	// NOTE(andrei): Benchmarks drop the tables they're creating, so I'm not sure
 	// if hitting this limit is expected.
-	_, err := db.Exec(`ALTER TENANT ALL SET CLUSTER SETTING "spanconfig.tenant_limit" = 10000000`)
+	_, err := db.Exec(`ALTER TENANT ALL SET CLUSTER SETTING "spanconfig.virtual_cluster.max_spans" = 10000000`)
 	require.NoError(b, err)
 
 	_, err = tenantDB.Exec(`CREATE DATABASE bench`)

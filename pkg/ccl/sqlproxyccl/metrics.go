@@ -234,19 +234,19 @@ func makeProxyMetrics() metrics {
 		RefusedConnCount:       metric.NewCounter(metaRefusedConnCount),
 		SuccessfulConnCount:    metric.NewCounter(metaSuccessfulConnCount),
 		ConnectionLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaConnMigrationAttemptedCount,
-			Duration: base.DefaultHistogramWindowInterval(),
-			Buckets:  metric.IOLatencyBuckets,
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaConnMigrationAttemptedCount,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.IOLatencyBuckets,
 		}),
 		AuthFailedCount:        metric.NewCounter(metaAuthFailedCount),
 		ExpiredClientConnCount: metric.NewCounter(metaExpiredClientConnCount),
 		// Connector metrics.
 		DialTenantLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaDialTenantLatency,
-			Duration: base.DefaultHistogramWindowInterval(),
-			Buckets:  metric.IOLatencyBuckets},
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaDialTenantLatency,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.IOLatencyBuckets},
 		),
 		DialTenantRetries: metric.NewCounter(metaDialTenantRetries),
 		// Connection migration metrics.
@@ -255,17 +255,17 @@ func makeProxyMetrics() metrics {
 		ConnMigrationErrorRecoverableCount: metric.NewCounter(metaConnMigrationErrorRecoverableCount),
 		ConnMigrationAttemptedCount:        metric.NewCounter(metaConnMigrationAttemptedCount),
 		ConnMigrationAttemptedLatency: metric.NewHistogram(metric.HistogramOptions{
-			Mode:     metric.HistogramModePreferHdrLatency,
-			Metadata: metaConnMigrationAttemptedLatency,
-			Duration: base.DefaultHistogramWindowInterval(),
-			Buckets:  metric.IOLatencyBuckets,
+			Mode:         metric.HistogramModePreferHdrLatency,
+			Metadata:     metaConnMigrationAttemptedLatency,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.IOLatencyBuckets,
 		}),
 		ConnMigrationTransferResponseMessageSize: metric.NewHistogram(metric.HistogramOptions{
-			Metadata: metaConnMigrationTransferResponseMessageSize,
-			Duration: base.DefaultHistogramWindowInterval(),
-			Buckets:  metric.DataSize16MBBuckets,
-			MaxVal:   maxExpectedTransferResponseMessageSize,
-			SigFigs:  1,
+			Metadata:     metaConnMigrationTransferResponseMessageSize,
+			Duration:     base.DefaultHistogramWindowInterval(),
+			BucketConfig: metric.DataSize16MBBuckets,
+			MaxVal:       maxExpectedTransferResponseMessageSize,
+			SigFigs:      1,
 		}),
 		QueryCancelReceivedPGWire: metric.NewCounter(metaQueryCancelReceivedPGWire),
 		QueryCancelReceivedHTTP:   metric.NewCounter(metaQueryCancelReceivedHTTP),
@@ -292,11 +292,13 @@ func (metrics *metrics) updateForError(err error) {
 		metrics.ClientDisconnectCount.Inc(1)
 	case codeProxyRefusedConnection:
 		metrics.RefusedConnCount.Inc(1)
-		metrics.BackendDownCount.Inc(1)
 	case codeParamsRoutingFailed, codeUnavailable:
 		metrics.RoutingErrCount.Inc(1)
-		metrics.BackendDownCount.Inc(1)
-	case codeBackendDown:
+	case codeBackendDialFailed:
+		// NOTE: Historically, we had the code named codeBackendDown instead of
+		// codeBackendDialFailed. This has been renamed to codeBackendDialFailed
+		// for accuracy, and to prevent confusion by developers. We don't rename
+		// the metrics here as that may break downstream consumers.
 		metrics.BackendDownCount.Inc(1)
 	case codeAuthFailed:
 		metrics.AuthFailedCount.Inc(1)

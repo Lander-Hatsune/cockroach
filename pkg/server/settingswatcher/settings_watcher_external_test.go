@@ -76,8 +76,21 @@ func TestSettingWatcherOnTenant(t *testing.T) {
 		return rows
 	}
 	filterSystemOnly := func(rows []kv.KeyValue) (filtered []kv.KeyValue) {
+		sys := []roachpb.Key{
+			roachpb.Key(systemOnlySetting),
+			roachpb.Key("kv.closed_timestamp.target_duration"),
+			roachpb.Key("kv.closed_timestamp.side_transport_interval"),
+		}
+		isSys := func(key roachpb.Key) bool {
+			for _, s := range sys {
+				if bytes.Contains(key, s) {
+					return true
+				}
+			}
+			return false
+		}
 		for _, row := range rows {
-			if !bytes.Contains(row.Key, []byte(systemOnlySetting)) {
+			if !isSys(row.Key) {
 				filtered = append(filtered, row)
 			}
 		}
@@ -240,19 +253,19 @@ func TestSettingsWatcherWithOverrides(t *testing.T) {
 	st := cluster.MakeTestingClusterSettings()
 	f, err := rangefeed.NewFactory(stopper, kvDB, st, &rangefeed.TestingKnobs{})
 	require.NoError(t, err)
-	w := settingswatcher.NewWithOverrides(ts.Clock(), keys.SystemSQLCodec, st, f, stopper, m, nil)
+	w := settingswatcher.NewWithOverrides(ts.Clock(), ts.Codec(), st, f, stopper, m, nil)
 	require.NoError(t, w.Start(ctx))
 
-	expect := func(setting, value string) {
+	expect := func(setting settings.InternalKey, value string) {
 		t.Helper()
-		s, ok := settings.LookupForLocalAccess(setting, settings.ForSystemTenant)
+		s, ok := settings.LookupForLocalAccessByKey(setting, settings.ForSystemTenant)
 		require.True(t, ok)
 		require.Equal(t, value, s.String(&st.SV))
 	}
 
-	expectSoon := func(setting, value string) {
+	expectSoon := func(setting settings.InternalKey, value string) {
 		t.Helper()
-		s, ok := settings.LookupForLocalAccess(setting, settings.ForSystemTenant)
+		s, ok := settings.LookupForLocalAccessByKey(setting, settings.ForSystemTenant)
 		require.True(t, ok)
 		testutils.SucceedsSoon(t, func() error {
 			if actual := s.String(&st.SV); actual != value {
@@ -301,7 +314,7 @@ func TestSettingsWatcherWithOverrides(t *testing.T) {
 	expectSoon("i1", "10")
 
 	// Verify that version cannot be overridden.
-	version, ok := settings.LookupForLocalAccess("version", settings.ForSystemTenant)
+	version, ok, _ := settings.LookupForLocalAccess("version", settings.ForSystemTenant)
 	require.True(t, ok)
 	versionValue := version.String(&st.SV)
 
@@ -317,7 +330,7 @@ type testingOverrideMonitor struct {
 	mu struct {
 		syncutil.Mutex
 		ch        chan struct{}
-		overrides map[string]settings.EncodedValue
+		overrides map[settings.InternalKey]settings.EncodedValue
 	}
 }
 
@@ -326,7 +339,7 @@ var _ settingswatcher.OverridesMonitor = (*testingOverrideMonitor)(nil)
 func newTestingOverrideMonitor() *testingOverrideMonitor {
 	m := &testingOverrideMonitor{}
 	m.mu.ch = make(chan struct{})
-	m.mu.overrides = make(map[string]settings.EncodedValue)
+	m.mu.overrides = make(map[settings.InternalKey]settings.EncodedValue)
 	return m
 }
 
@@ -337,7 +350,7 @@ func (m *testingOverrideMonitor) notify() {
 	m.mu.ch = make(chan struct{})
 }
 
-func (m *testingOverrideMonitor) set(key string, val string, valType string) {
+func (m *testingOverrideMonitor) set(key settings.InternalKey, val string, valType string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -347,7 +360,7 @@ func (m *testingOverrideMonitor) set(key string, val string, valType string) {
 	}
 }
 
-func (m *testingOverrideMonitor) unset(key string) {
+func (m *testingOverrideMonitor) unset(key settings.InternalKey) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.mu.overrides, key)
@@ -359,10 +372,13 @@ func (m *testingOverrideMonitor) WaitForStart(ctx context.Context) error {
 }
 
 // Overrides is part of the settingswatcher.OverridesMonitor interface.
-func (m *testingOverrideMonitor) Overrides() (map[string]settings.EncodedValue, <-chan struct{}) {
+func (m *testingOverrideMonitor) Overrides() (
+	map[settings.InternalKey]settings.EncodedValue,
+	<-chan struct{},
+) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	res := make(map[string]settings.EncodedValue)
+	res := make(map[settings.InternalKey]settings.EncodedValue)
 	for k, v := range m.mu.overrides {
 		res[k] = v
 	}
@@ -438,7 +454,7 @@ func TestOverflowRestart(t *testing.T) {
 // two settings do not match. It generally gets used with SucceeedsSoon.
 func CheckSettingsValuesMatch(t *testing.T, a, b *cluster.Settings) error {
 	for _, k := range settings.Keys(false /* forSystemTenant */) {
-		s, ok := settings.LookupForLocalAccess(k, false /* forSystemTenant */)
+		s, ok := settings.LookupForLocalAccessByKey(k, false /* forSystemTenant */)
 		require.True(t, ok)
 		if s.Class() == settings.SystemOnly {
 			continue

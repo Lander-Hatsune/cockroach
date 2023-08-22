@@ -3138,6 +3138,12 @@ func (r *Replica) followerSendSnapshot(
 	// explicitly for snapshots going out to followers.
 	snap.State.DeprecatedUsingAppliedStateKey = true
 
+	// Use shared replication if shared storage is enabled and we're sending
+	// a snapshot for a non-system range. This allows us to send metadata of
+	// sstables in shared storage as opposed to streaming their contents. Keys
+	// in higher levels of the LSM are still streamed in the snapshot.
+	sharedReplicate := r.store.cfg.SharedStorageEnabled && snap.State.Desc.StartKey.AsRawKey().Compare(keys.TableDataMin) >= 0
+
 	// Create new snapshot request header using the delegate snapshot request.
 	header := kvserverpb.SnapshotRequest_Header{
 		State:                                snap.State,
@@ -3160,6 +3166,7 @@ func (r *Replica) followerSendSnapshot(
 		SenderQueuePriority: req.SenderQueuePriority,
 		Strategy:            kvserverpb.SnapshotRequest_KV_BATCH,
 		Type:                req.Type,
+		SharedReplicate:     sharedReplicate,
 	}
 	newBatchFn := func() storage.WriteBatch {
 		return r.store.TODOEngine().NewWriteBatch()
@@ -3981,7 +3988,7 @@ func (r *Replica) adminScatter(
 	var allowLeaseTransfer bool
 	var err error
 	requeue := true
-	canTransferLease := func(ctx context.Context, repl plan.LeaseCheckReplica) bool {
+	canTransferLease := func(ctx context.Context, repl plan.LeaseCheckReplica, conf roachpb.SpanConfig) bool {
 		return allowLeaseTransfer
 	}
 	for re := retry.StartWithCtx(ctx, retryOpts); re.Next(); {
@@ -3991,8 +3998,9 @@ func (r *Replica) adminScatter(
 		if currentAttempt == maxAttempts-1 || !requeue {
 			allowLeaseTransfer = true
 		}
+		desc, conf := r.DescAndSpanConfig()
 		requeue, err = rq.processOneChange(
-			ctx, r, canTransferLease, true /* scatter */, false, /* dryRun */
+			ctx, r, desc, conf, canTransferLease, true /* scatter */, false, /* dryRun */
 		)
 		if err != nil {
 			// TODO(tbg): can this use IsRetriableReplicationError?
@@ -4010,9 +4018,9 @@ func (r *Replica) adminScatter(
 	// done by transferring the lease to any of the given N replicas with
 	// probability 1/N of choosing each.
 	if args.RandomizeLeases && r.OwnsValidLease(ctx, r.store.Clock().NowAsClockTimestamp()) {
-		desc := r.Desc()
+		desc, conf := r.DescAndSpanConfig()
 		potentialLeaseTargets := r.store.allocator.ValidLeaseTargets(
-			ctx, r.store.cfg.StorePool, r.SpanConfig(), desc.Replicas().VoterDescriptors(), r, allocator.TransferLeaseOptions{})
+			ctx, r.store.cfg.StorePool, desc, conf, desc.Replicas().VoterDescriptors(), r, allocator.TransferLeaseOptions{})
 		if len(potentialLeaseTargets) > 0 {
 			newLeaseholderIdx := rand.Intn(len(potentialLeaseTargets))
 			targetStoreID := potentialLeaseTargets[newLeaseholderIdx].StoreID

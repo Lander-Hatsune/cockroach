@@ -12,6 +12,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 
 	"github.com/cockroachdb/cockroach/pkg/keys"
@@ -37,8 +38,14 @@ func (s *systemStatusServer) spanStatsFanOut(
 	res := &roachpb.SpanStatsResponse{
 		SpanToStats: make(map[string]*roachpb.SpanStats),
 	}
-	// Response level error
-	var respErr error
+	// Populate SpanToStats with empty values for each span,
+	// so that clients may still access stats for a specific span
+	// in the extreme case of an error encountered on every node.
+	for _, sp := range req.Spans {
+		res.SpanToStats[sp.String()] = &roachpb.SpanStats{}
+	}
+
+	responses := make(map[string]struct{})
 
 	spansPerNode, err := s.getSpansPerNode(ctx, req)
 	if err != nil {
@@ -51,6 +58,14 @@ func (s *systemStatusServer) spanStatsFanOut(
 		ctx context.Context,
 		nodeID roachpb.NodeID,
 	) (interface{}, error) {
+		if s.knobs != nil {
+			if s.knobs.IterateNodesDialCallback != nil {
+				if err := s.knobs.IterateNodesDialCallback(nodeID); err != nil {
+					return nil, err
+				}
+			}
+		}
+
 		if _, ok := spansPerNode[nodeID]; ok {
 			return s.dialNode(ctx, nodeID)
 		}
@@ -58,6 +73,14 @@ func (s *systemStatusServer) spanStatsFanOut(
 	}
 
 	nodeFn := func(ctx context.Context, client interface{}, nodeID roachpb.NodeID) (interface{}, error) {
+		if s.knobs != nil {
+			if s.knobs.IterateNodesNodeCallback != nil {
+				if err := s.knobs.IterateNodesNodeCallback(ctx, nodeID); err != nil {
+					return nil, err
+				}
+			}
+		}
+
 		// `smartDial` may skip this node, so check to see if the client is nil.
 		// If it is, return nil response.
 		if client == nil {
@@ -80,24 +103,38 @@ func (s *systemStatusServer) spanStatsFanOut(
 
 		nodeResponse := resp.(*roachpb.SpanStatsResponse)
 
+		// Values of ApproximateDiskBytes, RemoteFileBytes, and ExternalFileBytes should be physical values, but
+		// TotalStats (MVCC stats) should be the logical, pre-replicated value.
+		// Note: This implementation can return arbitrarily stale values, because instead of getting
+		// MVCC stats from the leaseholder, MVCC stats are taken from the node that responded first.
+		// See #108779.
 		for spanStr, spanStats := range nodeResponse.SpanToStats {
-			_, exists := res.SpanToStats[spanStr]
-			if !exists {
-				res.SpanToStats[spanStr] = spanStats
-			} else {
-				res.SpanToStats[spanStr].Add(spanStats)
+			// Accumulate physical values across all replicas:
+			res.SpanToStats[spanStr].ApproximateDiskBytes += spanStats.ApproximateDiskBytes
+			res.SpanToStats[spanStr].RemoteFileBytes += spanStats.RemoteFileBytes
+			res.SpanToStats[spanStr].ExternalFileBytes += spanStats.ExternalFileBytes
+
+			// Logical values: take the values from the node that responded first.
+			// TODO: This should really be read from the leaseholder.
+			if _, ok := responses[spanStr]; !ok {
+				res.SpanToStats[spanStr].TotalStats = spanStats.TotalStats
+				res.SpanToStats[spanStr].RangeCount = spanStats.RangeCount
+				responses[spanStr] = struct{}{}
 			}
 		}
 	}
 
 	errorFn := func(nodeID roachpb.NodeID, err error) {
 		log.Errorf(ctx, nodeErrorMsgPlaceholder, nodeID, err)
-		respErr = err
+		errorMessage := fmt.Sprintf("%v", err)
+		res.Errors = append(res.Errors, errorMessage)
 	}
 
+	timeout := roachpb.SpanStatsNodeTimeout.Get(&s.st.SV)
 	if err := s.statusServer.iterateNodes(
 		ctx,
 		"iterating nodes for span stats",
+		timeout,
 		smartDial,
 		nodeFn,
 		responseFn,
@@ -106,7 +143,7 @@ func (s *systemStatusServer) spanStatsFanOut(
 		return nil, err
 	}
 
-	return res, respErr
+	return res, nil
 }
 
 func (s *systemStatusServer) getLocalStats(

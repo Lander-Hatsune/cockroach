@@ -391,7 +391,9 @@ ALTER TABLE t DROP COLUMN IF EXISTS q
 statement error cannot drop column "e" because view "v" depends on it
 ALTER TABLE t DROP COLUMN IF EXISTS e
 
-statement ok
+# Negative test to assert that NOTICEs are NOT emitted if there are no indexes
+# being dropped.
+statement notice ^$
 ALTER TABLE t DROP COLUMN IF EXISTS e CASCADE
 
 statement ok
@@ -403,12 +405,16 @@ CREATE TABLE o (gf INT REFERENCES t (g), h INT, i INT, INDEX oi (i), INDEX oh (h
 statement error "t_g_key" is referenced by foreign key from table "o"
 ALTER TABLE t DROP COLUMN g
 
-statement ok
+statement notice NOTICE: dropping index "t_g_key" which depends on column "g"
 ALTER TABLE t DROP COLUMN g CASCADE
 
 # Dropping columns that are indexed or stored in indexes drops those indexes
-# too.
-statement ok
+# too. Excuse the nasty regex, the legacy schema changer emits additional
+# NOTICEs about GCing. We're not testing for that, so we just "eat" them.
+# Example: "NOTICE: the data for dropped indexes is reclaimed
+# asynchronously\nHINT: The reclamation delay can be customized in the zone
+# configuration for the table."
+statement notice (NOTICE: dropping index "(oh|oih)" which depends on column "h"(\nNOTICE: .+\nHINT: .+\n)?\n?){2}
 ALTER TABLE o DROP COLUMN h
 
 query TTBITTTBBBF colnames,rowsort
@@ -2204,11 +2210,8 @@ COMMIT
 subtest add_multiple_in_txn
 
 statement ok
-CREATE SEQUENCE IF NOT EXISTS multipleinstmt_seq MAXVALUE 9007199254740991;
-
-statement ok
 CREATE TABLE IF NOT EXISTS multipleinstmt (
-	id INT8 DEFAULT nextval('multipleinstmt_seq') PRIMARY KEY, key STRING, value STRING
+	key STRING PRIMARY KEY, value STRING
 );
 
 statement ok
@@ -2223,23 +2226,23 @@ ALTER TABLE multipleinstmt ADD COLUMN IF NOT EXISTS a BOOL DEFAULT false;
 ALTER TABLE multipleinstmt ADD COLUMN IF NOT EXISTS b STRING;
 COMMIT;
 
-query ITTBT
-SELECT * FROM multipleinstmt ORDER BY id ASC;
+query TTBT
+SELECT * FROM multipleinstmt ORDER BY key ASC;
 ----
-1  a  a  false  NULL
-2  b  b  false  NULL
-3  c  c  false  NULL
+a  a  false  NULL
+b  b  false  NULL
+c  c  false  NULL
 
 statement ok
 ALTER TABLE multipleinstmt ADD COLUMN IF NOT EXISTS c BOOL DEFAULT true,
                            ADD COLUMN IF NOT EXISTS d STRING;
 
-query ITTBTBT
-SELECT * FROM multipleinstmt ORDER BY id ASC;
+query TTBTBT
+SELECT * FROM multipleinstmt ORDER BY key ASC;
 ----
-1  a  a  false  NULL  true  NULL
-2  b  b  false  NULL  true  NULL
-3  c  c  false  NULL  true  NULL
+a  a  false  NULL  true  NULL
+b  b  false  NULL  true  NULL
+c  c  false  NULL  true  NULL
 
 skip_on_retry
 
@@ -2406,8 +2409,8 @@ FROM (
 LEFT JOIN pg_catalog.pg_depend r ON l.table_id = r.objid;
 ----
 table_id  name               state   refobjid
-202       test_serial_b_seq  PUBLIC  201
-201       test_serial        PUBLIC  NULL
+201       test_serial_b_seq  PUBLIC  200
+200       test_serial        PUBLIC  NULL
 
 statement ok
 DROP TABLE test_serial;
@@ -2441,8 +2444,8 @@ FROM (
 LEFT JOIN pg_catalog.pg_depend r ON l.table_id = r.objid;
 ----
 table_id  name               state   refobjid
-204       test_serial_b_seq  PUBLIC  203
-203       test_serial        PUBLIC  NULL
+203       test_serial_b_seq  PUBLIC  202
+202       test_serial        PUBLIC  NULL
 
 statement ok
 ALTER TABLE test_serial DROP COLUMN b;
@@ -2457,7 +2460,7 @@ FROM (
 LEFT JOIN pg_catalog.pg_depend r ON l.table_id = r.objid;
 ----
 table_id  name         state   refobjid
-203       test_serial  PUBLIC  NULL
+202       test_serial  PUBLIC  NULL
 
 statement ok
 DROP TABLE test_serial;

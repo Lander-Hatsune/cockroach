@@ -1073,6 +1073,13 @@ func TestLogic_json_builtins(
 	runLogicTest(t, "json_builtins")
 }
 
+func TestLogic_json_index_local_mixed(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "json_index_local_mixed")
+}
+
 func TestLogic_kv_builtin_functions(
 	t *testing.T,
 ) {
@@ -2067,6 +2074,13 @@ func TestLogic_udf_delete(
 	runLogicTest(t, "udf_delete")
 }
 
+func TestLogic_udf_fk(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_fk")
+}
+
 func TestLogic_udf_insert(
 	t *testing.T,
 ) {
@@ -2100,6 +2114,13 @@ func TestLogic_udf_plpgsql(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_plpgsql")
+}
+
+func TestLogic_udf_prepare(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_prepare")
 }
 
 func TestLogic_udf_privileges(

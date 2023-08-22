@@ -247,7 +247,11 @@ func (a *apiV2Server) listRange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.status.iterateNodes(
-		ctx, fmt.Sprintf("details about range %d", rangeID), dialFn, nodeFn, responseFn, errorFn,
+		ctx,
+		fmt.Sprintf("details about range %d", rangeID),
+		noTimeout,
+		dialFn, nodeFn,
+		responseFn, errorFn,
 	); err != nil {
 		srverrors.APIV2InternalError(ctx, err, w)
 		return
@@ -566,8 +570,9 @@ func (a *apiV2Server) listHotRanges(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	timeout := HotRangesRequestNodeTimeout.Get(&a.status.st.SV)
 	next, err := a.status.paginatedIterateNodes(
-		ctx, "hot ranges", limit, start, requestedNodes, dialFn,
+		ctx, "hot ranges", limit, start, requestedNodes, timeout, dialFn,
 		nodeFn, responseFn, errorFn)
 
 	if err != nil {

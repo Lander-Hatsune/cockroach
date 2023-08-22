@@ -17,7 +17,6 @@ go_library(
         "//pkg/sql",
         "//pkg/sql/contention",
         "//pkg/sql/sqlstats/persistedsqlstats",
-        "//pkg/sql/tests",
         "//pkg/testutils/serverutils",
         "//pkg/testutils/sqlutils",
         "//pkg/util/httputil",
@@ -48,6 +47,7 @@ go_test(
     }),
     data = glob(["testdata/**"]),
     embed = [":serverccl"],
+    exec_properties = {"Pool": "large"},
     tags = ["ccl_test"],
     deps = [
         "//pkg/base",
@@ -88,6 +88,7 @@ go_test(
         "//pkg/util/log",
         "//pkg/util/protoutil",
         "//pkg/util/randutil",
+        "//pkg/util/stop",
         "//pkg/util/timeutil",
         "@com_github_cockroachdb_datadriven//:datadriven",
         "@com_github_cockroachdb_errors//:errors",

@@ -728,7 +728,7 @@ var highPriorityAfter = settings.RegisterDurationSetting(
 	"changefeed.schema_feed.read_with_priority_after",
 	"retry with high priority if we were not able to read descriptors for too long; 0 disables",
 	time.Minute,
-).WithPublic()
+	settings.WithPublic)
 
 // sendExportRequestWithPriorityOverride uses KV API Export() to dump all kv pairs
 // whose key falls under `span` and whose mvcc timestamp falls within [startTs, endTS].
@@ -857,12 +857,19 @@ func (tf *schemaFeed) fetchDescriptorVersions(
 					if err != nil {
 						return err
 					}
-					if unsafeValue == nil {
+
+					if len(unsafeValue) == 0 {
+						if isType {
+							return changefeedbase.WithTerminalError(
+								errors.Wrapf(catalog.ErrDescriptorDropped, "type descriptor %d dropped", id))
+						}
+
 						name := origName
 						if name == "" {
 							name = changefeedbase.StatementTimeName(fmt.Sprintf("desc(%d)", id))
 						}
-						return errors.Errorf(`"%v" was dropped or truncated`, name)
+						return changefeedbase.WithTerminalError(
+							errors.Wrapf(catalog.ErrDescriptorDropped, `table "%v"[%d] was dropped or truncated`, name, id))
 					}
 
 					// Unmarshal the descriptor.

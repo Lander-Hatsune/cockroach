@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigtestutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
-	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/datadriven"
 	"github.com/guptarohit/asciigraph"
@@ -157,11 +156,8 @@ import (
 //     ....└── [11 12 13 14 15]
 func TestDataDriven(t *testing.T) {
 	ctx := context.Background()
-	dir := datapathutils.TestDataPath(t, ".")
+	dir := datapathutils.TestDataPath(t, "non_rand")
 	datadriven.Walk(t, dir, func(t *testing.T, path string) {
-		if strings.Contains(path, "example_fulldisk") {
-			skip.WithIssue(t, 105904, "asim is non-deterministic")
-		}
 		const defaultKeyspace = 10000
 		loadGen := gen.BasicLoad{}
 		var clusterGen gen.ClusterGen
@@ -209,7 +205,7 @@ func TestDataDriven(t *testing.T) {
 				if placementSkew {
 					placementType = gen.Skewed
 				} else {
-					placementType = gen.Uniform
+					placementType = gen.Even
 				}
 				rangeGen = gen.BasicRanges{
 					BaseRanges: gen.BaseRanges{

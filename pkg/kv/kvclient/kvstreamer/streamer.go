@@ -728,7 +728,10 @@ func (s *Streamer) GetResults(ctx context.Context) ([]Result, error) {
 		if len(results) > 0 || allComplete || err != nil {
 			return results, err
 		}
-		if err = s.results.wait(ctx); err != nil {
+		s.results.wait()
+		// Check whether the Streamer has been canceled or closed while we were
+		// waiting for the results.
+		if err = ctx.Err(); err != nil {
 			s.results.setError(err)
 			return nil, err
 		}
@@ -1590,6 +1593,7 @@ func processSingleRangeResults(
 				continue
 			}
 			result := Result{
+				ScanResp:       scan,
 				Position:       position,
 				subRequestIdx:  subRequestIdx,
 				subRequestDone: scan.ResumeSpan == nil,
@@ -1597,7 +1601,6 @@ func processSingleRangeResults(
 			result.memoryTok.streamer = s
 			result.memoryTok.toRelease = scanResponseSize(scan) + scanResponseOverhead
 			memoryTokensBytes += result.memoryTok.toRelease
-			result.ScanResp = scan
 			if s.hints.SingleRowLookup {
 				result.scanComplete = true
 			} else if scan.ResumeSpan == nil {
@@ -1699,6 +1702,11 @@ func buildResumeSingleRangeBatch(
 				resumeReq.minTargetBytes = get.ResumeNextBytes
 			}
 			resumeReqIdx++
+			// Unset the ResumeSpan on the response in order to not confuse the
+			// user of the Streamer (in case it were to inspect result.GetResp)
+			// as well as to allow for GC of the ResumeSpan. Non-nil resume span
+			// was already included into resumeReq above.
+			get.ResumeSpan = nil
 
 		case *kvpb.ScanResponse:
 			scan := response
@@ -1722,16 +1730,11 @@ func buildResumeSingleRangeBatch(
 				resumeReq.minTargetBytes = scan.ResumeNextBytes
 			}
 			resumeReqIdx++
-
-			if s.hints.SingleRowLookup {
-				// Unset the ResumeSpan on the result in order to not
-				// confuse the user of the Streamer. Non-nil resume span was
-				// already included into resumeReq above.
-				//
-				// When SingleRowLookup is false, this will be done in
-				// finalizeSingleRangeResults().
-				scan.ResumeSpan = nil
-			}
+			// Unset the ResumeSpan on the response in order to not confuse the
+			// user of the Streamer (in case it were to inspect result.ScanResp)
+			// as well as to allow for GC of the ResumeSpan. Non-nil resume span
+			// was already included into resumeReq above.
+			scan.ResumeSpan = nil
 		}
 	}
 

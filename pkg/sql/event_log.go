@@ -166,9 +166,6 @@ type eventLogOptions struct {
 
 	// Additional redaction options, if necessary.
 	rOpts redactionOptions
-
-	// isCopy notes whether the current event is related to COPY.
-	isCopy bool
 }
 
 // redactionOptions contains instructions on how to redact the SQL
@@ -281,8 +278,8 @@ func logEventInternalForSQLStatements(
 ) error {
 	// Inject the common fields into the payload provided by the caller.
 	injectCommonFields := func(event logpb.EventPayload) error {
-		if opts.isCopy {
-			// No txn is set for COPY, so use now instead.
+		if txn == nil {
+			// No txn is set (e.g. for COPY or BEGIN), so use now instead.
 			event.CommonDetails().Timestamp = timeutil.Now().UnixNano()
 		} else {
 			event.CommonDetails().Timestamp = txn.KV().ReadTimestamp().WallTime
@@ -440,7 +437,7 @@ var eventLogSystemTableEnabled = settings.RegisterBoolSetting(
 	"server.eventlog.enabled",
 	"if set, logged notable events are also stored in the table system.eventlog",
 	true,
-).WithPublic()
+	settings.WithPublic)
 
 // EventLogTestingKnobs provides hooks and knobs for event logging.
 type EventLogTestingKnobs struct {

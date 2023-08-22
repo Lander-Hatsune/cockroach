@@ -43,11 +43,7 @@ func TestTelemetrySQLStatsIndependence(t *testing.T) {
 
 	ctx := context.Background()
 	var params base.TestServerArgs
-	params.Knobs = base.TestingKnobs{
-		SQLStatsKnobs: &sqlstats.TestingKnobs{
-			AOSTClause: "AS OF SYSTEM TIME '-1us'",
-		},
-	}
+	params.Knobs.SQLStatsKnobs = sqlstats.CreateTestingKnobs()
 
 	r := diagutils.NewServer()
 	defer r.Close()
@@ -307,7 +303,7 @@ func TestClusterResetSQLStats(t *testing.T) {
 
 	for _, flushed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("flushed=%t", flushed), func(t *testing.T) {
-			testCluster := serverutils.StartNewTestCluster(t, 3 /* numNodes */, base.TestClusterArgs{
+			testCluster := serverutils.StartCluster(t, 3 /* numNodes */, base.TestClusterArgs{
 				ServerArgs: base.TestServerArgs{
 					Insecure: true,
 					Knobs: base.TestingKnobs{

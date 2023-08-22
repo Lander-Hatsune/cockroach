@@ -23,7 +23,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/contention"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
@@ -144,7 +143,7 @@ func NewTestTenantHelper(
 ) TenantTestHelper {
 	t.Helper()
 
-	testCluster := serverutils.StartNewTestCluster(t, 1 /* numNodes */, base.TestClusterArgs{
+	testCluster := serverutils.StartCluster(t, 1 /* numNodes */, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Knobs:             knobs,
 			DefaultTestTenant: base.TestControlsTenantsExplicitly,
@@ -221,9 +220,10 @@ func newTenantClusterHelper(
 
 	var cluster tenantCluster = make([]TestTenant, tenantClusterSize)
 	for i := 0; i < tenantClusterSize; i++ {
-		args := tests.CreateTestTenantParams(roachpb.MustMakeTenantID(tenantID))
-		args.TestingKnobs = knobs
-		cluster[i] = newTestTenant(t, server, args)
+		cluster[i] = newTestTenant(t, server, base.TestTenantArgs{
+			TenantID:     roachpb.MustMakeTenantID(tenantID),
+			TestingKnobs: knobs,
+		})
 	}
 
 	return cluster

@@ -1232,16 +1232,6 @@ func (v *validator) failIfError(
 ) (ambiguous, hasError bool) {
 	exceptions = append(exceptions[:len(exceptions):len(exceptions)], func(err error) bool {
 		return errors.Is(err, errInjected)
-	}, func(err error) bool {
-		// Work-around for [1].
-		//
-		// TODO(arul): find out why we (as of [2]) sometimes leaking
-		// *TransactionPushError (wrapped in `UnhandledRetryableError`) from
-		// `db.Get`, `db.Scan`, etc.
-		//
-		// [1]: https://github.com/cockroachdb/cockroach/issues/105330
-		// [2]: https://github.com/cockroachdb/cockroach/pull/97779
-		return errors.HasType(err, (*kvpb.UnhandledRetryableError)(nil))
 	})
 	switch r.Type {
 	case ResultType_Unknown:
@@ -1318,11 +1308,14 @@ func validReadTimes(b *pebble.Batch, key roachpb.Key, value []byte) disjointTime
 	var hist []storage.MVCCValue
 	lowerBound := storage.EncodeMVCCKey(storage.MVCCKey{Key: key})
 	upperBound := storage.EncodeMVCCKey(storage.MVCCKey{Key: key.Next()})
-	iter := b.NewIter(&pebble.IterOptions{
+	iter, err := b.NewIter(&pebble.IterOptions{
 		KeyTypes:   storage.IterKeyTypePointsAndRanges,
 		LowerBound: lowerBound,
 		UpperBound: upperBound,
 	})
+	if err != nil {
+		panic(err)
+	}
 	defer func() { _ = iter.Close() }()
 
 	iter.SeekGE(lowerBound)
@@ -1446,7 +1439,10 @@ func validScanTime(b *pebble.Batch, span roachpb.Span, kvs []roachpb.KeyValue) m
 	// Note that this iterator ignores MVCC range deletions. We use this iterator
 	// only to *discover* point keys; we then invoke validReadTimes for each of
 	// them which *does* take into account MVCC range deletions.
-	iter := b.NewIter(nil)
+	iter, err := b.NewIter(nil)
+	if err != nil {
+		panic(err)
+	}
 	defer func() { _ = iter.Close() }()
 
 	iter.SeekGE(storage.EncodeMVCCKey(storage.MVCCKey{Key: span.Key}))

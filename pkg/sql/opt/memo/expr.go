@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/constraint"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/props/physical"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree/treewindow"
@@ -720,6 +721,23 @@ type UDFDefinition struct {
 	// should be optimized if it is rebuilt. Each props corresponds to the RelExpr
 	// at the same position in Body.
 	BodyProps []*physical.Required
+
+	// ExceptionBlock contains information needed for exception-handling when the
+	// body of this routine returns an error. It can be unset.
+	ExceptionBlock *ExceptionBlock
+}
+
+// ExceptionBlock contains the information needed to match and handle errors in
+// the EXCEPTION block of a routine defined with PLpgSQL.
+type ExceptionBlock struct {
+	// Codes is a list of pgcode strings (see pgcode/codes.go). When the body of a
+	// routine with an ExceptionBlock returns an error, the code of that error is
+	// compared against the Codes slice for a match.
+	Codes []pgcode.Code
+
+	// Actions contains routine definitions that represent exception handlers for
+	// each code in the Codes slice.
+	Actions []*UDFDefinition
 }
 
 // WindowFrame denotes the definition of a window frame for an individual
@@ -920,24 +938,22 @@ func (lj *LookupJoinPrivate) GetConstPrefixFilter(md *opt.Metadata) (pos int, ok
 	return 0, false
 }
 
-// ColIsEquivalentWithLookupIndexPrefix returns true if there is a term in
-// `LookupExpr` equating the first column in the lookup index with `col`.
-func (lj *LookupJoinPrivate) ColIsEquivalentWithLookupIndexPrefix(
-	md *opt.Metadata, col opt.ColumnID,
+// LookupIndexPrefixIsEquatedWithColInColSet returns true if there is a term in
+// `LookupExpr` equating the first column in the lookup index with a column in
+// `colSet`.
+func (lj *LookupJoinPrivate) LookupIndexPrefixIsEquatedWithColInColSet(
+	md *opt.Metadata, colSet opt.ColSet,
 ) bool {
 	lookupTable := md.Table(lj.Table)
 	lookupIndex := lookupTable.Index(lj.Index)
 
 	idxCol := lj.Table.IndexColumnID(lookupIndex, 0)
-	var desiredEquivalentCols opt.ColSet
-	desiredEquivalentCols.Add(idxCol)
-	desiredEquivalentCols.Add(col)
 
 	for i := range lj.LookupExpr {
 		props := lj.LookupExpr[i].ScalarProps()
 
 		equivCols := props.FuncDeps.ComputeEquivGroup(idxCol)
-		if desiredEquivalentCols.SubsetOf(equivCols) {
+		if colSet.Intersects(equivCols) {
 			return true
 		}
 	}

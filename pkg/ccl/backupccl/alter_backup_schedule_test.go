@@ -78,7 +78,9 @@ func newAlterSchedulesTestHelper(t *testing.T) (*alterSchedulesTestHelper, func(
 	th.sqlDB = sqlutils.MakeSQLRunner(db)
 	th.server = s
 	th.sqlDB.Exec(t, `SET CLUSTER SETTING bulkio.backup.merge_file_buffer_size = '1MiB'`)
-	th.sqlDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`) // speeds up test
+	sysDB := sqlutils.MakeSQLRunner(s.SystemLayer().SQLConn(t, ""))
+	sysDB.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`) // speeds up test
+	sysDB.Exec(t, `ALTER TENANT ALL SET CLUSTER SETTING kv.closed_timestamp.target_duration = '100ms'`)
 
 	return th, func() {
 		dirCleanupFn()
@@ -133,8 +135,8 @@ INSERT INTO t1 values (1), (10), (100);
 	require.Equal(t, []string{"PAUSED: Waiting for initial backup to complete", "ACTIVE"}, statuses)
 	require.Equal(t, []string{"@daily", "@weekly"}, schedules)
 	require.Equal(t, []string{
-		"BACKUP TABLE mydb.public.t1 INTO LATEST IN 'nodelocal://1/backup/alter-schedule' WITH detached",
-		"BACKUP TABLE mydb.public.t1 INTO 'nodelocal://1/backup/alter-schedule' WITH detached",
+		"BACKUP TABLE mydb.public.t1 INTO LATEST IN 'nodelocal://1/backup/alter-schedule' WITH OPTIONS (detached)",
+		"BACKUP TABLE mydb.public.t1 INTO 'nodelocal://1/backup/alter-schedule' WITH OPTIONS (detached)",
 	},
 		backupStmts)
 

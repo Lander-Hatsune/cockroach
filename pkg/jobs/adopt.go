@@ -82,14 +82,10 @@ func (r *Registry) maybeDumpTrace(resumerCtx context.Context, resumer Resumer, j
 		return
 	}
 
-	resumerTraceFilename := fmt.Sprintf("resumer-trace-n%s.%s.binpb",
+	resumerTraceFilename := fmt.Sprintf("%s/resumer-trace/%s",
 		r.ID().String(), timeutil.Now().Format("20060102_150405.00"))
 	td := jobspb.TraceData{CollectedSpans: sp.GetConfiguredRecording()}
-	b, err := protoutil.Marshal(&td)
-	if err != nil {
-		return
-	}
-	if err := WriteExecutionDetailFile(dumpCtx, resumerTraceFilename, b, r.db, jobID); err != nil {
+	if err := WriteProtobinExecutionDetailFile(dumpCtx, resumerTraceFilename, &td, r.db, jobID); err != nil {
 		log.Warning(dumpCtx, "failed to write trace on resumer trace file")
 		return
 	}
@@ -132,7 +128,7 @@ const (
 	// NextRunClause calculates the next execution time of a job with exponential backoff delay, calculated
 	// using last_run and num_runs values.
 	NextRunClause = `
-COALESCE(last_run, created) + least(
+COALESCE(last_run::timestamptz, created::timestamptz) + least(
 	IF(
 		args.initial_delay * (power(2, least(62, COALESCE(num_runs, 0))) - 1)::FLOAT >= 0.0,
 		args.initial_delay * (power(2, least(62, COALESCE(num_runs, 0))) - 1)::FLOAT,

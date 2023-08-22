@@ -22,7 +22,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/severity"
-	"github.com/cockroachdb/cockroach/pkg/util/must"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	sentry "github.com/getsentry/sentry-go"
@@ -58,22 +57,24 @@ var (
 		"diagnostics.reporting.enabled",
 		"enable reporting diagnostic metrics to cockroach labs",
 		false,
-	).WithPublic()
+		settings.WithPublic)
 
-	// CrashReports wraps "diagnostics.reporting.send_crash_reports".
+	// CrashReports wraps "diagnostics.reporting.send_crash_reports.enabled".
 	CrashReports = settings.RegisterBoolSetting(
 		settings.TenantWritable,
 		"diagnostics.reporting.send_crash_reports",
 		"send crash and panic reports",
 		true,
+		settings.WithName("diagnostics.reporting.send_crash_reports.enabled"),
 	)
 
-	// PanicOnAssertions wraps "debug.panic_on_failed_assertions"
+	// PanicOnAssertions wraps "debug.panic_on_failed_assertions.enabled"
 	PanicOnAssertions = settings.RegisterBoolSetting(
 		settings.TenantWritable,
 		"debug.panic_on_failed_assertions",
 		"panic when an assertion fails rather than reporting",
 		false,
+		settings.WithName("debug.panic_on_failed_assertions.enabled"),
 	)
 
 	// startTime records when the process started so that crash reports can
@@ -256,6 +257,7 @@ func SetupCrashReporter(ctx context.Context, cmd string) {
 	crashReportingActive = true
 
 	sentry.ConfigureScope(func(scope *sentry.Scope) {
+		scope.SetTags(getTagsFromEnvironment())
 		scope.SetTags(map[string]string{
 			"cmd":          cmd,
 			"platform":     info.Platform,
@@ -318,9 +320,6 @@ const (
 	// ReportTypeLogFatal signifies that this is an error report that
 	// was generated via a log.Fatal call.
 	ReportTypeLogFatal
-	// ReportTypeAssertionFailure signifies that an assertion was violated (see
-	// must package).
-	ReportTypeAssertionFailure
 )
 
 // sendCrashReport posts to sentry.
@@ -380,8 +379,6 @@ func SendReport(
 		event.Tags["report_type"] = "error"
 	case ReportTypeLogFatal:
 		event.Tags["report_type"] = "log_fatal"
-	case ReportTypeAssertionFailure:
-		event.Tags["report_type"] = "assertion"
 	}
 
 	for _, f := range tagFns {
@@ -443,18 +440,13 @@ func RegisterTagFn(key string, value func(context.Context) string) {
 	tagFns = append(tagFns, tagFn{key, value})
 }
 
-func maybeSendCrashReport(ctx context.Context, err error, reportType ReportType) {
+func maybeSendCrashReport(ctx context.Context, err error) {
 	// We load the ReportingSettings from global singleton in this call path.
 	if sv := getGlobalSettings(); sv != nil {
-		sendCrashReport(ctx, sv, err, reportType)
+		sendCrashReport(ctx, sv, err, ReportTypeLogFatal)
 	}
 }
 
 func init() {
-	log.MaybeSendCrashReport = func(ctx context.Context, err error) {
-		maybeSendCrashReport(ctx, err, ReportTypeLogFatal)
-	}
-	must.MaybeSendReport = func(ctx context.Context, err error) {
-		maybeSendCrashReport(ctx, err, ReportTypeAssertionFailure)
-	}
+	log.MaybeSendCrashReport = maybeSendCrashReport
 }

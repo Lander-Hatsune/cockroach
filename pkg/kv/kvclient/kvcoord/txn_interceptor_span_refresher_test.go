@@ -625,8 +625,7 @@ func TestTxnSpanRefresherPreemptiveRefresh(t *testing.T) {
 		require.Equal(t, scanArgs.Span(), refReq.Span())
 		require.Equal(t, origReadTs, refReq.RefreshFrom)
 
-		return nil, kvpb.NewError(kvpb.NewRefreshFailedError(
-			kvpb.RefreshFailedError_REASON_COMMITTED_VALUE, roachpb.Key("a"), hlc.Timestamp{WallTime: 1}))
+		return nil, kvpb.NewError(kvpb.NewRefreshFailedError(ctx, kvpb.RefreshFailedError_REASON_COMMITTED_VALUE, roachpb.Key("a"), hlc.Timestamp{WallTime: 1}))
 	}
 	unexpected := func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
 		require.Fail(t, "unexpected")
@@ -1235,10 +1234,10 @@ func TestTxnSpanRefresherAssignsCanForwardReadTimestamp(t *testing.T) {
 	require.Equal(t, int64(0), tsr.metrics.ClientRefreshAutoRetries.Count())
 	require.Equal(t, int64(1), tsr.metrics.ServerRefreshSuccess.Count())
 
-	// Send a Put request for a transaction with a fixed commit timestamp.
+	// Send a Put request for a transaction with a fixed read timestamp.
 	// Should NOT set CanForwardReadTimestamp flag.
 	txnFixed := txn.Clone()
-	txnFixed.CommitTimestampFixed = true
+	txnFixed.ReadTimestampFixed = true
 	baFixed := &kvpb.BatchRequest{}
 	baFixed.Header = kvpb.Header{Txn: txnFixed}
 	baFixed.Add(&kvpb.PutRequest{RequestHeader: kvpb.RequestHeader{Key: keyA}})

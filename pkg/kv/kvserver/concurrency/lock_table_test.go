@@ -497,7 +497,11 @@ func TestLockTableBasic(t *testing.T) {
 				var key string
 				d.ScanArgs(t, "k", &key)
 				strength := ScanLockStrength(t, d)
-				if ok, txn := g.IsKeyLockedByConflictingTxn(roachpb.Key(key), strength); ok {
+				ok, txn, err := g.IsKeyLockedByConflictingTxn(roachpb.Key(key), strength)
+				if err != nil {
+					return err.Error()
+				}
+				if ok {
 					holder := "<nil>"
 					if txn != nil {
 						holder = txn.ID.String()
@@ -713,6 +717,13 @@ func scanSpans(
 			sa = spanset.SpanReadWrite
 		case lock.Exclusive:
 			sa = spanset.SpanReadWrite
+		case lock.Shared:
+			// Unlike non-locking reads, shared-locking reads are isolated at all
+			// timestamps (not just the request's timestamp); so we acquire a read
+			// latch at max timestamp. See
+			// https://github.com/cockroachdb/cockroach/issues/102264.
+			sa = spanset.SpanReadOnly
+			ts = hlc.MaxTimestamp
 		default:
 			d.Fatalf(t, "unsupported lock strength: %s", str)
 		}
@@ -1884,12 +1895,14 @@ func TestLockStateSafeFormat(t *testing.T) {
 		key:    []byte("KEY"),
 		endKey: []byte("END"),
 	}
-	l.holder.txn = &enginepb.TxnMeta{ID: uuid.NamespaceDNS}
+	holder := &txnLock{}
+	l.holders.PushFront(holder)
+	holder.txn = &enginepb.TxnMeta{ID: uuid.NamespaceDNS}
 	// TODO(arul): add something about replicated locks here too.
-	l.holder.unreplicatedInfo.init()
-	l.holder.unreplicatedInfo.ts = hlc.Timestamp{WallTime: 123, Logical: 7}
-	require.NoError(t, l.holder.unreplicatedInfo.acquire(lock.Exclusive, 1))
-	require.NoError(t, l.holder.unreplicatedInfo.acquire(lock.Shared, 3))
+	holder.unreplicatedInfo.init()
+	holder.unreplicatedInfo.ts = hlc.Timestamp{WallTime: 123, Logical: 7}
+	require.NoError(t, holder.unreplicatedInfo.acquire(lock.Exclusive, 1))
+	require.NoError(t, holder.unreplicatedInfo.acquire(lock.Shared, 3))
 	require.EqualValues(t,
 		" lock: ‹\"KEY\"›\n  holder: txn: 6ba7b810-9dad-11d1-80b4-00c04fd430c8 epoch: 0, iso: Serializable, ts: 0.000000123,7, info: unrepl [(str: Exclusive seq: 1), (str: Shared seq: 3)]\n",
 		redact.Sprint(l))

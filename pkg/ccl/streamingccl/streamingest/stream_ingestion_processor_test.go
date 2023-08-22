@@ -60,6 +60,9 @@ import (
 type mockStreamClient struct {
 	partitionEvents map[string][]streamingccl.Event
 	doneCh          chan struct{}
+	heartbeatErr    error
+	heartbeatStatus streampb.StreamReplicationStatus
+	onHeartbeat     func() (streampb.StreamReplicationStatus, error)
 }
 
 var _ streamclient.Client = &mockStreamClient{}
@@ -68,6 +71,13 @@ var _ streamclient.Client = &mockStreamClient{}
 func (m *mockStreamClient) Create(
 	_ context.Context, _ roachpb.TenantName,
 ) (streampb.ReplicationProducerSpec, error) {
+	panic("unimplemented")
+}
+
+// SetupSpanConfigsStream implements the Client interface.
+func (m *mockStreamClient) SetupSpanConfigsStream(
+	ctx context.Context, tenant roachpb.TenantName,
+) (streamclient.Subscription, error) {
 	panic("unimplemented")
 }
 
@@ -80,7 +90,10 @@ func (m *mockStreamClient) Dial(_ context.Context) error {
 func (m *mockStreamClient) Heartbeat(
 	_ context.Context, _ streampb.StreamID, _ hlc.Timestamp,
 ) (streampb.StreamReplicationStatus, error) {
-	panic("unimplemented")
+	if m.onHeartbeat != nil {
+		return m.onHeartbeat()
+	}
+	return m.heartbeatStatus, m.heartbeatErr
 }
 
 // Plan implements the Client interface.
@@ -531,10 +544,13 @@ func assertEqualKVs(
 	// Iterate over the store.
 	store, err := srv.GetStores().(*kvserver.Stores).GetStore(srv.GetFirstStoreID())
 	require.NoError(t, err)
-	it := store.TODOEngine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
+	it, err := store.TODOEngine().NewMVCCIterator(storage.MVCCKeyAndIntentsIterKind, storage.IterOptions{
 		LowerBound: targetSpan.Key,
 		UpperBound: targetSpan.EndKey,
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer it.Close()
 	var prevKey roachpb.Key
 	var valueTimestampTuples []roachpb.KeyValue

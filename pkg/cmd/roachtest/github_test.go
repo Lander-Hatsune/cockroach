@@ -111,9 +111,14 @@ func TestGenerateHelpCommand(t *testing.T) {
 	end := time.Date(2023, time.July, 21, 16, 42, 13, 137, time.UTC)
 
 	r := &issues.Renderer{}
-	generateHelpCommand("foo-cluster", start, end)(r)
+	generateHelpCommand("foo-cluster", spec.GCE, start, end)(r)
 
 	echotest.Require(t, r.String(), filepath.Join("testdata", "help_command.txt"))
+
+	r = &issues.Renderer{}
+	generateHelpCommand("foo-cluster", spec.AWS, start, end)(r)
+
+	echotest.Require(t, r.String(), filepath.Join("testdata", "help_command_non_gce.txt"))
 }
 
 func TestCreatePostRequest(t *testing.T) {
@@ -122,17 +127,18 @@ func TestCreatePostRequest(t *testing.T) {
 	}
 
 	testCases := []struct {
-		nonReleaseBlocker      bool
-		clusterCreationFailed  bool
-		loadTeamsFailed        bool
-		localSSD               bool
-		arch                   vm.CPUArch
-		failure                failure
-		expectedPost           bool
-		expectedReleaseBlocker bool
-		expectedParams         map[string]string
+		nonReleaseBlocker       bool
+		clusterCreationFailed   bool
+		loadTeamsFailed         bool
+		localSSD                bool
+		arch                    vm.CPUArch
+		failure                 failure
+		expectedPost            bool
+		expectedReleaseBlocker  bool
+		expectedSkipTestFailure bool
+		expectedParams          map[string]string
 	}{
-		{true, false, false, false, "", createFailure(errors.New("other")), true, false,
+		{true, false, false, false, "", createFailure(errors.New("other")), true, false, false,
 			prefixAll(map[string]string{
 				"cloud":     "gce",
 				"encrypted": "false",
@@ -143,7 +149,7 @@ func TestCreatePostRequest(t *testing.T) {
 				"localSSD":  "false",
 			}),
 		},
-		{true, false, false, true, vm.ArchARM64, createFailure(errClusterProvisioningFailed), true, false,
+		{true, false, false, true, vm.ArchARM64, createFailure(errClusterProvisioningFailed), true, false, true,
 			prefixAll(map[string]string{
 				"cloud":     "gce",
 				"encrypted": "false",
@@ -158,7 +164,7 @@ func TestCreatePostRequest(t *testing.T) {
 		// !nonReleaseBlocker and issue is an SSH flake. Also ensure that
 		// in the event of a failed cluster creation, nil `vmOptions` and
 		// `clusterImpl` are not dereferenced
-		{false, true, false, false, "", createFailure(rperrors.ErrSSH255), true, false,
+		{false, true, false, false, "", createFailure(rperrors.ErrSSH255), true, false, true,
 			prefixAll(map[string]string{
 				"cloud": "gce",
 				"ssd":   "0",
@@ -166,9 +172,9 @@ func TestCreatePostRequest(t *testing.T) {
 			}),
 		},
 		//Simulate failure loading TEAMS.yaml
-		{true, false, true, false, "", createFailure(errors.New("other")), false, false, nil},
+		{true, false, true, false, "", createFailure(errors.New("other")), false, false, false, nil},
 		//Error during post test assertions
-		{true, false, false, false, "", createFailure(errDuringPostAssertions), false, false, nil},
+		{true, false, false, false, "", createFailure(errDuringPostAssertions), false, false, false, nil},
 	}
 
 	reg := makeTestRegistry(spec.GCE, "", "", false, false)
@@ -184,11 +190,13 @@ func TestCreatePostRequest(t *testing.T) {
 			}
 
 			ti := &testImpl{
-				spec: testSpec,
-				l:    nilLogger(),
+				spec:  testSpec,
+				l:     nilLogger(),
+				start: time.Date(2023, time.July, 21, 16, 34, 3, 817, time.UTC),
+				end:   time.Date(2023, time.July, 21, 16, 42, 13, 137, time.UTC),
 			}
 
-			testClusterImpl := &clusterImpl{spec: clusterSpec, arch: vm.ArchAMD64}
+			testClusterImpl := &clusterImpl{spec: clusterSpec, arch: vm.ArchAMD64, name: "foo"}
 			vo := vm.DefaultCreateOpts()
 			vmOpts := &vo
 
@@ -220,25 +228,32 @@ func TestCreatePostRequest(t *testing.T) {
 				req, err := github.createPostRequest("github_test", ti.start, ti.end, testSpec, c.failure, "message")
 				assert.NoError(t, err, "Expected no error in createPostRequest")
 
+				r := &issues.Renderer{}
+				req.HelpCommand(r)
+				file := fmt.Sprintf("help_command_createpost_%d.txt", idx+1)
+				echotest.Require(t, r.String(), filepath.Join("testdata", file))
+
 				if c.expectedParams != nil {
 					require.Equal(t, c.expectedParams, req.ExtraParams)
 				}
 
 				require.True(t, contains(req.ExtraLabels, nil, "O-roachtest"))
 				require.Equal(t, c.expectedReleaseBlocker, contains(req.ExtraLabels, nil, "release-blocker"))
+				require.Equal(t, c.expectedSkipTestFailure, req.SkipLabelTestFailure)
 
 				expectedTeam := "@cockroachdb/unowned"
 				expectedName := "github_test"
-				expectedLabel := ""
+				expectedLabels := []string{}
 				expectedMessagePrefix := ""
 
 				if errors.Is(c.failure.squashedErr, errClusterProvisioningFailed) {
-					expectedTeam = "@cockroachdb/dev-inf"
+					expectedTeam = "@cockroachdb/test-eng"
+					expectedLabels = []string{"T-testeng", "X-infra-flake"}
 					expectedName = "cluster_creation"
 					expectedMessagePrefix = "test github_test was skipped due to "
 				} else if errors.Is(c.failure.squashedErr, rperrors.ErrSSH255) {
 					expectedTeam = "@cockroachdb/test-eng"
-					expectedLabel = "T-testeng"
+					expectedLabels = []string{"T-testeng", "X-infra-flake"}
 					expectedName = "ssh_problem"
 					expectedMessagePrefix = "test github_test failed due to "
 				} else if errors.Is(c.failure.squashedErr, errDuringPostAssertions) {
@@ -248,11 +263,12 @@ func TestCreatePostRequest(t *testing.T) {
 				require.Contains(t, req.MentionOnCreate, expectedTeam)
 				require.Equal(t, expectedName, req.TestName)
 				require.True(t, strings.HasPrefix(req.Message, expectedMessagePrefix), req.Message)
-				if expectedLabel != "" {
-					require.Contains(t, req.ExtraLabels, expectedLabel)
+				if len(expectedLabels) > 0 {
+					for _, expectedLabel := range expectedLabels {
+						require.Contains(t, req.ExtraLabels, expectedLabel)
+					}
 				}
 			}
 		})
-
 	}
 }

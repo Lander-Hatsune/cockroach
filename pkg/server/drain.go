@@ -19,6 +19,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/serverctl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/srverrors"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -44,7 +45,7 @@ var (
 			"after changing this setting)",
 		10*time.Second,
 		settings.NonNegativeDurationWithMaximum(10*time.Hour),
-	).WithPublic()
+		settings.WithPublic)
 
 	drainWait = settings.RegisterDurationSetting(
 		settings.TenantWritable,
@@ -56,7 +57,7 @@ var (
 			"wait time for health probes to notice that the node is not ready.)",
 		0*time.Second,
 		settings.NonNegativeDurationWithMaximum(10*time.Hour),
-	).WithPublic()
+		settings.WithPublic)
 
 	connectionWait = settings.RegisterDurationSetting(
 		settings.TenantWritable,
@@ -67,7 +68,7 @@ var (
 			"after changing this setting)",
 		0*time.Second,
 		settings.NonNegativeDurationWithMaximum(10*time.Hour),
-	).WithPublic()
+		settings.WithPublic)
 
 	jobRegistryWait = settings.RegisterDurationSetting(
 		settings.TenantWritable,
@@ -76,7 +77,7 @@ var (
 			"to notice drain request and to perform orderly shutdown",
 		10*time.Second,
 		settings.NonNegativeDurationWithMaximum(10*time.Minute),
-	).WithPublic()
+		settings.WithPublic)
 )
 
 // Drain puts the node into the specified drain mode(s) and optionally
@@ -197,7 +198,7 @@ func (s *drainServer) maybeShutdownAfterDrain(
 		// away (and who knows whether gRPC-goroutines are tied up in some
 		// stopper task somewhere).
 		s.grpc.Stop()
-		s.stopTrigger.signalStop(ctx, MakeShutdownRequest(ShutdownReasonDrainRPC, nil /* err */))
+		s.stopTrigger.signalStop(ctx, serverctl.MakeShutdownRequest(serverctl.ShutdownReasonDrainRPC, nil /* err */))
 	}()
 
 	select {
@@ -446,10 +447,6 @@ func (s *drainServer) drainClients(
 	// tasks that may issue SQL statements have shut down.
 	s.sqlServer.leaseMgr.SetDraining(ctx, true /* drain */, reporter)
 
-	// Mark this phase in the logs to clarify the context of any subsequent
-	// errors/warnings, if any.
-	log.Infof(ctx, "SQL server drained successfully; SQL queries cannot execute any more")
-
 	session, err := s.sqlServer.sqlLivenessProvider.Release(ctx)
 	if err != nil {
 		return err
@@ -463,8 +460,9 @@ func (s *drainServer) drainClients(
 
 	// Mark the node as fully drained.
 	s.sqlServer.gracefulDrainComplete.Set(true)
-
-	// Done. This executes the defers set above to drain SQL leases.
+	// Mark this phase in the logs to clarify the context of any subsequent
+	// errors/warnings, if any.
+	log.Infof(ctx, "SQL server drained successfully; SQL queries cannot execute any more")
 	return nil
 }
 

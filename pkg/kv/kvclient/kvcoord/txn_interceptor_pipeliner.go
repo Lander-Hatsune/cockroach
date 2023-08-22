@@ -31,12 +31,13 @@ import (
 // The degree of the inFlightWrites btree.
 const txnPipelinerBtreeDegree = 32
 
-// PipelinedWritesEnabled is the kv.transaction.write_pipelining_enabled cluster setting.
+// PipelinedWritesEnabled is the kv.transaction.write_pipelining.enabled cluster setting.
 var PipelinedWritesEnabled = settings.RegisterBoolSetting(
 	settings.TenantWritable,
 	"kv.transaction.write_pipelining_enabled",
 	"if enabled, transactional writes are pipelined through Raft consensus",
 	true,
+	settings.WithName("kv.transaction.write_pipelining.enabled"),
 )
 var pipelinedWritesMaxBatchSize = settings.RegisterIntSetting(
 	settings.TenantWritable,
@@ -52,6 +53,7 @@ var pipelinedWritesMaxBatchSize = settings.RegisterIntSetting(
 	// hit the 1PC fast-path or should have batches which exceed this limit.
 	128,
 	settings.NonNegativeInt,
+	settings.WithName("kv.transaction.write_pipelining.max_batch_size"),
 )
 
 // TrackedWritesMaxSize is a byte threshold for the tracking of writes performed
@@ -82,7 +84,7 @@ var TrackedWritesMaxSize = settings.RegisterIntSetting(
 	"kv.transaction.max_intents_bytes",
 	"maximum number of bytes used to track locks in transactions",
 	1<<22, /* 4 MB */
-).WithPublic()
+	settings.WithPublic)
 
 // rejectTxnOverTrackedWritesBudget dictates what happens when a txn exceeds
 // kv.transaction.max_intents_bytes.
@@ -92,7 +94,7 @@ var rejectTxnOverTrackedWritesBudget = settings.RegisterBoolSetting(
 	"if set, transactions that exceed their lock tracking budget (kv.transaction.max_intents_bytes) "+
 		"are rejected instead of having their lock spans imprecisely compressed",
 	false,
-).WithPublic()
+	settings.WithPublic)
 
 // txnPipeliner is a txnInterceptor that pipelines transactional writes by using
 // asynchronous consensus. The interceptor then tracks all writes that have been
@@ -656,8 +658,8 @@ func (tp *txnPipeliner) updateLockTrackingInner(
 		// locks, we ignore that request for the purposes of accounting for lock
 		// spans. This is important for transactions that only perform a single
 		// request and hit an unambiguous error like a ConditionFailedError, as it
-		// can allow them to avoid sending a rollback. It it also important for
-		// transactions that throw a WriteIntentError due to heavy contention on a
+		// can allow them to avoid sending a rollback. It is also important for
+		// transactions that throw a LockConflictError due to heavy contention on a
 		// certain key after either passing a Error wait policy or hitting a lock
 		// timeout / queue depth limit. In such cases, this optimization prevents
 		// these transactions from adding even more load to the contended key by
@@ -701,11 +703,18 @@ func (tp *txnPipeliner) updateLockTrackingInner(
 		resp := br.Responses[i].GetInner()
 
 		if qiReq, ok := req.(*kvpb.QueryIntentRequest); ok {
-			// Remove any in-flight writes that were proven to exist.
-			// It shouldn't be possible for a QueryIntentRequest with
-			// the ErrorIfMissing option set to return without error
-			// and with FoundIntent=false, but we handle that case here
-			// because it happens a lot in tests.
+			// Remove any in-flight writes that were proven to exist. It should not be
+			// possible for a QueryIntentRequest with the ErrorIfMissing option set to
+			// return without error and with FoundIntent=false if the request was
+			// evaluated on the server.
+			//
+			// However, it is possible that the batch was split on a range boundary
+			// and hit a batch-wide key or byte limit before a portion was even sent
+			// by the DistSender. In such cases, an empty response will be returned
+			// for the requests that were not evaluated (see fillSkippedResponses).
+			// For these requests, we neither proved nor disproved the existence of
+			// their intent, so we ignore the response.
+			//
 			// TODO(nvanbenschoten): we only need to check FoundIntent, but this field
 			// was not set before v23.2, so for now, we check both fields. Remove this
 			// in the future.
@@ -714,9 +723,6 @@ func (tp *txnPipeliner) updateLockTrackingInner(
 				tp.ifWrites.remove(qiReq.Key, qiReq.Txn.Sequence)
 				// Move to lock footprint.
 				tp.lockFootprint.insert(roachpb.Span{Key: qiReq.Key})
-			} else {
-				log.Warningf(ctx,
-					"QueryIntent(ErrorIfMissing=true) found no intent, but did not error; resp=%+v", qiResp)
 			}
 		} else if kvpb.IsLocking(req) {
 			// If the request intended to acquire locks, track its lock spans.

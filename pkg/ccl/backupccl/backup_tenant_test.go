@@ -19,7 +19,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	_ "github.com/cockroachdb/cockroach/pkg/sql/importer"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
@@ -87,7 +86,7 @@ func TestBackupTenantImportingTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := tc.Server(0).(*server.TestServer).WaitForTenantReadiness(ctx, tenantID); err != nil {
+	if err := tc.Server(0).TenantController().WaitForTenantReadiness(ctx, tenantID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -127,7 +126,7 @@ func TestBackupTenantImportingTable(t *testing.T) {
 
 // TestTenantBackupMultiRegionDatabases ensures secondary tenants restoring
 // MR databases respect the
-// sql.multi_region.allow_abstractions_for_secondary_tenants.enabled cluster
+// sql.virtual_cluster.feature_access.multiregion.enabled cluster
 // setting.
 func TestTenantBackupMultiRegionDatabases(t *testing.T) {
 	defer leaktest.AfterTest(t)()

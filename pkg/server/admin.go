@@ -67,6 +67,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/mon"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/quotapool"
+	"github.com/cockroachdb/cockroach/pkg/util/rangedesc"
 	"github.com/cockroachdb/cockroach/pkg/util/safesql"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -77,6 +78,7 @@ import (
 	"github.com/cockroachdb/errors"
 	gwruntime "github.com/grpc-ecosystem/grpc-gateway/runtime"
 	gwutil "github.com/grpc-ecosystem/grpc-gateway/utilities"
+	"golang.org/x/exp/slices"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	grpcstatus "google.golang.org/grpc/status"
@@ -130,7 +132,7 @@ type systemAdminServer struct {
 	*adminServer
 
 	nodeLiveness *liveness.NodeLiveness
-	server       *Server
+	server       *topLevelServer
 }
 
 // noteworthyAdminMemoryUsageBytes is the minimum size tracked by the
@@ -161,7 +163,7 @@ func newSystemAdminServer(
 	distSender *kvcoord.DistSender,
 	grpc *grpcServer,
 	drainServer *drainServer,
-	s *Server,
+	s *topLevelServer,
 ) *systemAdminServer {
 	adminServer := newAdminServer(
 		sqlServer,
@@ -1328,16 +1330,9 @@ func (s *adminServer) statsForSpan(
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	rSpan, err := keys.SpanAddr(span)
-	if err != nil {
-		return nil, err
-	}
-
 	// Get a list of nodeIDs, range counts, and replica counts per node
 	// for the specified span.
-	nodeIDs, rangeCount, replCounts, err := getNodeIDsRangeCountReplCountForSpan(
-		ctx, s.distSender, rSpan,
-	)
+	nodeIDs, rangeCount, replCounts, err := s.getSpanDetails(ctx, span)
 	if err != nil {
 		return nil, err
 	}
@@ -1450,25 +1445,29 @@ func (s *adminServer) statsForSpan(
 
 // Returns the list of node ids, range count,
 // and replica count for the specified span.
-func getNodeIDsRangeCountReplCountForSpan(
-	ctx context.Context, ds *kvcoord.DistSender, rSpan roachpb.RSpan,
+func (s *adminServer) getSpanDetails(
+	ctx context.Context, span roachpb.Span,
 ) (nodeIDList []roachpb.NodeID, rangeCount int64, replCounts map[roachpb.NodeID]int64, _ error) {
 	nodeIDs := make(map[roachpb.NodeID]struct{})
 	replCountForNodeID := make(map[roachpb.NodeID]int64)
-	ri := kvcoord.MakeRangeIterator(ds)
-	ri.Seek(ctx, rSpan.Key, kvcoord.Ascending)
-	for ; ri.Valid(); ri.Next(ctx) {
+	var it rangedesc.Iterator
+	var err error
+	if s.sqlServer.tenantConnect == nil {
+		it, err = s.sqlServer.execCfg.RangeDescIteratorFactory.NewIterator(ctx, span)
+	} else {
+		it, err = s.sqlServer.tenantConnect.NewIterator(ctx, span)
+	}
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	var rangeDesc roachpb.RangeDescriptor
+	for ; it.Valid(); it.Next() {
 		rangeCount++
-		for _, repl := range ri.Desc().Replicas().Descriptors() {
+		rangeDesc = it.CurRangeDescriptor()
+		for _, repl := range rangeDesc.Replicas().Descriptors() {
 			replCountForNodeID[repl.NodeID]++
 			nodeIDs[repl.NodeID] = struct{}{}
 		}
-		if !ri.NeedAnother(rSpan) {
-			break
-		}
-	}
-	if err := ri.Error(); err != nil {
-		return nil, 0, nil, err
 	}
 
 	nodeIDList = make([]roachpb.NodeID, 0, len(nodeIDs))
@@ -1986,17 +1985,15 @@ func (s *adminServer) Settings(
 ) (*serverpb.SettingsResponse, error) {
 	ctx = s.AnnotateCtx(ctx)
 
-	keys := req.Keys
-	if len(keys) == 0 {
-		keys = settings.Keys(settings.ForSystemTenant)
-	}
-
 	_, isAdmin, err := s.privilegeChecker.GetUserAndRole(ctx)
 	if err != nil {
 		return nil, srverrors.ServerError(ctx, err)
 	}
 
 	redactValues := true
+	// Only returns non-sensitive settings that are required
+	// for features on DB Console.
+	consoleSettingsOnly := false
 	if isAdmin {
 		// Root accesses can customize the purpose.
 		// This is used by the UI to see all values (local access)
@@ -2005,16 +2002,53 @@ func (s *adminServer) Settings(
 			redactValues = false
 		}
 	} else {
-		// Non-root access cannot see the values in any case.
+		// Non-root access cannot see the values.
+		// Exception: users with VIEWACTIVITY and VIEWACTIVITYREDACTED can see cluster
+		// settings used by the UI Console.
 		if err := s.privilegeChecker.RequireViewClusterSettingOrModifyClusterSettingPermission(ctx); err != nil {
-			return nil, err
+			if err2 := s.privilegeChecker.RequireViewActivityOrViewActivityRedactedPermission(ctx); err2 != nil {
+				// The check for VIEWACTIVITY or VIEWATIVITYREDACTED is a special case so cluster settings from
+				// the console can be returned, but if the user doesn't have them (i.e. err2 != nil), we don't want
+				// to share this error message, so only return `err`.
+				return nil, err
+			}
+			consoleSettingsOnly = true
+		}
+	}
+
+	// settingsKeys is the list of setting keys to retrieve.
+	settingsKeys := make([]settings.InternalKey, 0, len(req.Keys))
+	for _, desiredSetting := range req.Keys {
+		// The API client can pass either names or internal keys through the API.
+		key, ok, _ := settings.NameToKey(settings.SettingName(desiredSetting))
+		if ok {
+			settingsKeys = append(settingsKeys, key)
+		} else {
+			settingsKeys = append(settingsKeys, settings.InternalKey(desiredSetting))
+		}
+	}
+	if !consoleSettingsOnly {
+		if len(settingsKeys) == 0 {
+			settingsKeys = settings.Keys(settings.ForSystemTenant)
+		}
+	} else {
+		if len(settingsKeys) == 0 {
+			settingsKeys = settings.ConsoleKeys()
+		} else {
+			newSettingsKeys := make([]settings.InternalKey, 0, len(settings.ConsoleKeys()))
+			for _, k := range settingsKeys {
+				if slices.Contains(settings.ConsoleKeys(), k) {
+					newSettingsKeys = append(newSettingsKeys, k)
+				}
+			}
+			settingsKeys = newSettingsKeys
 		}
 	}
 
 	// Read the system.settings table to determine the settings for which we have
 	// explicitly set values -- the in-memory SV has the set and default values
 	// flattened for quick reads, but we'd only need the non-defaults for comparison.
-	alteredSettings := make(map[string]*time.Time)
+	alteredSettings := make(map[settings.InternalKey]*time.Time)
 	if it, err := s.internalExecutor.QueryIteratorEx(
 		ctx, "read-setting", nil, /* txn */
 		sessiondata.RootUserSessionDataOverride,
@@ -2025,9 +2059,9 @@ func (s *adminServer) Settings(
 		var ok bool
 		for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
 			row := it.Cur()
-			name := string(tree.MustBeDString(row[0]))
+			key := settings.InternalKey(tree.MustBeDString(row[0]))
 			lastUpdated := row[1].(*tree.DTimestamp)
-			alteredSettings[name] = &lastUpdated.Time
+			alteredSettings[key] = &lastUpdated.Time
 		}
 		if err != nil {
 			// No need to clear AlteredSettings map since we only make best
@@ -2037,13 +2071,13 @@ func (s *adminServer) Settings(
 	}
 
 	resp := serverpb.SettingsResponse{KeyValues: make(map[string]serverpb.SettingsResponse_Value)}
-	for _, k := range keys {
+	for _, k := range settingsKeys {
 		var v settings.Setting
 		var ok bool
 		if redactValues {
-			v, ok = settings.LookupForReporting(k, settings.ForSystemTenant)
+			v, ok = settings.LookupForReportingByKey(k, settings.ForSystemTenant)
 		} else {
-			v, ok = settings.LookupForLocalAccess(k, settings.ForSystemTenant)
+			v, ok = settings.LookupForLocalAccessByKey(k, settings.ForSystemTenant)
 		}
 		if !ok {
 			continue
@@ -2052,8 +2086,9 @@ func (s *adminServer) Settings(
 		if val, ok := alteredSettings[k]; ok {
 			altered = val
 		}
-		resp.KeyValues[k] = serverpb.SettingsResponse_Value{
+		resp.KeyValues[string(k)] = serverpb.SettingsResponse_Value{
 			Type: v.Typ(),
+			Name: string(v.Name()),
 			// Note: v.String() redacts the values if the purpose is not "LocalAccess".
 			Value:       v.String(&s.st.SV),
 			Description: v.Description(),
@@ -2089,7 +2124,7 @@ func (s *adminServer) Cluster(
 	}, nil
 }
 
-// Health returns whether this sql tenant is ready to receive
+// Health returns whether this tenant server is ready to receive
 // traffic.
 //
 // See the docstring for HealthRequest for more details about
@@ -2109,11 +2144,24 @@ func (s *adminServer) Health(
 		return resp, nil
 	}
 
-	if !s.sqlServer.isReady.Get() {
-		return nil, grpcstatus.Errorf(codes.Unavailable, "node is not accepting SQL clients")
+	if err := s.checkReadinessForHealthCheck(ctx); err != nil {
+		return nil, err
 	}
 
 	return resp, nil
+}
+
+// checkReadinessForHealthCheck returns a gRPC error.
+func (s *adminServer) checkReadinessForHealthCheck(ctx context.Context) error {
+	if err := s.grpc.health(ctx); err != nil {
+		return err
+	}
+
+	if !s.sqlServer.isReady.Get() {
+		return grpcstatus.Errorf(codes.Unavailable, "node is not accepting SQL clients")
+	}
+
+	return nil
 }
 
 // Health returns liveness for the node target of the request.
@@ -2143,18 +2191,8 @@ func (s *systemAdminServer) Health(
 
 // checkReadinessForHealthCheck returns a gRPC error.
 func (s *systemAdminServer) checkReadinessForHealthCheck(ctx context.Context) error {
-	serveMode := s.grpc.mode.get()
-	switch serveMode {
-	case modeInitializing:
-		return grpcstatus.Error(codes.Unavailable, "node is waiting for cluster initialization")
-	case modeDraining:
-		// grpc.mode is set to modeDraining when the Drain(DrainMode_CLIENT) has
-		// been called (client connections are to be drained).
-		return grpcstatus.Errorf(codes.Unavailable, "node is shutting down")
-	case modeOperational:
-		break
-	default:
-		return srverrors.ServerError(ctx, errors.Newf("unknown mode: %v", serveMode))
+	if err := s.grpc.health(ctx); err != nil {
+		return err
 	}
 
 	status := s.nodeLiveness.GetNodeVitalityFromCache(roachpb.NodeID(s.serverIterator.getID()))
@@ -3198,6 +3236,7 @@ func (s *systemAdminServer) EnqueueRange(
 	if err := timeutil.RunWithTimeout(ctx, "enqueue range", time.Minute, func(ctx context.Context) error {
 		return s.server.status.iterateNodes(
 			ctx, fmt.Sprintf("enqueue r%d in queue %s", req.RangeID, req.Queue),
+			noTimeout,
 			dialFn, nodeFn, responseFn, errorFn,
 		)
 	}); err != nil {
@@ -3521,24 +3560,30 @@ func (rs resultScanner) ScanIndex(row tree.Datums, index int, dst interface{}) e
 		}
 
 	case *time.Time:
-		s, ok := src.(*tree.DTimestamp)
-		if !ok {
+		switch s := src.(type) {
+		case *tree.DTimestamp:
+			*d = s.Time
+		case *tree.DTimestampTZ:
+			*d = s.Time
+		default:
 			return errors.Errorf("source type assertion failed")
 		}
-		*d = s.Time
 
 	// Passing a **time.Time instead of a *time.Time means the source is allowed
 	// to be NULL, in which case nil is stored into *src.
 	case **time.Time:
-		s, ok := src.(*tree.DTimestamp)
-		if !ok {
-			if src != tree.DNull {
+		switch s := src.(type) {
+		case *tree.DTimestamp:
+			*d = &s.Time
+		case *tree.DTimestampTZ:
+			*d = &s.Time
+		default:
+			if src == tree.DNull {
+				*d = nil
+			} else {
 				return errors.Errorf("source type assertion failed")
 			}
-			*d = nil
-			break
 		}
-		*d = &s.Time
 
 	case *[]byte:
 		s, ok := src.(*tree.DBytes)

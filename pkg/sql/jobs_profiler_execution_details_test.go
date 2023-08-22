@@ -33,7 +33,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/physicalplan"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/jobutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -119,7 +118,7 @@ func TestJobsExecutionDetails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute*2)
 	defer cancel()
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 	defer jobs.ResetConstructors()()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -163,7 +162,7 @@ func TestReadWriteProfilerExecutionDetails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute*2)
 	defer cancel()
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 	defer jobs.ResetConstructors()()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -312,7 +311,7 @@ func TestListProfilerExecutionDetails(t *testing.T) {
 	ctx, cancel := context.WithTimeout(ctx, time.Minute*2)
 	defer cancel()
 
-	params, _ := tests.CreateTestServerParams()
+	params, _ := createTestServerParams()
 	params.Knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
 	defer jobs.ResetConstructors()()
 	s, sqlDB, _ := serverutils.StartServer(t, params)
@@ -350,10 +349,10 @@ func TestListProfilerExecutionDetails(t *testing.T) {
 		runner.Exec(t, `SELECT crdb_internal.request_job_execution_details($1)`, importJobID)
 		files := listExecutionDetails(t, s, jobspb.JobID(importJobID))
 		require.Len(t, files, 5)
-		require.Regexp(t, "distsql\\..*\\.html", files[0])
-		require.Regexp(t, "goroutines\\..*\\.txt", files[1])
-		require.Regexp(t, "resumer-trace-n[0-9].*\\.binpb", files[2])
-		require.Regexp(t, "resumer-trace-n[0-9].*\\.binpb\\.txt", files[3])
+		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb", files[0])
+		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb", files[1])
+		require.Regexp(t, "distsql\\..*\\.html", files[2])
+		require.Regexp(t, "goroutines\\..*\\.txt", files[3])
 		require.Regexp(t, "trace\\..*\\.zip", files[4])
 
 		// Resume the job, so it can write another DistSQL diagram and goroutine
@@ -365,14 +364,14 @@ func TestListProfilerExecutionDetails(t *testing.T) {
 		runner.Exec(t, `SELECT crdb_internal.request_job_execution_details($1)`, importJobID)
 		files = listExecutionDetails(t, s, jobspb.JobID(importJobID))
 		require.Len(t, files, 10)
-		require.Regexp(t, "distsql\\..*\\.html", files[0])
-		require.Regexp(t, "distsql\\..*\\.html", files[1])
-		require.Regexp(t, "goroutines\\..*\\.txt", files[2])
-		require.Regexp(t, "goroutines\\..*\\.txt", files[3])
-		require.Regexp(t, "resumer-trace-n[0-9].*\\.binpb", files[4])
-		require.Regexp(t, "resumer-trace-n[0-9].*\\.binpb\\.txt", files[5])
-		require.Regexp(t, "resumer-trace-n[0-9].*\\.binpb", files[6])
-		require.Regexp(t, "resumer-trace-n[0-9].*\\.binpb\\.txt", files[7])
+		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb", files[0])
+		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb.txt", files[1])
+		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb", files[2])
+		require.Regexp(t, "[0-9]/resumer-trace/.*~cockroach\\.sql\\.jobs\\.jobspb\\.TraceData\\.binpb.txt", files[3])
+		require.Regexp(t, "distsql\\..*\\.html", files[4])
+		require.Regexp(t, "distsql\\..*\\.html", files[5])
+		require.Regexp(t, "goroutines\\..*\\.txt", files[6])
+		require.Regexp(t, "goroutines\\..*\\.txt", files[7])
 		require.Regexp(t, "trace\\..*\\.zip", files[8])
 		require.Regexp(t, "trace\\..*\\.zip", files[9])
 	})
@@ -414,7 +413,7 @@ func checkExecutionDetails(
 	client, err := s.GetAdminHTTPClient()
 	require.NoError(t, err)
 
-	url := s.AdminURL().String() + fmt.Sprintf("/_status/job_profiler_execution_details/%d/%s", jobID, filename)
+	url := s.AdminURL().String() + fmt.Sprintf("/_status/job_profiler_execution_details/%d?%s", jobID, filename)
 	req, err := http.NewRequest("GET", url, nil)
 	require.NoError(t, err)
 

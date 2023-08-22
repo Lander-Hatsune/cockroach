@@ -27,9 +27,11 @@ import (
 )
 
 func init() {
-	// Add all replicationBuiltins to the builtins map after a sanity check.
 	for k, v := range replicationBuiltins {
-		registerBuiltin(k, v)
+		// Most builtins in this file are of the Normal class, but there are a
+		// couple of the Generator class.
+		const enforceClass = false
+		registerBuiltin(k, v, tree.NormalClass, enforceClass)
 	}
 }
 
@@ -293,5 +295,31 @@ var replicationBuiltins = map[string]builtinDefinition{
 				"'successful_ingestion' indicates whether the stream ingestion finished successfully.",
 			Volatility: volatility.Volatile,
 		},
+	),
+	"crdb_internal.setup_span_configs_stream": makeBuiltin(
+		tree.FunctionProperties{
+			Category:           builtinconstants.CategoryStreamIngestion,
+			Undocumented:       true,
+			DistsqlBlocklist:   false,
+			VectorizeStreaming: true,
+		},
+		makeGeneratorOverload(
+			tree.ParamTypes{
+				{Name: "tenant_name", Typ: types.String},
+			},
+			types.MakeLabeledTuple(
+				[]*types.T{types.Bytes},
+				[]string{"stream_event"},
+			),
+			func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (eval.ValueGenerator, error) {
+				mgr, err := evalCtx.StreamManagerFactory.GetReplicationStreamManager(ctx)
+				if err != nil {
+					return nil, err
+				}
+				return mgr.SetupSpanConfigsStream(ctx, roachpb.TenantName(tree.MustBeDString(args[0])))
+			},
+			"Stream span config updates for specified tenant",
+			volatility.Volatile,
+		),
 	),
 }

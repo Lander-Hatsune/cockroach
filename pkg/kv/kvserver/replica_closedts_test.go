@@ -606,7 +606,7 @@ func TestRejectedLeaseDoesntDictateClosedTimestamp(t *testing.T) {
 	manual.Increment(remainingNanos - pause1 + 1)
 	leaseAcqErrCh := make(chan error)
 	go func() {
-		r, _, err := n2.Stores().GetReplicaForRangeID(ctx, desc.RangeID)
+		r, _, err := n2.GetStores().(*kvserver.Stores).GetReplicaForRangeID(ctx, desc.RangeID)
 		if err != nil {
 			leaseAcqErrCh <- err
 			return
@@ -772,7 +772,7 @@ func TestNonBlockingReadsAtResolvedTimestamp(t *testing.T) {
 
 			// Issue a transactional scan over the keys at the resolved timestamp on
 			// the same store. Use an error wait policy so that we'll hear an error
-			// (WriteIntentError) under conditions that would otherwise cause us to
+			// (LockConflictError) under conditions that would otherwise cause us to
 			// block on an intent. Send to a specific store instead of through a
 			// DistSender so that we'll hear an error (NotLeaseholderError) if the
 			// request would otherwise be redirected to the leaseholder.
@@ -814,7 +814,7 @@ func TestNonBlockingReadsWithServerSideBoundedStalenessNegotiation(t *testing.T)
 		return func(ctx context.Context) error {
 			// Issue a bounded-staleness read (a read with a MinTimestampBound)
 			// over the keys. Use an error wait policy so that we'll hear an error
-			// (WriteIntentError) under conditions that would otherwise cause us
+			// (LockConflictError) under conditions that would otherwise cause us
 			// to block on an intent. Send to a specific store instead of through
 			// a DistSender so that we'll hear an error (NotLeaseholderError) if
 			// the request would otherwise be redirected to the leaseholder.
@@ -920,7 +920,7 @@ func testNonBlockingReadsWithReaderFn(
 
 	// Reader goroutines: run one reader per store.
 	for _, s := range tc.Servers {
-		store, err := s.Stores().GetStore(s.GetFirstStoreID())
+		store, err := s.GetStores().(*kvserver.Stores).GetStore(s.GetFirstStoreID())
 		require.NoError(t, err)
 		g.Go(func() error {
 			readerFn := readerFnFactory(store, scratchRange.RangeID, keySpan)

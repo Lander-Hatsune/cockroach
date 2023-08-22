@@ -27,7 +27,6 @@ import (
 	"math/bits"
 	"math/rand"
 	"net"
-	"regexp"
 	"regexp/syntax"
 	"strconv"
 	"strings"
@@ -77,6 +76,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
@@ -197,7 +197,8 @@ func mustBeDIntInTenantRange(e tree.Expr) (tree.DInt, error) {
 
 func init() {
 	for k, v := range regularBuiltins {
-		registerBuiltin(k, v)
+		const enforceClass = true
+		registerBuiltin(k, v, tree.NormalClass, enforceClass)
 	}
 }
 
@@ -2105,9 +2106,9 @@ var regularBuiltins = map[string]builtinDefinition{
 				return tree.NewDInt(v), nil
 			},
 			Info: "Returns a unique ID. The value is a combination of the " +
-				"insert timestamp and the ID of the node executing the statement, which " +
-				"guarantees this combination is globally unique. The way it is generated " +
-				"there is no ordering",
+				"insert timestamp (bit-reversed) and the ID of the node executing the statement, which " +
+				"guarantees this combination is globally unique. The way it is generated is statistically " +
+				"likely to not have any ordering relative to previously generated values.",
 			Volatility: volatility.Volatile,
 		},
 	),
@@ -3993,6 +3994,41 @@ value if you rely on the HLC for accuracy.`,
 		},
 	),
 
+	"oidvectortypes": makeBuiltin(
+		tree.FunctionProperties{
+			Category: builtinconstants.CategoryCompatibility,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "vector", Typ: types.OidVector},
+			},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				var err error
+				oidVector := args[0].(*tree.DArray)
+				result := strings.Builder{}
+				for idx, datum := range oidVector.Array {
+					oidDatum := datum.(*tree.DOid)
+					var typ *types.T
+					if resolvedTyp, ok := types.OidToType[oidDatum.Oid]; ok {
+						typ = resolvedTyp
+					} else {
+						typ, err = evalCtx.Planner.ResolveTypeByOID(ctx, oidDatum.Oid)
+						if err != nil {
+							return nil, err
+						}
+					}
+					result.WriteString(typ.Name())
+					if idx != len(oidVector.Array)-1 {
+						result.WriteString(", ")
+					}
+				}
+				return tree.NewDString(result.String()), nil
+			},
+			Info:       "Generates a comma seperated string of type names from an oidvector.",
+			Volatility: volatility.Stable,
+		}),
+
 	"crdb_internal.pb_to_json": makeBuiltin(
 		jsonProps(),
 		func() []tree.Overload {
@@ -4792,8 +4828,8 @@ value if you rely on the HLC for accuracy.`,
 				if !ok {
 					return nil, errors.AssertionFailedf("expected string value, got %T", args[0])
 				}
-				name := strings.ToLower(string(s))
-				setting, ok := settings.LookupForLocalAccess(name, evalCtx.Codec.ForSystemTenant())
+				name := settings.SettingName(strings.ToLower(string(s)))
+				setting, ok, _ := settings.LookupForLocalAccess(name, evalCtx.Codec.ForSystemTenant())
 				if !ok {
 					return nil, errors.Newf("unknown cluster setting '%s'", name)
 				}
@@ -4822,8 +4858,8 @@ value if you rely on the HLC for accuracy.`,
 				if !ok {
 					return nil, errors.AssertionFailedf("expected string value, got %T", args[1])
 				}
-				name := strings.ToLower(string(s))
-				setting, ok := settings.LookupForLocalAccess(name, evalCtx.Codec.ForSystemTenant())
+				name := settings.SettingName(strings.ToLower(string(s)))
+				setting, ok, _ := settings.LookupForLocalAccess(name, evalCtx.Codec.ForSystemTenant())
 				if !ok {
 					return nil, errors.Newf("unknown cluster setting '%s'", name)
 				}
@@ -5520,7 +5556,7 @@ SELECT
 				minDuration := args[0].(*tree.DInterval).Duration
 				elapsed := duration.MakeDuration(int64(evalCtx.StmtTimestamp.Sub(evalCtx.TxnTimestamp)), 0, 0)
 				if elapsed.Compare(minDuration) < 0 {
-					return nil, evalCtx.Txn.GenerateForcedRetryableError(
+					return nil, evalCtx.Txn.GenerateForcedRetryableErr(
 						ctx, "forced by crdb_internal.force_retry()")
 				}
 				return tree.DZero, nil
@@ -5728,6 +5764,38 @@ SELECT
 			Volatility: volatility.Immutable,
 		},
 	),
+	// Return if a key belongs to a system table, which should make it to print
+	// within redacted output.
+	"crdb_internal.is_system_table_key": makeBuiltin(
+		tree.FunctionProperties{
+			Category:     builtinconstants.CategorySystemInfo,
+			Undocumented: true,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "raw_key", Typ: types.Bytes},
+			},
+			ReturnType: tree.FixedReturnType(types.Bool),
+			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+				_, tableID, err := evalCtx.Codec.DecodeTablePrefix(roachpb.Key(tree.MustBeDBytes(args[0])))
+				if err != nil {
+					// If a key isn't prefixed with a table ID ignore.
+					//nolint:returnerrcheck
+					return tree.DBoolFalse, nil
+				}
+				isSystemTable, err := evalCtx.PrivilegedAccessor.IsSystemTable(ctx, int64(tableID))
+				if err != nil {
+					// If we can't find the descriptor or its not the right type then its
+					// not a system table.
+					//nolint:returnerrcheck
+					return tree.DBoolFalse, nil
+				}
+				return tree.MakeDBool(tree.DBool(isSystemTable)), nil
+			},
+			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
+			Volatility: volatility.Stable,
+		},
+	),
 
 	// Return a pretty string for a given span, skipping the specified number of
 	// fields.
@@ -5764,9 +5832,10 @@ SELECT
 				tree.ParamType{Name: "raw_value", Typ: types.Bytes},
 			},
 			ReturnType: tree.FixedReturnType(types.String),
-			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (tree.Datum, error) {
+			Fn: func(_ context.Context, _ *eval.Context, args tree.Datums) (d tree.Datum, err error) {
 				var v roachpb.Value
 				v.RawBytes = []byte(tree.MustBeDBytes(args[0]))
+
 				return tree.NewDString(v.PrettyPrint()), nil
 			},
 			Info:       "This function is used only by CockroachDB's developers for testing purposes.",
@@ -7743,65 +7812,9 @@ specified store on the node it's run from. One of 'mvccGC', 'merge', 'split',
 			Category:         builtinconstants.CategorySystemInfo,
 			DistsqlBlocklist: true, // applicable only on the gateway
 		},
-		tree.Overload{
-			Types: tree.ParamTypes{
-				{Name: "stmtFingerprint", Typ: types.String},
-				{Name: "samplingProbability", Typ: types.Float},
-				{Name: "minExecutionLatency", Typ: types.Interval},
-				{Name: "expiresAfter", Typ: types.Interval},
-			},
-			ReturnType: tree.FixedReturnType(types.Bool),
-			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
-				hasViewActivity, err := evalCtx.SessionAccessor.HasRoleOption(
-					ctx, roleoption.VIEWACTIVITY)
-				if err != nil {
-					return nil, err
-				}
-
-				if !hasViewActivity {
-					return nil, errors.New("requesting statement bundle requires " +
-						"VIEWACTIVITY or ADMIN role option")
-				}
-
-				isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
-				if err != nil {
-					return nil, err
-				}
-
-				hasViewActivityRedacted, err := evalCtx.SessionAccessor.HasRoleOption(
-					ctx, roleoption.VIEWACTIVITYREDACTED)
-				if err != nil {
-					return nil, err
-				}
-
-				if !isAdmin && hasViewActivityRedacted {
-					return nil, errors.New("VIEWACTIVITYREDACTED role option cannot request " +
-						"statement bundle")
-				}
-
-				stmtFingerprint := string(tree.MustBeDString(args[0]))
-				samplingProbability := float64(tree.MustBeDFloat(args[1]))
-				minExecutionLatency := time.Duration(tree.MustBeDInterval(args[2]).Nanos())
-				expiresAfter := time.Duration(tree.MustBeDInterval(args[3]).Nanos())
-
-				if err := evalCtx.StmtDiagnosticsRequestInserter(
-					ctx,
-					stmtFingerprint,
-					samplingProbability,
-					minExecutionLatency,
-					expiresAfter,
-				); err != nil {
-					return nil, err
-				}
-
-				return tree.DBoolTrue, nil
-			},
-			Volatility: volatility.Volatile,
-			Info: `Used to request statement bundle for a given statement fingerprint
-that has execution latency greater than the 'minExecutionLatency'. If the
-'expiresAfter' argument is empty, then the statement bundle request never
-expires until the statement bundle is collected`,
-		},
+		makeRequestStatementBundleBuiltinOverload(false /* withPlanGist */, false /* withAntiPlanGist */),
+		makeRequestStatementBundleBuiltinOverload(true /* withPlanGist */, false /* withAntiPlanGist */),
+		makeRequestStatementBundleBuiltinOverload(true /* withPlanGist */, true /* withAntiPlanGist */),
 	),
 
 	"crdb_internal.set_compaction_concurrency": makeBuiltin(
@@ -8116,6 +8129,11 @@ expires until the statement bundle is collected`,
 			Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
 				argStrings := make([]string, len(args))
 				for i := range args {
+					if args[i] == tree.DNull {
+						return nil, pgerror.New(
+							pgcode.NullValueNotAllowed, "RAISE statement option cannot be null",
+						)
+					}
 					s, ok := tree.AsDString(args[i])
 					if !ok {
 						return nil, errors.Newf("expected string value, got %T", args[i])
@@ -8140,8 +8158,7 @@ expires until the statement bundle is collected`,
 				}
 				if codeString := argStrings[4]; codeString != "" {
 					var code string
-					if regexp.MustCompile(`[A-Z0-9]{5}`).MatchString(codeString) {
-						// The supplied argument is a valid PG code.
+					if pgcode.IsValidPGCode(codeString) {
 						code = codeString
 					} else {
 						// The supplied string may be a condition name.
@@ -8167,8 +8184,204 @@ expires until the statement bundle is collected`,
 				}
 				return tree.DNull, nil
 			},
-			Info:       "This function is used internally to implement the PLpgSQL RAISE statement.",
-			Volatility: volatility.Volatile,
+			Info:              "This function is used internally to implement the PLpgSQL RAISE statement.",
+			Volatility:        volatility.Volatile,
+			CalledOnNullInput: true,
+		},
+	),
+	"bitmask_or": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
+		stringOverload2(
+			"a",
+			"b",
+			func(_ context.Context, _ *eval.Context, a, b string) (tree.Datum, error) {
+				aBitArray, err := bitarray.Parse(a)
+				if err != nil {
+					return nil, err
+				}
+
+				bBitArray, err := bitarray.Parse(b)
+				if err != nil {
+					return nil, err
+				}
+
+				return bitmaskOr(aBitArray.String(), bBitArray.String())
+			},
+			types.VarBit,
+			"Calculates bitwise OR value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			volatility.Immutable),
+		bitsOverload2("a", "b",
+			func(_ context.Context, _ *eval.Context, a, b *tree.DBitArray) (tree.Datum, error) {
+				return bitmaskOr(a.BitArray.String(), b.BitArray.String())
+			},
+			types.VarBit,
+			"Calculates bitwise OR value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			volatility.Immutable,
+		),
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "a", Typ: types.VarBit},
+				{Name: "b", Typ: types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.VarBit),
+			Fn: func(_ context.Context, _ *eval.Context, datums tree.Datums) (tree.Datum, error) {
+				a, b := datums[0], datums[1]
+				bBitArray, err := bitarray.Parse(string(tree.MustBeDString(b)))
+				if err != nil {
+					return nil, err
+				}
+
+				return bitmaskOr(a.(*tree.DBitArray).BitArray.String(), bBitArray.String())
+			},
+			Info:       "Calculates bitwise OR value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			Volatility: volatility.Immutable,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "a", Typ: types.String},
+				{Name: "b", Typ: types.VarBit},
+			},
+			ReturnType: tree.FixedReturnType(types.VarBit),
+			Fn: func(_ context.Context, _ *eval.Context, datums tree.Datums) (tree.Datum, error) {
+				a, b := datums[0], datums[1]
+				aBitArray, err := bitarray.Parse(string(tree.MustBeDString(a)))
+				if err != nil {
+					return nil, err
+				}
+
+				return bitmaskOr(aBitArray.String(), b.(*tree.DBitArray).BitArray.String())
+			},
+			Info:       "Calculates bitwise OR value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			Volatility: volatility.Immutable,
+		},
+	),
+	"bitmask_and": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
+		stringOverload2(
+			"a",
+			"b",
+			func(_ context.Context, _ *eval.Context, a, b string) (tree.Datum, error) {
+				aBitArray, err := bitarray.Parse(a)
+				if err != nil {
+					return nil, err
+				}
+
+				bBitArray, err := bitarray.Parse(b)
+				if err != nil {
+					return nil, err
+				}
+
+				return bitmaskAnd(aBitArray.String(), bBitArray.String())
+			},
+			types.VarBit,
+			"Calculates bitwise AND value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			volatility.Immutable),
+		bitsOverload2("a", "b",
+			func(_ context.Context, _ *eval.Context, a, b *tree.DBitArray) (tree.Datum, error) {
+				return bitmaskAnd(a.BitArray.String(), b.BitArray.String())
+			},
+			types.VarBit,
+			"Calculates bitwise AND value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			volatility.Immutable,
+		),
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "a", Typ: types.VarBit},
+				{Name: "b", Typ: types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.VarBit),
+			Fn: func(_ context.Context, _ *eval.Context, datums tree.Datums) (tree.Datum, error) {
+				a, b := datums[0], datums[1]
+				bBitArray, err := bitarray.Parse(string(tree.MustBeDString(b)))
+				if err != nil {
+					return nil, err
+				}
+
+				return bitmaskAnd(a.(*tree.DBitArray).BitArray.String(), bBitArray.String())
+			},
+			Info:       "Calculates bitwise AND value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			Volatility: volatility.Immutable,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "a", Typ: types.String},
+				{Name: "b", Typ: types.VarBit},
+			},
+			ReturnType: tree.FixedReturnType(types.VarBit),
+			Fn: func(_ context.Context, _ *eval.Context, datums tree.Datums) (tree.Datum, error) {
+				a, b := datums[0], datums[1]
+				aBitArray, err := bitarray.Parse(string(tree.MustBeDString(a)))
+				if err != nil {
+					return nil, err
+				}
+
+				return bitmaskAnd(aBitArray.String(), b.(*tree.DBitArray).BitArray.String())
+			},
+			Info:       "Calculates bitwise AND value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			Volatility: volatility.Immutable,
+		},
+	),
+	"bitmask_xor": makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategoryString},
+		stringOverload2(
+			"a",
+			"b",
+			func(_ context.Context, _ *eval.Context, a, b string) (tree.Datum, error) {
+				aBitArray, err := bitarray.Parse(a)
+				if err != nil {
+					return nil, err
+				}
+
+				bBitArray, err := bitarray.Parse(b)
+				if err != nil {
+					return nil, err
+				}
+
+				return bitmaskXor(aBitArray.String(), bBitArray.String())
+			},
+			types.VarBit,
+			"Calculates bitwise XOR value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			volatility.Immutable),
+		bitsOverload2("a", "b",
+			func(_ context.Context, _ *eval.Context, a, b *tree.DBitArray) (tree.Datum, error) {
+				return bitmaskXor(a.BitArray.String(), b.BitArray.String())
+			},
+			types.VarBit,
+			"Calculates bitwise XOR value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			volatility.Immutable,
+		),
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "a", Typ: types.VarBit},
+				{Name: "b", Typ: types.String},
+			},
+			ReturnType: tree.FixedReturnType(types.VarBit),
+			Fn: func(_ context.Context, _ *eval.Context, datums tree.Datums) (tree.Datum, error) {
+				a, b := datums[0], datums[1]
+				bBitArray, err := bitarray.Parse(string(tree.MustBeDString(b)))
+				if err != nil {
+					return nil, err
+				}
+
+				return bitmaskXor(a.(*tree.DBitArray).BitArray.String(), bBitArray.String())
+			},
+			Info:       "Calculates bitwise XOR value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			Volatility: volatility.Immutable,
+		},
+		tree.Overload{
+			Types: tree.ParamTypes{
+				{Name: "a", Typ: types.String},
+				{Name: "b", Typ: types.VarBit},
+			},
+			ReturnType: tree.FixedReturnType(types.VarBit),
+			Fn: func(_ context.Context, _ *eval.Context, datums tree.Datums) (tree.Datum, error) {
+				a, b := datums[0], datums[1]
+				aBitArray, err := bitarray.Parse(string(tree.MustBeDString(a)))
+				if err != nil {
+					return nil, err
+				}
+
+				return bitmaskXor(aBitArray.String(), b.(*tree.DBitArray).BitArray.String())
+			},
+			Info:       "Calculates bitwise XOR value of unsigned bit arrays 'a' and 'b' that may have different lengths.",
+			Volatility: volatility.Immutable,
 		},
 	),
 }
@@ -9792,13 +10005,16 @@ func GenerateUniqueUnorderedID(instanceID base.SQLInstanceID) tree.DInt {
 }
 
 // mapToUnorderedUniqueInt is used by GenerateUniqueUnorderedID to convert a
-// serial unique uint64 to an unordered unique int64. The bit manipulation
+// serial unique uint64 to an unordered unique int64. It accomplishes this by
+// reversing the timestamp portion of the unique ID. This bit manipulation
 // should preserve the number of 1-bits.
-func mapToUnorderedUniqueInt(val uint64) uint64 {
+func mapToUnorderedUniqueInt(uniqueInt uint64) uint64 {
 	// val is [0][48 bits of ts][15 bits of node id]
-	ts := (val & ((uint64(math.MaxUint64) >> 16) << 15)) >> 15
-	v := (bits.Reverse64(ts) >> 1) | (val & (1<<15 - 1))
-	return v
+	ts := uniqueInt & builtinconstants.UniqueIntTimestampMask
+	nodeID := uniqueInt & builtinconstants.UniqueIntNodeIDMask
+	reversedTS := bits.Reverse64(ts<<builtinconstants.UniqueIntLeadingZeroBits) << builtinconstants.UniqueIntNodeIDBits
+	unorderedUniqueInt := reversedTS | nodeID
+	return unorderedUniqueInt
 }
 
 // ProcessUniqueID is an ID which is unique to this process in the cluster.
@@ -9857,7 +10073,7 @@ func GenerateUniqueInt(instanceID ProcessUniqueID) tree.DInt {
 func GenerateUniqueID(instanceID int32, timestamp uint64) tree.DInt {
 	// We xor in the instanceID so that instanceIDs larger than 32K will flip bits
 	// in the timestamp portion of the final value instead of always setting them.
-	id := (timestamp << builtinconstants.NodeIDBits) ^ uint64(instanceID)
+	id := (timestamp << builtinconstants.UniqueIntNodeIDBits) ^ uint64(instanceID)
 	return tree.DInt(id)
 }
 
@@ -10932,4 +11148,151 @@ func spanToDatum(span roachpb.Span) (tree.Datum, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+func makeRequestStatementBundleBuiltinOverload(
+	withPlanGist bool, withAntiPlanGist bool,
+) tree.Overload {
+	typs := tree.ParamTypes{{Name: "stmtFingerprint", Typ: types.String}}
+	lastTyps := tree.ParamTypes{
+		{Name: "samplingProbability", Typ: types.Float},
+		{Name: "minExecutionLatency", Typ: types.Interval},
+		{Name: "expiresAfter", Typ: types.Interval},
+	}
+	info := `Used to request statement bundle for a given statement fingerprint
+that has execution latency greater than the 'minExecutionLatency'. If the
+'expiresAfter' argument is empty, then the statement bundle request never
+expires until the statement bundle is collected`
+	if withPlanGist {
+		typs = append(typs, tree.ParamType{Name: "planGist", Typ: types.String})
+		info += `. If 'planGist' argument is
+not empty, then only the execution of the statement with the matching plan
+will be used`
+		if withAntiPlanGist {
+			typs = append(typs, tree.ParamType{Name: "antiPlanGist", Typ: types.Bool})
+			info += `. If 'antiPlanGist' argument is
+true, then any plan other then the specified gist will be used`
+		}
+	}
+	typs = append(typs, lastTyps...)
+	return tree.Overload{
+		Types:      typs,
+		ReturnType: tree.FixedReturnType(types.Bool),
+		Fn: func(ctx context.Context, evalCtx *eval.Context, args tree.Datums) (tree.Datum, error) {
+			hasViewActivity, err := evalCtx.SessionAccessor.HasRoleOption(
+				ctx, roleoption.VIEWACTIVITY)
+			if err != nil {
+				return nil, err
+			}
+
+			if !hasViewActivity {
+				return nil, errors.New("requesting statement bundle requires " +
+					"VIEWACTIVITY or ADMIN role option")
+			}
+
+			isAdmin, err := evalCtx.SessionAccessor.HasAdminRole(ctx)
+			if err != nil {
+				return nil, err
+			}
+
+			hasViewActivityRedacted, err := evalCtx.SessionAccessor.HasRoleOption(
+				ctx, roleoption.VIEWACTIVITYREDACTED)
+			if err != nil {
+				return nil, err
+			}
+
+			if !isAdmin && hasViewActivityRedacted {
+				return nil, errors.New("VIEWACTIVITYREDACTED role option cannot request " +
+					"statement bundle")
+			}
+
+			if args[0] == tree.DNull {
+				return nil, errors.New("stmtFingerprint must be non-NULL")
+			}
+
+			stmtFingerprint := string(tree.MustBeDString(args[0]))
+			var planGist string
+			var antiPlanGist bool
+			spIdx, melIdx, eaIdx := 1, 2, 3
+			if withPlanGist {
+				if args[1] != tree.DNull {
+					planGist = string(tree.MustBeDString(args[1]))
+				}
+				spIdx, melIdx, eaIdx = 2, 3, 4
+				if withAntiPlanGist {
+					if args[2] != tree.DNull {
+						antiPlanGist = bool(tree.MustBeDBool(args[2]))
+					}
+					spIdx, melIdx, eaIdx = 3, 4, 5
+				}
+			}
+			var samplingProbability float64
+			if args[spIdx] != tree.DNull {
+				samplingProbability = float64(tree.MustBeDFloat(args[spIdx]))
+			}
+			var minExecutionLatency, expiresAfter time.Duration
+			if args[melIdx] != tree.DNull {
+				minExecutionLatency = time.Duration(tree.MustBeDInterval(args[melIdx]).Nanos())
+			}
+			if args[eaIdx] != tree.DNull {
+				expiresAfter = time.Duration(tree.MustBeDInterval(args[eaIdx]).Nanos())
+			}
+
+			if err = evalCtx.StmtDiagnosticsRequestInserter(
+				ctx,
+				stmtFingerprint,
+				planGist,
+				antiPlanGist,
+				samplingProbability,
+				minExecutionLatency,
+				expiresAfter,
+			); err != nil {
+				return nil, err
+			}
+
+			return tree.DBoolTrue, nil
+		},
+		Volatility: volatility.Volatile,
+		Info:       info,
+	}
+}
+
+func bitmaskAnd(aStr, bStr string) (*tree.DBitArray, error) {
+	return bitmaskOp(aStr, bStr, func(a, b byte) byte { return a & b })
+}
+
+func bitmaskOr(aStr, bStr string) (*tree.DBitArray, error) {
+	return bitmaskOp(aStr, bStr, func(a, b byte) byte { return a | b })
+}
+
+func bitmaskXor(aStr, bStr string) (*tree.DBitArray, error) {
+	return bitmaskOp(aStr, bStr, func(a, b byte) byte { return (a ^ b) + '0' })
+}
+
+// Perform bitwise operation on the 2 bit strings that may have different
+// lengths. The function applies left padding implicitly with 0s. The function
+// also assumes both input strings are only comprised of charactor '0' and '1'.
+func bitmaskOp(aStr, bStr string, op func(byte, byte) byte) (*tree.DBitArray, error) {
+	aLen, bLen := len(aStr), len(bStr)
+	bufLen := max(aLen, bLen)
+	buf := make([]byte, bufLen)
+	for i := 0; i < bufLen; i++ {
+		var a, b byte
+
+		if i >= aLen {
+			a = '0'
+		} else {
+			a = aStr[aLen-i-1]
+		}
+
+		if i >= bLen {
+			b = '0'
+		} else {
+			b = bStr[bLen-i-1]
+		}
+
+		buf[bufLen-i-1] = op(a, b)
+	}
+
+	return tree.ParseDBitArray(string(buf))
 }

@@ -89,6 +89,7 @@ go_test(
         "replication_random_client_test.go",
         "replication_stream_e2e_test.go",
         "stream_ingestion_dist_test.go",
+        "stream_ingestion_frontier_processor_test.go",
         "stream_ingestion_job_test.go",
         "stream_ingestion_processor_test.go",
     ],
@@ -96,7 +97,10 @@ go_test(
     data = glob(["testdata/**"]),
     embed = [":streamingest"],
     shard_count = 16,
-    tags = ["ccl_test"],
+    tags = [
+        "ccl_test",
+        "no-remote-exec",
+    ],
     deps = [
         "//pkg/base",
         "//pkg/ccl",
@@ -123,6 +127,7 @@ go_test(
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
+        "//pkg/settings",
         "//pkg/settings/cluster",
         "//pkg/sql",
         "//pkg/sql/catalog/descs",

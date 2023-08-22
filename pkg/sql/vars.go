@@ -688,8 +688,13 @@ var varGen = map[string]sessionVar{
 		Set: func(_ context.Context, m sessionDataMutator, s string) error {
 			mode, ok := sessiondatapb.VectorizeExecModeFromString(s)
 			if !ok {
-				return newVarValueError(`vectorize`, s,
-					"off", "on", "experimental_always")
+				return newVarValueError(
+					`vectorize`,
+					s,
+					sessiondatapb.VectorizeOff.String(),
+					sessiondatapb.VectorizeOn.String(),
+					sessiondatapb.VectorizeExperimentalAlways.String(),
+				)
 			}
 			m.SetVectorize(mode)
 			return nil
@@ -2026,6 +2031,36 @@ var varGen = map[string]sessionVar{
 			return formatBoolAsPostgresSetting(evalCtx.SessionData().InjectRetryErrorsOnCommitEnabled), nil
 		},
 		GlobalDefault: globalFalse,
+	},
+
+	// CockroachDB extension. Configures the maximum number of automatic retries
+	// to perform for statements in explicit READ COMMITTED transactions that
+	// see a transaction retry error.
+	`max_retries_for_read_committed`: {
+		GetStringVal: makeIntGetStringValFn(`max_retries_for_read_committed`),
+		Set: func(_ context.Context, m sessionDataMutator, s string) error {
+			b, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return err
+			}
+			if b < 0 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"cannot set max_retries_for_read_committed to a negative value: %d", b)
+			}
+			if b > math.MaxInt32 {
+				return pgerror.Newf(pgcode.InvalidParameterValue,
+					"cannot set max_retries_for_read_committed to a value greater than %d: %d", math.MaxInt32, b)
+			}
+
+			m.SetMaxRetriesForReadCommitted(int32(b))
+			return nil
+		},
+		Get: func(evalCtx *extendedEvalContext, _ *kv.Txn) (string, error) {
+			return strconv.FormatInt(int64(evalCtx.SessionData().MaxRetriesForReadCommitted), 10), nil
+		},
+		GlobalDefault: func(sv *settings.Values) string {
+			return "10"
+		},
 	},
 
 	// CockroachDB extension.

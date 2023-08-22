@@ -25,9 +25,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
-	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/server/decommissioning"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -36,7 +35,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -48,7 +46,7 @@ func TestDecommissionPreCheckInvalid(t *testing.T) {
 
 	// Set up test cluster.
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 4, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 4, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: decommissionTsArgs("a", "n1"),
@@ -59,7 +57,7 @@ func TestDecommissionPreCheckInvalid(t *testing.T) {
 	})
 	defer tc.Stopper().Stop(ctx)
 
-	firstSvr := tc.Server(0).(*server.TestServer)
+	firstSvr := tc.Server(0)
 
 	// Create database and tables.
 	ac := firstSvr.AmbientCtx()
@@ -75,7 +73,7 @@ func TestDecommissionPreCheckInvalid(t *testing.T) {
 	status, ok := status.FromError(err)
 	require.True(t, ok, "expected grpc status error")
 	require.Equal(t, codes.InvalidArgument, status.Code())
-	require.Equal(t, server.DecommissionPreCheckResult{}, result)
+	require.Equal(t, decommissioning.PreCheckResult{}, result)
 }
 
 // TestDecommissionPreCheckEvaluation tests evaluation of decommission readiness
@@ -91,7 +89,7 @@ func TestDecommissionPreCheckEvaluation(t *testing.T) {
 
 	// Set up test cluster.
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 7, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgsPerNode: map[int]base.TestServerArgs{
 			0: tsArgs("ns1", "origin"),
@@ -105,7 +103,7 @@ func TestDecommissionPreCheckEvaluation(t *testing.T) {
 	})
 	defer tc.Stopper().Stop(ctx)
 
-	firstSvr := tc.Server(0).(*server.TestServer)
+	firstSvr := tc.Server(0)
 	db := tc.ServerConn(0)
 	runQueries := func(queries ...string) {
 		for _, q := range queries {
@@ -211,12 +209,12 @@ func TestDecommissionPreCheckOddToEven(t *testing.T) {
 
 	// Set up test cluster.
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 5, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 5, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 	})
 	defer tc.Stopper().Stop(ctx)
 
-	firstSvr := tc.Server(0).(*server.TestServer)
+	firstSvr := tc.Server(0)
 	db := tc.ServerConn(0)
 	runQueries := func(queries ...string) {
 		for _, q := range queries {
@@ -336,16 +334,13 @@ func TestDecommissionPreCheckBasicReadiness(t *testing.T) {
 	skip.UnderRace(t) // can't handle 7-node clusters
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 7, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
 
 	adminSrv := tc.Server(4)
-	conn, err := adminSrv.RPCContext().GRPCDialNode(
-		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
-	require.NoError(t, err)
-	adminClient := serverpb.NewAdminClient(conn)
+	adminClient := adminSrv.GetAdminClient(t)
 
 	resp, err := adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
 		NodeIDs: []roachpb.NodeID{tc.Server(5).NodeID()},
@@ -363,7 +358,7 @@ func TestDecommissionPreCheckUnready(t *testing.T) {
 	skip.UnderRace(t) // can't handle 7-node clusters
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 7, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -379,10 +374,7 @@ func TestDecommissionPreCheckUnready(t *testing.T) {
 
 	adminSrv := tc.Server(adminSrvIdx)
 	decommissioningSrv := tc.Server(decommissioningSrvIdx)
-	conn, err := adminSrv.RPCContext().GRPCDialNode(
-		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
-	require.NoError(t, err)
-	adminClient := serverpb.NewAdminClient(conn)
+	adminClient := adminSrv.GetAdminClient(t)
 
 	checkNodeReady := func(nID roachpb.NodeID, replicaCount int64, strict bool) {
 		resp, err := adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
@@ -514,7 +506,7 @@ func TestDecommissionPreCheckMultiple(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 5, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 5, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -557,10 +549,7 @@ func TestDecommissionPreCheckMultiple(t *testing.T) {
 	}
 
 	adminSrv := tc.Server(adminSrvIdx)
-	conn, err := adminSrv.RPCContext().GRPCDialNode(
-		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
-	require.NoError(t, err)
-	adminClient := serverpb.NewAdminClient(conn)
+	adminClient := adminSrv.GetAdminClient(t)
 
 	// We expect to be able to decommission the targeted nodes simultaneously.
 	resp, err := adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
@@ -583,7 +572,7 @@ func TestDecommissionPreCheckInvalidNode(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 5, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 5, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -622,10 +611,7 @@ func TestDecommissionPreCheckInvalidNode(t *testing.T) {
 	}
 
 	adminSrv := tc.Server(adminSrvIdx)
-	conn, err := adminSrv.RPCContext().GRPCDialNode(
-		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
-	require.NoError(t, err)
-	adminClient := serverpb.NewAdminClient(conn)
+	adminClient := adminSrv.GetAdminClient(t)
 
 	// We expect the pre-check to fail as some node IDs are invalid.
 	resp, err := adminClient.DecommissionPreCheck(ctx, &serverpb.DecommissionPreCheckRequest{
@@ -652,7 +638,7 @@ func TestDecommissionSelf(t *testing.T) {
 
 	// Set up test cluster.
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 7, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 	})
 	defer tc.Stopper().Stop(ctx)
@@ -662,10 +648,7 @@ func TestDecommissionSelf(t *testing.T) {
 	// admin server's logic, which involves a subsequent DecommissionStatus
 	// call which could fail if used from a node that's just decommissioned.
 	adminSrv := tc.Server(4)
-	conn, err := adminSrv.RPCContext().GRPCDialNode(
-		adminSrv.RPCAddr(), adminSrv.NodeID(), rpc.DefaultClass).Connect(ctx)
-	require.NoError(t, err)
-	adminClient := serverpb.NewAdminClient(conn)
+	adminClient := adminSrv.GetAdminClient(t)
 	decomNodeIDs := []roachpb.NodeID{
 		tc.Server(4).NodeID(),
 		tc.Server(5).NodeID(),
@@ -726,7 +709,7 @@ func TestDecommissionEnqueueReplicas(t *testing.T) {
 
 	ctx := context.Background()
 	enqueuedRangeIDs := make(chan roachpb.RangeID)
-	tc := serverutils.StartNewTestCluster(t, 7, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 7, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual,
 		ServerArgs: base.TestServerArgs{
 			Insecure: true, // allows admin client without setting up certs
@@ -751,13 +734,9 @@ func TestDecommissionEnqueueReplicas(t *testing.T) {
 		decommissioningSrv := tc.Server(decommissioningSrvIdx)
 		tc.AddVotersOrFatal(t, scratchKey, tc.Target(decommissioningSrvIdx))
 
-		conn, err := decommissioningSrv.RPCContext().GRPCDialNode(
-			decommissioningSrv.RPCAddr(), decommissioningSrv.NodeID(), rpc.DefaultClass,
-		).Connect(ctx)
-		require.NoError(t, err)
-		adminClient := serverpb.NewAdminClient(conn)
+		adminClient := decommissioningSrv.GetAdminClient(t)
 		decomNodeIDs := []roachpb.NodeID{tc.Server(decommissioningSrvIdx).NodeID()}
-		_, err = adminClient.Decommission(
+		_, err := adminClient.Decommission(
 			ctx,
 			&serverpb.DecommissionRequest{
 				NodeIDs:          decomNodeIDs,
@@ -795,7 +774,7 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 	skip.UnderRace(t, "test uses timeouts, and race builds cause the timeouts to be exceeded")
 
 	ctx := context.Background()
-	tc := serverutils.StartNewTestCluster(t, 2, base.TestClusterArgs{
+	tc := serverutils.StartCluster(t, 2, base.TestClusterArgs{
 		ReplicationMode: base.ReplicationManual, // saves time
 		ServerArgs: base.TestServerArgs{
 			// Disable the default test tenant for now as this tests fails
@@ -806,6 +785,9 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 	})
 	defer tc.Stopper().Stop(ctx)
 
+	// Configure drain to immediately cancel SQL queries and jobs to speed up the
+	// test and avoid timeouts.
+	serverutils.SetClusterSetting(t, tc, "server.shutdown.query_wait", 0)
 	serverutils.SetClusterSetting(t, tc, "server.shutdown.jobs_wait", 0)
 
 	scratchKey := tc.ScratchRange(t)
@@ -822,8 +804,8 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 		require.NoError(t, srv.Decommission(ctx, status, []roachpb.NodeID{decomSrv.NodeID()}))
 	}
 
-	testutils.SucceedsWithin(t, func() error {
-		timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	testutils.SucceedsSoon(t, func() error {
+		timeoutCtx, cancel := context.WithTimeout(ctx, testutils.DefaultSucceedsSoonDuration)
 		defer cancel()
 		_, err := decomSrv.DB().Scan(timeoutCtx, keys.LocalMax, keys.MaxKey, 0)
 		if err == nil {
@@ -834,16 +816,10 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 			return nil
 		}
 		return err
-	}, 10*time.Second)
+	})
 
 	// Set up an admin client.
-	//lint:ignore SA1019 grpc.WithInsecure is deprecated
-	conn, err := grpc.Dial(decomSrv.AdvRPCAddr(), grpc.WithInsecure())
-	require.NoError(t, err)
-	defer func() {
-		_ = conn.Close() // nolint:grpcconnclose
-	}()
-	adminClient := serverpb.NewAdminClient(conn)
+	adminClient := decomSrv.GetAdminClient(t)
 
 	// Run some operations on the decommissioned node. The ones that require
 	// access to the cluster should fail, other should succeed. We're mostly
@@ -952,8 +928,8 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 	for _, tc := range testcases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			testutils.SucceedsWithin(t, func() error {
-				timeoutCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			testutils.SucceedsSoon(t, func() error {
+				timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 				defer cancel()
 				err := tc.op(timeoutCtx, adminClient)
 				if tc.expectCode == codes.OK {
@@ -972,7 +948,7 @@ func TestAdminDecommissionedOperations(t *testing.T) {
 				}
 				require.Equal(t, tc.expectCode, s.Code(), "%+v", err)
 				return nil
-			}, 10*time.Second)
+			})
 		})
 	}
 }

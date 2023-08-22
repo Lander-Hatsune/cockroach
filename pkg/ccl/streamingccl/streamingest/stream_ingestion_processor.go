@@ -48,12 +48,12 @@ import (
 	"github.com/cockroachdb/logtags"
 )
 
-var minimumFlushInterval = settings.RegisterPublicDurationSettingWithExplicitUnit(
+var minimumFlushInterval = settings.RegisterDurationSettingWithExplicitUnit(
 	settings.TenantWritable,
 	"bulkio.stream_ingestion.minimum_flush_interval",
 	"the minimum timestamp between flushes; flushes may still occur if internal buffers fill up",
 	5*time.Second,
-	nil, /* validateFn */
+	settings.WithPublic,
 )
 
 var maxKVBufferSize = settings.RegisterByteSizeSetting(
@@ -84,7 +84,7 @@ var cutoverSignalPollInterval = settings.RegisterDurationSetting(
 	settings.TenantWritable,
 	"bulkio.stream_ingestion.cutover_signal_poll_interval",
 	"the interval at which the stream ingestion job checks if it has been signaled to cutover",
-	30*time.Second,
+	10*time.Second,
 	settings.NonNegativeDuration,
 )
 
@@ -394,7 +394,8 @@ func (sip *streamIngestionProcessor) Start(ctx context.Context) {
 			streamClient = sip.forceClientForTests
 			log.Infof(ctx, "using testing client")
 		} else {
-			streamClient, err = streamclient.NewStreamClient(ctx, streamingccl.StreamAddress(addr), db)
+			streamClient, err = streamclient.NewStreamClient(ctx, streamingccl.StreamAddress(addr), db,
+				streamclient.WithStreamID(streampb.StreamID(sip.spec.StreamID)))
 			if err != nil {
 				sip.MoveToDraining(errors.Wrapf(err, "creating client for partition spec %q from %q", token, addr))
 				return

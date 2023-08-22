@@ -130,8 +130,8 @@ func (c *TenantStreamingClusters) setupSrcTenant() {
 
 func (c *TenantStreamingClusters) init() {
 	c.SrcSysSQL.ExecMultiple(c.T, ConfigureClusterSettings(c.Args.SrcClusterSettings)...)
-	c.SrcSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.split_at.allow_for_secondary_tenant.enabled=true`, c.Args.SrcTenantName)
-	c.SrcSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.scatter.allow_for_secondary_tenant.enabled=true`, c.Args.SrcTenantName)
+	c.SrcSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.virtual_cluster.feature_access.manual_range_split.enabled=true`, c.Args.SrcTenantName)
+	c.SrcSysSQL.Exec(c.T, `ALTER TENANT $1 SET CLUSTER SETTING sql.virtual_cluster.feature_access.manual_range_scatter.enabled=true`, c.Args.SrcTenantName)
 	if c.Args.SrcInitFunc != nil {
 		c.Args.SrcInitFunc(c.T, c.SrcSysSQL, c.SrcTenantSQL)
 	}
@@ -449,7 +449,7 @@ var defaultSrcClusterSetting = map[string]string{
 	`kv.rangefeed.enabled`:                `true`,
 	`kv.closed_timestamp.target_duration`: `'1s'`,
 	// Large timeout makes test to not fail with unexpected timeout failures.
-	`stream_replication.job_liveness_timeout`:            `'3m'`,
+	`stream_replication.job_liveness.timeout`:            `'3m'`,
 	`stream_replication.stream_liveness_track_frequency`: `'2s'`,
 	`stream_replication.min_checkpoint_frequency`:        `'1s'`,
 	// Make all AddSSTable operation to trigger AddSSTable events.

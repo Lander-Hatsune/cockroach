@@ -100,7 +100,7 @@ func TestFlowControlBasic(t *testing.T) {
 		for i := 0; i < numNodes; i++ {
 			si, err := tc.Server(i).GetStores().(*kvserver.Stores).GetStore(tc.Server(i).GetFirstStoreID())
 			require.NoError(t, err)
-			tc.Servers[i].RaftTransport().ListenIncomingRaftMessages(si.StoreID(),
+			tc.Servers[i].RaftTransport().(*kvserver.RaftTransport).ListenIncomingRaftMessages(si.StoreID(),
 				&unreliableRaftHandler{
 					rangeID:                    desc.RangeID,
 					IncomingRaftMessageHandler: si,
@@ -763,9 +763,6 @@ func TestFlowControlRaftSnapshot(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	stickyEngineRegistry := server.NewStickyInMemEnginesRegistry()
-	defer stickyEngineRegistry.CloseAllStickyInMemEngines()
-
 	const numServers int = 5
 	stickyServerArgs := make(map[int]base.TestServerArgs)
 	var maintainStreamsForBehindFollowers atomic.Bool
@@ -783,8 +780,8 @@ func TestFlowControlRaftSnapshot(t *testing.T) {
 			Settings: st,
 			StoreSpecs: []base.StoreSpec{
 				{
-					InMemory:               true,
-					StickyInMemoryEngineID: strconv.FormatInt(int64(i), 10),
+					InMemory:    true,
+					StickyVFSID: strconv.FormatInt(int64(i), 10),
 				},
 			},
 			RaftConfig: base.RaftConfig{
@@ -794,7 +791,7 @@ func TestFlowControlRaftSnapshot(t *testing.T) {
 			},
 			Knobs: base.TestingKnobs{
 				Server: &server.TestingKnobs{
-					StickyEngineRegistry: stickyEngineRegistry,
+					StickyVFSRegistry: server.NewStickyVFSRegistry(),
 				},
 				Store: &kvserver.StoreTestingKnobs{
 					FlowControlTestingKnobs: &kvflowcontrol.TestingKnobs{
@@ -963,7 +960,7 @@ ORDER BY name ASC;
 	   FROM crdb_internal.kv_flow_control_handles
 	`, "range_id", "store_id", "total_tracked_tokens")
 
-	tc.WaitForValues(t, k, []int64{incAB, incA, incA, incAB, incAB})
+	tc.WaitForValues(t, k, []int64{incAB, 0 /* stopped */, 0 /* stopped */, incAB, incAB})
 
 	index := repl.GetLastIndex()
 	h.comment(`-- (Truncating raft log.)`)
@@ -1907,7 +1904,7 @@ func TestFlowControlUnquiescedRange(t *testing.T) {
 	for i := 0; i < numNodes; i++ {
 		si, err := tc.Server(i).GetStores().(*kvserver.Stores).GetStore(tc.Server(i).GetFirstStoreID())
 		require.NoError(t, err)
-		tc.Servers[i].RaftTransport().ListenIncomingRaftMessages(si.StoreID(),
+		tc.Servers[i].RaftTransport().(*kvserver.RaftTransport).ListenIncomingRaftMessages(si.StoreID(),
 			&unreliableRaftHandler{
 				rangeID:                    desc.RangeID,
 				IncomingRaftMessageHandler: si,

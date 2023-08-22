@@ -70,7 +70,15 @@ var (
 	prometheusScrapeInterval = time.Second * 15
 
 	prng, _ = randutil.NewLockedPseudoRand()
+
+	runID string
 )
+
+// VmLabelTestName is the label used to identify the test name in the VM metadata
+const VmLabelTestName string = "test_name"
+
+// VmLabelTestRunID is the label used to identify the test run id in the VM metadata
+const VmLabelTestRunID string = "test_run_id"
 
 // testRunner runs tests.
 type testRunner struct {
@@ -296,6 +304,8 @@ func (r *testRunner) Run(
 
 	qp := quotapool.NewIntPool("cloud cpu", uint64(clustersOpt.cpuQuota))
 	l := lopt.l
+	runID = generateRunID(clustersOpt.user)
+	shout(ctx, l, lopt.stdout, "%s: %s", VmLabelTestRunID, runID)
 	var wg sync.WaitGroup
 
 	for i := 0; i < parallelism; i++ {
@@ -384,6 +394,16 @@ func numConcurrentClusterCreations() int {
 		res = 1000
 	}
 	return res
+}
+
+// This will be added as a label to all cluster nodes when the
+// cluster is registered.
+func generateRunID(user string) string {
+	uniqueId := os.Getenv("TC_BUILD_ID")
+	if uniqueId == "" {
+		uniqueId = fmt.Sprintf("%d", timeutil.Now().Unix())
+	}
+	return fmt.Sprintf("%s-%s", user, uniqueId)
 }
 
 // defaultClusterAllocator is used by workers to create new clusters (or to attach
@@ -911,7 +931,11 @@ func (r *testRunner) runTest(
 	t.runnerID = goid.Get()
 
 	s := t.Spec().(*registry.TestSpec)
+	_ = c.addLabels(map[string]string{
+		VmLabelTestName: s.Name,
+	})
 	defer func() {
+		_ = c.removeLabels([]string{VmLabelTestName})
 		t.end = timeutil.Now()
 
 		// We only have to record panics if the panic'd value is not the sentinel
@@ -1087,16 +1111,19 @@ func (r *testRunner) runTest(
 		t.ReplaceL(logger)
 	}
 
-	// Awkward file name to keep it close to test.log.
-	l.Printf("running post test assertions (test-post-assertions.log)")
-	replaceLogger("test-post-assertions")
+	if !t.Failed() {
+		// Awkward file name to keep it close to test.log.
+		l.Printf("running post test assertions (test-post-assertions.log)")
+		replaceLogger("test-post-assertions")
 
-	// We still want to run the post-test assertions even if the test timed out as it
-	// might provide useful information about the health of the nodes. Any assertion failures
-	// will will be recorded against, and eventually fail, the test.
-	// TODO (miral): consider not running these assertions if the test has already failed
-	if err := r.postTestAssertions(ctx, t, c, 10*time.Minute); err != nil {
-		l.Printf("error during post test assertions: %v; see test-post-assertions.log for details", err)
+		// We still want to run the post-test assertions even if the test timed out as it
+		// might provide useful information about the health of the nodes. Any assertion failures
+		// will will be recorded against, and eventually fail, the test.
+		if err := r.postTestAssertions(ctx, t, c, 10*time.Minute); err != nil {
+			l.Printf("error during post test assertions: %v; see test-post-assertions.log for details", err)
+		}
+	} else {
+		l.Printf("skipping post test assertions as test failed")
 	}
 
 	// From now on, all logging goes to test-teardown.log to give a clear separation between

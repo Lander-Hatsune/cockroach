@@ -142,10 +142,11 @@ func rangeFeedCheckpoint(span roachpb.Span, ts hlc.Timestamp) *kvpb.RangeFeedEve
 }
 
 const testProcessorEventCCap = 16
+const testProcessorEventCTimeout = 10 * time.Millisecond
 
 func newTestProcessorWithTxnPusher(
 	t *testing.T, rtsIter storage.SimpleMVCCIterator, txnPusher TxnPusher,
-) (*Processor, *stop.Stopper) {
+) (*LegacyProcessor, *stop.Stopper) {
 	t.Helper()
 	stopper := stop.NewStopper()
 
@@ -161,11 +162,13 @@ func newTestProcessorWithTxnPusher(
 		TxnPusher:        txnPusher,
 		PushTxnsInterval: pushTxnInterval,
 		PushTxnsAge:      pushTxnAge,
+		EventChanTimeout: testProcessorEventCTimeout,
 		EventChanCap:     testProcessorEventCCap,
 		Metrics:          NewMetrics(),
 	})
 	require.NoError(t, p.Start(stopper, makeIntentScannerConstructor(rtsIter)))
-	return p, stopper
+	impl := p.(*LegacyProcessor)
+	return impl, stopper
 }
 
 func makeIntentScannerConstructor(rtsIter storage.SimpleMVCCIterator) IntentScannerConstructor {
@@ -177,7 +180,7 @@ func makeIntentScannerConstructor(rtsIter storage.SimpleMVCCIterator) IntentScan
 
 func newTestProcessor(
 	t *testing.T, rtsIter storage.SimpleMVCCIterator,
-) (*Processor, *stop.Stopper) {
+) (*LegacyProcessor, *stop.Stopper) {
 	t.Helper()
 	return newTestProcessorWithTxnPusher(t, rtsIter, nil /* pusher */)
 }
@@ -433,33 +436,6 @@ func TestProcessorBasic(t *testing.T) {
 	require.False(t, r3OK)
 }
 
-func TestNilProcessor(t *testing.T) {
-	defer leaktest.AfterTest(t)()
-	ctx := context.Background()
-	var p *Processor
-
-	// All of the following should be no-ops.
-	require.Equal(t, 0, p.Len())
-	require.NotPanics(t, func() { p.Stop() })
-	require.NotPanics(t, func() { p.StopWithErr(nil) })
-	require.NotPanics(t, func() { p.ConsumeLogicalOps(ctx) })
-	require.NotPanics(t, func() { p.ConsumeLogicalOps(ctx, make([]enginepb.MVCCLogicalOp, 5)...) })
-	require.NotPanics(t, func() { p.ForwardClosedTS(ctx, hlc.Timestamp{}) })
-	require.NotPanics(t, func() { p.ForwardClosedTS(ctx, hlc.Timestamp{WallTime: 1}) })
-
-	// The following should panic because they are not safe
-	// to call on a nil Processor.
-	stopper := stop.NewStopper()
-	defer stopper.Stop(ctx)
-	require.Panics(t, func() { _ = p.Start(stopper, nil) })
-	require.Panics(t, func() {
-		var done future.ErrorFuture
-		p.Register(roachpb.RSpan{}, hlc.Timestamp{}, nil, false, nil,
-			func() {}, &done,
-		)
-	})
-}
-
 func TestProcessorSlowConsumer(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	p, stopper := newTestProcessor(t, nil /* rtsIter */)
@@ -564,6 +540,7 @@ func TestProcessorMemoryBudgetExceeded(t *testing.T) {
 
 	stopper := stop.NewStopper()
 	var pushTxnInterval, pushTxnAge time.Duration = 0, 0 // disable
+	m := NewMetrics()
 	p := NewProcessor(Config{
 		AmbientContext:   log.MakeTestingAmbientCtxWithNewTracer(),
 		Clock:            hlc.NewClockForTesting(nil),
@@ -571,7 +548,7 @@ func TestProcessorMemoryBudgetExceeded(t *testing.T) {
 		PushTxnsInterval: pushTxnInterval,
 		PushTxnsAge:      pushTxnAge,
 		EventChanCap:     testProcessorEventCCap,
-		Metrics:          NewMetrics(),
+		Metrics:          m,
 		MemBudget:        fb,
 		EventChanTimeout: time.Millisecond,
 	})
@@ -591,7 +568,7 @@ func TestProcessorMemoryBudgetExceeded(t *testing.T) {
 		func() {},
 		&r1Done,
 	)
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	// Block it.
 	unblock := r1Stream.BlockSend()
@@ -612,16 +589,16 @@ func TestProcessorMemoryBudgetExceeded(t *testing.T) {
 	}
 
 	// Unblock stream processing part to consume error.
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	// Unblock the 'send' channel. The events should quickly be consumed.
 	unblock()
 	unblock = nil
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	require.Equal(t, newErrBufferCapacityExceeded().GoError(), waitErrorFuture(&r1Done))
-	require.Equal(t, 0, p.reg.Len(), "registration was not removed")
-	require.Equal(t, int64(1), p.Metrics.RangeFeedBudgetExhausted.Count())
+	require.Equal(t, 0, p.Len(), "registration was not removed")
+	require.Equal(t, int64(1), m.RangeFeedBudgetExhausted.Count())
 }
 
 // TestProcessorMemoryBudgetReleased that memory budget is correctly released.
@@ -660,7 +637,7 @@ func TestProcessorMemoryBudgetReleased(t *testing.T) {
 		func() {},
 		&r1Done,
 	)
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	// Write entries and check they are consumed so that we could write more
 	// data than total budget if inflight messages are within budget.
@@ -671,7 +648,7 @@ func TestProcessorMemoryBudgetReleased(t *testing.T) {
 			hlc.Timestamp{WallTime: int64(i + 2)},
 			[]byte("value")))
 	}
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	// Count consumed values
 	consumedOps := 0
@@ -680,7 +657,7 @@ func TestProcessorMemoryBudgetReleased(t *testing.T) {
 			consumedOps++
 		}
 	}
-	require.Equal(t, 1, p.reg.Len(), "registration was removed")
+	require.Equal(t, 1, p.Len(), "registration was removed")
 	require.Equal(t, 10, consumedOps)
 }
 
@@ -1069,14 +1046,14 @@ func TestProcessorRegistrationObservesOnlyNewEvents(t *testing.T) {
 // syncEventAndRegistrations waits for all previously sent events to be
 // processed *and* for all registration output loops to fully process their own
 // internal buffers.
-func (p *Processor) syncEventAndRegistrations() {
+func (p *LegacyProcessor) syncEventAndRegistrations() {
 	p.syncEventAndRegistrationSpan(all)
 }
 
 // syncEventAndRegistrations waits for all previously sent events to be
 // processed *and* for all registration output loops for registrations
 // overlapping the given span to fully process their own internal buffers.
-func (p *Processor) syncEventAndRegistrationSpan(span roachpb.Span) {
+func (p *LegacyProcessor) syncEventAndRegistrationSpan(span roachpb.Span) {
 	syncC := make(chan struct{})
 	ev := getPooledEvent(event{sync: &syncEvent{c: syncC, testRegCatchupSpan: &span}})
 	select {
@@ -1128,6 +1105,7 @@ func TestBudgetReleaseOnProcessorStop(t *testing.T) {
 		PushTxnsInterval: pushTxnInterval,
 		PushTxnsAge:      pushTxnAge,
 		EventChanCap:     channelCapacity,
+		EventChanTimeout: time.Millisecond,
 		MemBudget:        fb,
 		Metrics:          NewMetrics(),
 	})
@@ -1149,7 +1127,7 @@ func TestBudgetReleaseOnProcessorStop(t *testing.T) {
 		&done,
 	)
 	rErrC := notifyWhenDone(&done)
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	for i := 0; i < totalEvents; i++ {
 		p.ConsumeLogicalOps(ctx, writeValueOpWithKV(
@@ -1218,6 +1196,7 @@ func TestBudgetReleaseOnLastStreamError(t *testing.T) {
 		PushTxnsInterval: pushTxnInterval,
 		PushTxnsAge:      pushTxnAge,
 		EventChanCap:     channelCapacity,
+		EventChanTimeout: time.Millisecond,
 		MemBudget:        fb,
 		Metrics:          NewMetrics(),
 	})
@@ -1239,7 +1218,7 @@ func TestBudgetReleaseOnLastStreamError(t *testing.T) {
 		&done,
 	)
 	rErrC := notifyWhenDone(&done)
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	for i := 0; i < totalEvents; i++ {
 		p.ConsumeLogicalOps(ctx, writeValueOpWithKV(
@@ -1297,6 +1276,7 @@ func TestBudgetReleaseOnOneStreamError(t *testing.T) {
 		PushTxnsInterval: pushTxnInterval,
 		PushTxnsAge:      pushTxnAge,
 		EventChanCap:     channelCapacity,
+		EventChanTimeout: 100 * time.Millisecond, // enough time for registration to process events
 		MemBudget:        fb,
 		Metrics:          NewMetrics(),
 	})
@@ -1331,7 +1311,7 @@ func TestBudgetReleaseOnOneStreamError(t *testing.T) {
 		func() {},
 		&r2Done,
 	)
-	p.syncEventAndRegistrations()
+	syncEventAndRegistrations(p)
 
 	for i := 0; i < totalEvents; i++ {
 		p.ConsumeLogicalOps(ctx, writeValueOpWithKV(
@@ -1361,7 +1341,8 @@ func TestBudgetReleaseOnOneStreamError(t *testing.T) {
 // stop and drain remaining allocations.
 // We use account and not a monitor for those checks because monitor doesn't
 // necessary return all data to the pool until processor is stopped.
-func requireBudgetDrainedSoon(t *testing.T, processor *Processor, stream *consumer) {
+func requireBudgetDrainedSoon(t *testing.T, p Processor, stream *consumer) {
+	processor := p.(*LegacyProcessor)
 	testutils.SucceedsSoon(t, func() error {
 		processor.MemBudget.mu.Lock()
 		used := processor.MemBudget.mu.memBudget.Used()
@@ -1457,4 +1438,87 @@ func TestSizeOfEvent(t *testing.T) {
 	var e event
 	size := int(unsafe.Sizeof(e))
 	require.Equal(t, 72, size)
+}
+
+// TestProcessorBackpressure tests that a processor with EventChanTimeout set to
+// 0 will backpressure senders when a consumer isn't keeping up.
+func TestProcessorBackpressure(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+
+	span := roachpb.RSpan{Key: roachpb.RKey("a"), EndKey: roachpb.RKey("z")}
+
+	// Set up processor.
+	p := NewProcessor(Config{
+		AmbientContext:   log.MakeTestingAmbientContext(nil),
+		Clock:            hlc.NewClockForTesting(nil),
+		Metrics:          NewMetrics(),
+		Span:             span,
+		MemBudget:        newTestBudget(math.MaxInt64),
+		EventChanCap:     1,
+		EventChanTimeout: 0,
+	})
+	require.NoError(t, p.Start(stopper, nil))
+	defer p.Stop()
+
+	// Add a registration.
+	stream := newTestStream()
+	done := &future.ErrorFuture{}
+	ok, _ := p.Register(span, hlc.MinTimestamp, nil, false, stream, nil, done)
+	require.True(t, ok)
+
+	// Wait for the initial checkpoint.
+	syncEventAndRegistrations(p)
+	require.Len(t, stream.Events(), 1)
+
+	// Block the registration consumer, and spawn a goroutine to post events to
+	// the stream, which should block. The rangefeed pipeline buffers a few
+	// additional events in intermediate goroutines between channels, so post 10
+	// events to be sure.
+	unblock := stream.BlockSend()
+	defer unblock()
+
+	const numEvents = 10
+	doneC := make(chan struct{})
+	go func() {
+		for i := 0; i < numEvents; i++ {
+			assert.True(t, p.ForwardClosedTS(ctx, hlc.Timestamp{WallTime: int64(i + 1)}))
+		}
+		close(doneC)
+	}()
+
+	// The sender should be blocked for at least 3 seconds.
+	select {
+	case <-doneC:
+		t.Fatal("send unexpectely succeeded")
+	case <-time.After(3 * time.Second):
+	case <-ctx.Done():
+	}
+
+	// Unblock the sender, and wait for it to complete.
+	unblock()
+	select {
+	case <-doneC:
+	case <-time.After(time.Second):
+		t.Fatal("sender did not complete")
+	}
+
+	// Wait for the final checkpoint event.
+	syncEventAndRegistrations(p)
+	events := stream.Events()
+	require.Equal(t, &kvpb.RangeFeedEvent{
+		Checkpoint: &kvpb.RangeFeedCheckpoint{
+			Span:       span.AsRawSpanWithNoLocals(),
+			ResolvedTS: hlc.Timestamp{WallTime: numEvents},
+		},
+	}, events[len(events)-1])
+}
+
+func syncEventAndRegistrations(p Processor) {
+	impl := p.(*LegacyProcessor)
+	impl.syncEventAndRegistrations()
 }

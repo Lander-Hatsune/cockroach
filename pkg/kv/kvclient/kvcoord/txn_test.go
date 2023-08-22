@@ -111,7 +111,7 @@ func BenchmarkSingleRoundtripWithLatency(b *testing.B) {
 		b.Run(fmt.Sprintf("latency=%s", latency), func(b *testing.B) {
 			var s localtestcluster.LocalTestCluster
 			s.Latency = latency
-			s.Start(b, testutils.NewNodeTestBaseContext(), kvcoord.InitFactoryForLocalTestCluster)
+			s.Start(b, kvcoord.InitFactoryForLocalTestCluster)
 			defer s.Stop()
 			defer b.StopTimer()
 			key := roachpb.Key("key")
@@ -145,7 +145,7 @@ func TestTxnLostIncrement(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	run := func(isoLevel isolation.Level, commitInBatch bool) {
+	run := func(t *testing.T, isoLevel isolation.Level, commitInBatch bool) {
 		s := createTestDB(t)
 		defer s.Stop()
 		ctx := context.Background()
@@ -208,13 +208,11 @@ func TestTxnLostIncrement(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	for _, isoLevel := range isolation.Levels() {
-		t.Run(isoLevel.String(), func(t *testing.T) {
-			testutils.RunTrueAndFalse(t, "commitInBatch", func(t *testing.T, commitInBatch bool) {
-				run(isoLevel, commitInBatch)
-			})
+	isolation.RunEachLevel(t, func(t *testing.T, isoLevel isolation.Level) {
+		testutils.RunTrueAndFalse(t, "commitInBatch", func(t *testing.T, commitInBatch bool) {
+			run(t, isoLevel, commitInBatch)
 		})
-	}
+	})
 }
 
 // TestTxnLostUpdate verifies that transactions are not susceptible to the
@@ -233,7 +231,7 @@ func TestTxnLostUpdate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	run := func(isoLevel isolation.Level, commitInBatch bool) {
+	run := func(t *testing.T, isoLevel isolation.Level, commitInBatch bool) {
 		s := createTestDB(t)
 		defer s.Stop()
 		ctx := context.Background()
@@ -308,13 +306,11 @@ func TestTxnLostUpdate(t *testing.T) {
 		require.Equal(t, []byte(expVal), gr.ValueBytes())
 	}
 
-	for _, isoLevel := range isolation.Levels() {
-		t.Run(isoLevel.String(), func(t *testing.T) {
-			testutils.RunTrueAndFalse(t, "commitInBatch", func(t *testing.T, commitInBatch bool) {
-				run(isoLevel, commitInBatch)
-			})
+	isolation.RunEachLevel(t, func(t *testing.T, isoLevel isolation.Level) {
+		testutils.RunTrueAndFalse(t, "commitInBatch", func(t *testing.T, commitInBatch bool) {
+			run(t, isoLevel, commitInBatch)
 		})
-	}
+	})
 }
 
 // TestTxnWeakIsolationLevelsTolerateWriteSkew verifies that transactions run
@@ -325,7 +321,7 @@ func TestTxnWeakIsolationLevelsTolerateWriteSkew(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	run := func(isoLevel isolation.Level) {
+	run := func(t *testing.T, isoLevel isolation.Level) {
 		s := createTestDB(t)
 		defer s.Stop()
 		ctx := context.Background()
@@ -373,9 +369,7 @@ func TestTxnWeakIsolationLevelsTolerateWriteSkew(t *testing.T) {
 		}
 	}
 
-	for _, isoLevel := range isolation.Levels() {
-		t.Run(isoLevel.String(), func(t *testing.T) { run(isoLevel) })
-	}
+	isolation.RunEachLevel(t, run)
 }
 
 // TestTxnReadCommittedPerStatementReadSnapshot verifies that transactions run
@@ -387,7 +381,19 @@ func TestTxnReadCommittedPerStatementReadSnapshot(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	run := func(isoLevel isolation.Level, mode kv.SteppingMode, step bool, expObserveExternalWrites bool) {
+	run := func(
+		t *testing.T,
+		// The transaction's isolation level.
+		isoLevel isolation.Level,
+		// Is the transaction's read timestamp fixed?
+		fixedReadTs bool,
+		// Is manual stepping enabled?
+		mode kv.SteppingMode,
+		// If manual stepping is enabled, is the transaction actually stepped?
+		step bool,
+		// Do we expect the transaction to observe intermediate, external writes?
+		expObserveExternalWrites bool,
+	) {
 		s := createTestDB(t)
 		defer s.Stop()
 		ctx := context.Background()
@@ -402,6 +408,10 @@ func TestTxnReadCommittedPerStatementReadSnapshot(t *testing.T) {
 		// Begin the test's transaction.
 		txn1 := s.DB.NewTxn(ctx, "txn1")
 		require.NoError(t, txn1.SetIsoLevel(isoLevel))
+		initReadTs := txn1.ReadTimestamp()
+		if fixedReadTs {
+			require.NoError(t, txn1.SetFixedTimestamp(ctx, initReadTs))
+		}
 		txn1.ConfigureStepping(ctx, mode)
 
 		// In a loop, increment the key outside the transaction, then read it in the
@@ -439,10 +449,14 @@ func TestTxnReadCommittedPerStatementReadSnapshot(t *testing.T) {
 			expVals = []int64{1, 1, 1}
 		}
 		require.Equal(t, expVals, readVals)
+
+		// Check whether the transaction's read timestamp changed.
+		sameReadTs := initReadTs == txn1.ReadTimestamp()
+		require.Equal(t, expObserveExternalWrites, !sameReadTs)
 	}
 
-	for _, isoLevel := range isolation.Levels() {
-		t.Run(isoLevel.String(), func(t *testing.T) {
+	isolation.RunEachLevel(t, func(t *testing.T, isoLevel isolation.Level) {
+		testutils.RunTrueAndFalse(t, "fixedReadTs", func(t *testing.T, fixedReadTs bool) {
 			testutils.RunTrueAndFalse(t, "steppingMode", func(t *testing.T, modeBool bool) {
 				mode := kv.SteppingMode(modeBool)
 				if mode == kv.SteppingEnabled {
@@ -451,19 +465,21 @@ func TestTxnReadCommittedPerStatementReadSnapshot(t *testing.T) {
 					// where it is not.
 					testutils.RunTrueAndFalse(t, "step", func(t *testing.T, step bool) {
 						// Expect a new read snapshot on each kv operation if the
-						// transaction is read committed and is manually stepped.
-						expObserveExternalWrites := isoLevel == isolation.ReadCommitted && step
-						run(isoLevel, mode, step, expObserveExternalWrites)
+						// transaction is read committed, its read timestamp is not
+						// fixed, and it is manually stepped.
+						expObserveExternalWrites := isoLevel == isolation.ReadCommitted && !fixedReadTs && step
+						run(t, isoLevel, fixedReadTs, mode, step, expObserveExternalWrites)
 					})
 				} else {
 					// Expect a new read snapshot on each kv operation if the
-					// transaction is read committed.
-					expObserveExternalWrites := isoLevel == isolation.ReadCommitted
-					run(isoLevel, mode, false, expObserveExternalWrites)
+					// transaction is read committed and its read timestamp is not
+					// fixed.
+					expObserveExternalWrites := isoLevel == isolation.ReadCommitted && !fixedReadTs
+					run(t, isoLevel, fixedReadTs, mode, false, expObserveExternalWrites)
 				}
 			})
 		})
-	}
+	})
 }
 
 // TestTxnWriteReadConflict verifies that write-read conflicts are non-blocking
@@ -476,7 +492,7 @@ func TestTxnWriteReadConflict(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	run := func(writeIsoLevel, readIsoLevel isolation.Level) {
+	run := func(t *testing.T, writeIsoLevel, readIsoLevel isolation.Level) {
 		s := createTestDB(t)
 		defer s.Stop()
 		ctx := context.Background()
@@ -516,7 +532,7 @@ func TestTxnWriteReadConflict(t *testing.T) {
 	for _, writeIsoLevel := range isolation.Levels() {
 		for _, readIsoLevel := range isolation.Levels() {
 			name := fmt.Sprintf("writeIso=%s,readIso=%s", writeIsoLevel, readIsoLevel)
-			t.Run(name, func(t *testing.T) { run(writeIsoLevel, readIsoLevel) })
+			t.Run(name, func(t *testing.T) { run(t, writeIsoLevel, readIsoLevel) })
 		}
 	}
 }
@@ -993,7 +1009,8 @@ func TestTxnCommitTimestampAdvancedByRefresh(t *testing.T) {
 		if !injected {
 			return errors.Errorf("didn't inject err")
 		}
-		commitTS := txn.CommitTimestamp()
+		commitTS, err := txn.CommitTimestamp()
+		require.NoError(t, err)
 		// We expect to have refreshed just after the timestamp injected by the error.
 		expTS := refreshTS.Add(0, 1)
 		if !commitTS.Equal(expTS) {
@@ -1026,9 +1043,9 @@ func TestTxnContinueAfterCputError(t *testing.T) {
 }
 
 // Test that a transaction can be used after a locking request returns a
-// WriteIntentError. This is not generally allowed for other errors, but
-// WriteIntentError is special.
-func TestTxnContinueAfterWriteIntentError(t *testing.T) {
+// LockConflictError. This is not generally allowed for other errors, but
+// a LockConflictError is special.
+func TestTxnContinueAfterLockConflictError(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 	ctx := context.Background()
@@ -1044,7 +1061,7 @@ func TestTxnContinueAfterWriteIntentError(t *testing.T) {
 	b.Header.WaitPolicy = lock.WaitPolicy_Error
 	b.Put("a", "c")
 	err := txn.Run(ctx, b)
-	require.IsType(t, &kvpb.WriteIntentError{}, err)
+	require.IsType(t, &kvpb.LockConflictError{}, err)
 
 	require.NoError(t, txn.Put(ctx, "a'", "c"))
 	require.NoError(t, txn.Commit(ctx))
@@ -1105,9 +1122,9 @@ func TestTxnWaitPolicies(t *testing.T) {
 		// Priority does not matter.
 		err := <-errorC
 		require.NotNil(t, err)
-		wiErr := new(kvpb.WriteIntentError)
-		require.True(t, errors.As(err, &wiErr))
-		require.Equal(t, kvpb.WriteIntentError_REASON_WAIT_POLICY, wiErr.Reason)
+		lcErr := new(kvpb.LockConflictError)
+		require.True(t, errors.As(err, &lcErr))
+		require.Equal(t, kvpb.LockConflictError_REASON_WAIT_POLICY, lcErr.Reason)
 
 		// SkipLocked wait policy.
 		type skipRes struct {
@@ -1157,9 +1174,9 @@ func TestTxnLockTimeout(t *testing.T) {
 	b.Get(key)
 	err := s.DB.Run(ctx, &b)
 	require.NotNil(t, err)
-	wiErr := new(kvpb.WriteIntentError)
-	require.True(t, errors.As(err, &wiErr))
-	require.Equal(t, kvpb.WriteIntentError_REASON_LOCK_TIMEOUT, wiErr.Reason)
+	lcErr := new(kvpb.LockConflictError)
+	require.True(t, errors.As(err, &lcErr))
+	require.Equal(t, kvpb.LockConflictError_REASON_LOCK_TIMEOUT, lcErr.Reason)
 }
 
 // TestTxnReturnsWriteTooOldErrorOnConflictingDeleteRange tests that if two
@@ -1250,11 +1267,12 @@ func TestRetrySerializableBumpsToNow(t *testing.T) {
 		bumpClosedTimestamp(delay)
 		attempt++
 		// Fixing transaction commit timestamp to disallow read refresh.
-		_ = txn.CommitTimestamp()
+		_, err := txn.CommitTimestamp()
+		require.NoError(t, err)
 		// Perform a scan to populate the transaction's read spans and mandate a refresh
 		// if the transaction's write timestamp is ever bumped. Because we fixed the
 		// transaction's commit timestamp, it will be forced to retry.
-		_, err := txn.Scan(ctx, roachpb.Key("a"), roachpb.Key("p"), 1000)
+		_, err = txn.Scan(ctx, roachpb.Key("a"), roachpb.Key("p"), 1000)
 		require.NoError(t, err, "Failed Scan request")
 		// Perform a write, which will run into the closed timestamp and get pushed.
 		require.NoError(t, txn.Put(ctx, roachpb.Key("b"), []byte(fmt.Sprintf("value-%d", attempt))))

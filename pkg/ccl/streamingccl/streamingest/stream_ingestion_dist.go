@@ -10,7 +10,8 @@ package streamingest
 
 import (
 	"context"
-	"fmt"
+	"math"
+	"sort"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
@@ -31,8 +32,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
+	"github.com/cockroachdb/redact"
 )
 
 var replanThreshold = settings.RegisterFloatSetting(
@@ -75,19 +78,15 @@ func startDistIngestion(
 		heartbeatTimestamp = initialScanTimestamp
 	}
 
-	msg := fmt.Sprintf("resuming stream (producer job %d) from %s",
-		streamID, heartbeatTimestamp)
+	msg := redact.Sprintf("resuming stream (producer job %d) from %s", streamID, heartbeatTimestamp)
 	updateRunningStatus(ctx, ingestionJob, jobspb.InitializingReplication, msg)
 
-	client, err := connectToActiveClient(ctx, ingestionJob, execCtx.ExecCfg().InternalDB)
+	client, err := connectToActiveClient(ctx, ingestionJob, execCtx.ExecCfg().InternalDB,
+		streamclient.WithStreamID(streamID))
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err := client.Close(ctx); err != nil {
-			log.Warningf(ctx, "stream ingestion client did not shut down properly: %s", err.Error())
-		}
-	}()
+	defer closeAndLog(ctx, client)
 	if err := waitUntilProducerActive(ctx, client, streamID, heartbeatTimestamp, ingestionJob.ID()); err != nil {
 		return err
 	}
@@ -152,8 +151,6 @@ func startDistIngestion(
 	)
 
 	execInitialPlan := func(ctx context.Context) error {
-		log.Infof(ctx, "starting to run DistSQL flow for stream ingestion job %d",
-			ingestionJob.ID())
 		defer stopReplanner()
 		ctx = logtags.AddTag(ctx, "stream-ingest-distsql", nil)
 
@@ -177,8 +174,7 @@ func startDistIngestion(
 		return rw.Err()
 	}
 
-	updateRunningStatus(ctx, ingestionJob, jobspb.Replicating,
-		"running the SQL flow for the stream ingestion job")
+	updateRunningStatus(ctx, ingestionJob, jobspb.Replicating, "physical replication running")
 	err = ctxgroup.GoAndWait(ctx, execInitialPlan, replanner)
 	if errors.Is(err, sql.ErrPlanChanged) {
 		execCtx.ExecCfg().JobRegistry.MetricsStruct().StreamIngest.(*Metrics).ReplanCount.Inc(1)
@@ -206,9 +202,7 @@ func (p *replicationFlowPlanner) makePlan(
 	gatewayID base.SQLInstanceID,
 ) func(context.Context, *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
 	return func(ctx context.Context, dsp *sql.DistSQLPlanner) (*sql.PhysicalPlan, *sql.PlanningCtx, error) {
-		log.Infof(ctx, "Generating DistSQL plan candidate for stream ingestion job %d",
-			ingestionJobID)
-
+		log.Infof(ctx, "generating DistSQL plan candidate")
 		streamID := streampb.StreamID(details.StreamID)
 		topology, err := client.Plan(ctx, streamID)
 		if err != nil {
@@ -222,11 +216,16 @@ func (p *replicationFlowPlanner) makePlan(
 		if err != nil {
 			return nil, nil, err
 		}
+		destNodeLocalities, err := getDestNodeLocalities(ctx, dsp, sqlInstanceIDs)
+		if err != nil {
+			return nil, nil, err
+		}
 
 		streamIngestionSpecs, streamIngestionFrontierSpec, err := constructStreamIngestionPlanSpecs(
+			ctx,
 			streamingccl.StreamAddress(details.StreamAddress),
 			topology,
-			sqlInstanceIDs,
+			destNodeLocalities,
 			initialScanTimestamp,
 			previousReplicatedTime,
 			checkpoint,
@@ -261,11 +260,6 @@ func (p *replicationFlowPlanner) makePlan(
 		p.AddSingleGroupStage(ctx, gatewayID,
 			execinfrapb.ProcessorCoreUnion{StreamIngestionFrontier: streamIngestionFrontierSpec},
 			execinfrapb.PostProcessSpec{}, streamIngestionResultTypes)
-
-		for src, dst := range streamIngestionFrontierSpec.SubscribingSQLInstances {
-			log.Infof(ctx, "physical replication src-dst pair candidate: %s:%d",
-				src, dst)
-		}
 
 		p.PlanToStreamColMap = []int{0}
 		sql.FinalizePlan(ctx, planCtx, p)
@@ -318,10 +312,128 @@ func measurePlanChange(before, after *sql.PhysicalPlan) float64 {
 	return float64(diff) / float64(oldCount)
 }
 
+type partitionWithCandidates struct {
+	partition          streamclient.PartitionInfo
+	closestDestIDs     []base.SQLInstanceID
+	sharedPrefixLength int
+}
+
+type candidatesByPriority []partitionWithCandidates
+
+func (a candidatesByPriority) Len() int      { return len(a) }
+func (a candidatesByPriority) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a candidatesByPriority) Less(i, j int) bool {
+	return a[i].sharedPrefixLength > a[j].sharedPrefixLength
+}
+
+// nodeMatcher matches each source cluster node to a destination cluster node,
+// given a list of available nodes in each cluster. The matcher has a primary goal
+// to match src-dst nodes that are "close" to each other, i.e. have common
+// locality tags, and a secondary goal to distribute source node assignments
+// evenly across destination nodes. Here's the algorithm:
+//
+// - For each src node, find their closest dst nodes and the number of
+// localities that match, the LocalityMatchCount, via the sql.ClosestInstances()
+// function. Example: Consider Src-A [US,East] which has match candidates Dst-A
+// [US,West], Dst-B [US, Central]. In the example, the LocalityMatchCount is 1,
+// as only US matches with the src node's locality.
+//
+// - Prioritize matching src nodes with a higher locality match count, via the
+// findSourceNodePriority() function.
+//
+// - While we have src nodes left to match, match the highest priority src node
+// to the dst node candidate that has the fewest matches already, via the
+// findMatch() function.
+
+type nodeMatcher struct {
+	destMatchCount     map[base.SQLInstanceID]int
+	destNodesInfo      []sql.InstanceLocality
+	destNodeToLocality map[base.SQLInstanceID]roachpb.Locality
+}
+
+func makeNodeMatcher(destNodesInfo []sql.InstanceLocality) *nodeMatcher {
+	nodeToLocality := make(map[base.SQLInstanceID]roachpb.Locality, len(destNodesInfo))
+	for _, node := range destNodesInfo {
+		nodeToLocality[node.GetInstanceID()] = node.GetLocality()
+	}
+	return &nodeMatcher{
+		destMatchCount:     make(map[base.SQLInstanceID]int, len(destNodesInfo)),
+		destNodesInfo:      destNodesInfo,
+		destNodeToLocality: nodeToLocality,
+	}
+}
+
+func (nm *nodeMatcher) destNodeIDs() []base.SQLInstanceID {
+	allDestNodeIDs := make([]base.SQLInstanceID, 0, len(nm.destNodesInfo))
+	for _, info := range nm.destNodesInfo {
+		allDestNodeIDs = append(allDestNodeIDs, info.GetInstanceID())
+	}
+	return allDestNodeIDs
+}
+
+// findSourceNodePriority finds the closest dest nodes for each source node and
+// returns a list of (source node, dest node match candidates) pairs ordered by
+// matching priority. A source node is earlier (higher priority) in the list if
+// it shares more locality tiers with their destination node match candidates.
+func (nm *nodeMatcher) findSourceNodePriority(topology streamclient.Topology) candidatesByPriority {
+
+	allDestNodeIDs := nm.destNodeIDs()
+	candidates := make(candidatesByPriority, 0, len(topology.Partitions))
+	for _, partition := range topology.Partitions {
+		closestDestIDs, sharedPrefixLength := sql.ClosestInstances(nm.destNodesInfo,
+			partition.SrcLocality)
+		if sharedPrefixLength == 0 {
+			closestDestIDs = allDestNodeIDs
+		}
+		candidate := partitionWithCandidates{
+			partition:          partition,
+			closestDestIDs:     closestDestIDs,
+			sharedPrefixLength: sharedPrefixLength,
+		}
+		candidates = append(candidates, candidate)
+	}
+	sort.Sort(candidates)
+
+	return candidates
+}
+
+// findMatch returns the destination node id with the fewest src node matches from the input list.
+func (nm *nodeMatcher) findMatch(destIDCandidates []base.SQLInstanceID) base.SQLInstanceID {
+	minCount := math.MaxInt
+	currentMatch := base.SQLInstanceID(0)
+
+	for _, destID := range destIDCandidates {
+		currentDestCount := nm.destMatchCount[destID]
+		if currentDestCount < minCount {
+			currentMatch = destID
+			minCount = currentDestCount
+		}
+	}
+	nm.destMatchCount[currentMatch]++
+	return currentMatch
+}
+
+func getDestNodeLocalities(
+	ctx context.Context, dsp *sql.DistSQLPlanner, instanceIDs []base.SQLInstanceID,
+) ([]sql.InstanceLocality, error) {
+
+	instanceInfos := make([]sql.InstanceLocality, 0, len(instanceIDs))
+	for _, id := range instanceIDs {
+		nodeDesc, err := dsp.GetSQLInstanceInfo(id)
+		if err != nil {
+			log.Eventf(ctx, "unable to get node descriptor for sql node %s", id)
+			return nil, err
+		}
+		instanceInfos = append(instanceInfos, sql.MakeInstanceLocality(id, nodeDesc.Locality))
+	}
+	return instanceInfos, nil
+}
+
 func constructStreamIngestionPlanSpecs(
+	ctx context.Context,
 	streamAddress streamingccl.StreamAddress,
 	topology streamclient.Topology,
-	sqlInstanceIDs []base.SQLInstanceID,
+	destSQLInstances []sql.InstanceLocality,
 	initialScanTimestamp hlc.Timestamp,
 	previousReplicatedTimestamp hlc.Timestamp,
 	checkpoint jobspb.StreamIngestionCheckpoint,
@@ -330,41 +442,55 @@ func constructStreamIngestionPlanSpecs(
 	sourceTenantID roachpb.TenantID,
 	destinationTenantID roachpb.TenantID,
 ) ([]*execinfrapb.StreamIngestionDataSpec, *execinfrapb.StreamIngestionFrontierSpec, error) {
-	// For each stream partition in the topology, assign it to a node.
-	streamIngestionSpecs := make([]*execinfrapb.StreamIngestionDataSpec, 0, len(sqlInstanceIDs))
+
+	streamIngestionSpecs := make([]*execinfrapb.StreamIngestionDataSpec, 0, len(destSQLInstances))
+	destSQLInstancesToIdx := make(map[base.SQLInstanceID]int, len(destSQLInstances))
+	for i, id := range destSQLInstances {
+		spec := &execinfrapb.StreamIngestionDataSpec{
+			StreamID:                    uint64(streamID),
+			JobID:                       int64(jobID),
+			PreviousReplicatedTimestamp: previousReplicatedTimestamp,
+			InitialScanTimestamp:        initialScanTimestamp,
+			Checkpoint:                  checkpoint, // TODO: Only forward relevant checkpoint info
+			StreamAddress:               string(streamAddress),
+			PartitionSpecs:              make(map[string]execinfrapb.StreamIngestionPartitionSpec),
+			TenantRekey: execinfrapb.TenantRekey{
+				OldID: sourceTenantID,
+				NewID: destinationTenantID,
+			},
+		}
+		streamIngestionSpecs = append(streamIngestionSpecs, spec)
+		destSQLInstancesToIdx[id.GetInstanceID()] = i
+	}
 
 	trackedSpans := make([]roachpb.Span, 0)
 	subscribingSQLInstances := make(map[string]uint32)
-	for i, partition := range topology.Partitions {
-		// Round robin assign the stream partitions to nodes. Partitions 0 through
-		// len(nodes) - 1 creates the spec. Future partitions just add themselves to
-		// the partition addresses.
-		if i < len(sqlInstanceIDs) {
-			spec := &execinfrapb.StreamIngestionDataSpec{
-				StreamID:                    uint64(streamID),
-				JobID:                       int64(jobID),
-				PreviousReplicatedTimestamp: previousReplicatedTimestamp,
-				InitialScanTimestamp:        initialScanTimestamp,
-				Checkpoint:                  checkpoint, // TODO: Only forward relevant checkpoint info
-				StreamAddress:               string(streamAddress),
-				PartitionSpecs:              make(map[string]execinfrapb.StreamIngestionPartitionSpec),
-				TenantRekey: execinfrapb.TenantRekey{
-					OldID: sourceTenantID,
-					NewID: destinationTenantID,
-				},
-			}
-			streamIngestionSpecs = append(streamIngestionSpecs, spec)
-		}
-		n := i % len(sqlInstanceIDs)
 
-		subscribingSQLInstances[partition.ID] = uint32(sqlInstanceIDs[n])
-		streamIngestionSpecs[n].PartitionSpecs[partition.ID] = execinfrapb.StreamIngestionPartitionSpec{
+	// Update stream ingestion specs with their matched source node.
+	matcher := makeNodeMatcher(destSQLInstances)
+	for _, candidate := range matcher.findSourceNodePriority(topology) {
+		destID := matcher.findMatch(candidate.closestDestIDs)
+		log.Infof(ctx, "physical replication src-dst pair candidate: %s (locality %s) - %d ("+
+			"locality %s)",
+			candidate.partition.ID,
+			candidate.partition.SrcLocality,
+			destID,
+			matcher.destNodeToLocality[destID])
+		partition := candidate.partition
+		subscribingSQLInstances[partition.ID] = uint32(destID)
+
+		specIdx, ok := destSQLInstancesToIdx[destID]
+		if !ok {
+			return nil, nil, errors.AssertionFailedf(
+				"matched destination node id does not contain a stream ingestion spec")
+		}
+		streamIngestionSpecs[specIdx].PartitionSpecs[partition.ID] = execinfrapb.
+			StreamIngestionPartitionSpec{
 			PartitionID:       partition.ID,
 			SubscriptionToken: string(partition.SubscriptionToken),
 			Address:           string(partition.SrcAddr),
 			Spans:             partition.Spans,
 		}
-
 		trackedSpans = append(trackedSpans, partition.Spans...)
 	}
 
@@ -381,4 +507,41 @@ func constructStreamIngestionPlanSpecs(
 	}
 
 	return streamIngestionSpecs, streamIngestionFrontierSpec, nil
+}
+
+// waitUntilProducerActive pings the producer job and waits until it
+// is active/running. It returns nil when the job is active.
+func waitUntilProducerActive(
+	ctx context.Context,
+	client streamclient.Client,
+	streamID streampb.StreamID,
+	heartbeatTimestamp hlc.Timestamp,
+	ingestionJobID jobspb.JobID,
+) error {
+	ro := retry.Options{
+		InitialBackoff: 1 * time.Second,
+		Multiplier:     2,
+		MaxBackoff:     5 * time.Second,
+		MaxRetries:     4,
+	}
+	// Make sure the producer job is active before start the stream replication.
+	var status streampb.StreamReplicationStatus
+	var err error
+	for r := retry.Start(ro); r.Next(); {
+		status, err = client.Heartbeat(ctx, streamID, heartbeatTimestamp)
+		if err != nil {
+			return errors.Wrapf(err, "failed to resume ingestion job %d due to producer job %d error",
+				ingestionJobID, streamID)
+		}
+		if status.StreamStatus != streampb.StreamReplicationStatus_UNKNOWN_STREAM_STATUS_RETRY {
+			break
+		}
+		log.Warningf(ctx, "producer job %d has status %s, retrying", streamID, status.StreamStatus)
+	}
+	if status.StreamStatus != streampb.StreamReplicationStatus_STREAM_ACTIVE {
+		return jobs.MarkAsPermanentJobError(errors.Errorf("failed to resume ingestion job %d "+
+			"as the producer job %d is not active and in status %s", ingestionJobID,
+			streamID, status.StreamStatus))
+	}
+	return nil
 }

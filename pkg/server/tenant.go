@@ -51,6 +51,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/debug"
 	"github.com/cockroachdb/cockroach/pkg/server/privchecker"
+	"github.com/cockroachdb/cockroach/pkg/server/serverctl"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/structlogging"
@@ -255,7 +256,17 @@ func newTenantServer(
 
 	// Inform the server identity provider that we're operating
 	// for a tenant server.
-	baseCfg.idProvider.SetTenant(sqlCfg.TenantID)
+	//
+	// TODO(#77336): we would like to set the tenant name here too.
+	// Unfortunately, this is not possible for now because the name is
+	// only known after the SQL server has initialized the connector (in
+	// preStart), which cannot be called yet.
+	// Instead, the tenant name is currently added to the idProvider
+	// inside preStart().
+	// The better approach would be to have the CLI flag use a name,
+	// then rely on some mechanism to retrieve the ID from the name to
+	// initialize the rest of the server.
+	baseCfg.idProvider.SetTenantID(sqlCfg.TenantID)
 	args, err := makeTenantSQLServerArgs(ctx, stopper, baseCfg, sqlCfg, tenantNameContainer, deps, serviceMode)
 	if err != nil {
 		return nil, err
@@ -359,7 +370,7 @@ func newTenantServer(
 	// Instantiate the migration API server.
 	tms := newTenantMigrationServer(sqlServer)
 	serverpb.RegisterMigrationServer(args.grpc.Server, tms)
-	sqlServer.migrationServer = tms // only for testing via TestTenant
+	sqlServer.migrationServer = tms // only for testing via testTenant
 
 	// Tell the authz server how to connect to SQL.
 	adminAuthzCheck.SetAuthzAccessorFactory(func(opName string) (sql.AuthorizationAccessor, func()) {
@@ -958,7 +969,7 @@ func (s *SQLServerWrapper) InitialStart() bool {
 
 // ShutdownRequested returns a channel that is signaled when a subsystem wants
 // the server to be shut down.
-func (s *SQLServerWrapper) ShutdownRequested() <-chan ShutdownRequest {
+func (s *SQLServerWrapper) ShutdownRequested() <-chan serverctl.ShutdownRequest {
 	return s.sqlServer.ShutdownRequested()
 }
 
@@ -977,9 +988,10 @@ func makeTenantSQLServerArgs(
 	// the instance ID (once known) as a tag.
 	startupCtx = baseCfg.AmbientCtx.AnnotateCtx(startupCtx)
 
-	maxOffset := time.Duration(baseCfg.MaxOffset)
-	toleratedOffset := baseCfg.ToleratedOffset()
-	clock := hlc.NewClockWithSystemTimeSource(maxOffset, toleratedOffset)
+	clock, err := newClockFromConfig(startupCtx, baseCfg)
+	if err != nil {
+		return sqlServerArgs{}, err
+	}
 
 	registry := metric.NewRegistry()
 	ruleRegistry := metric.NewRuleRegistry()
@@ -992,23 +1004,21 @@ func makeTenantSQLServerArgs(
 		testingKnobShutdownTenantConnectorEarlyIfNoRecordPresent = p.ShutdownTenantConnectorEarlyIfNoRecordPresent
 	}
 
+	rpcCtxOpts := rpc.ServerContextOptionsFromBaseConfig(baseCfg.Config)
+	rpcCtxOpts.TenantID = sqlCfg.TenantID
+	rpcCtxOpts.UseNodeAuth = sqlCfg.LocalKVServerInfo != nil
+	rpcCtxOpts.NodeID = baseCfg.IDContainer
+	rpcCtxOpts.StorageClusterID = baseCfg.ClusterIDContainer
+	rpcCtxOpts.Clock = clock.WallClock()
+	rpcCtxOpts.ToleratedOffset = clock.ToleratedOffset()
+	rpcCtxOpts.Stopper = stopper
+	rpcCtxOpts.Settings = st
+	rpcCtxOpts.Knobs = rpcTestingKnobs
 	// This tenant's SQL server only serves SQL connections and SQL-to-SQL
 	// RPCs; so it should refuse to serve SQL-to-KV RPCs completely.
-	authorizer := tenantcapabilitiesauthorizer.NewAllowNothingAuthorizer()
+	rpcCtxOpts.TenantRPCAuthorizer = tenantcapabilitiesauthorizer.NewAllowNothingAuthorizer()
 
-	rpcContext := rpc.NewContext(startupCtx, rpc.ContextOptions{
-		TenantID:            sqlCfg.TenantID,
-		UseNodeAuth:         sqlCfg.LocalKVServerInfo != nil,
-		NodeID:              baseCfg.IDContainer,
-		StorageClusterID:    baseCfg.ClusterIDContainer,
-		Config:              baseCfg.Config,
-		Clock:               clock.WallClock(),
-		ToleratedOffset:     clock.ToleratedOffset(),
-		Stopper:             stopper,
-		Settings:            st,
-		Knobs:               rpcTestingKnobs,
-		TenantRPCAuthorizer: authorizer,
-	})
+	rpcContext := rpc.NewContext(startupCtx, rpcCtxOpts)
 
 	if !baseCfg.Insecure {
 		// This check mirrors that done in NewServer().
@@ -1089,6 +1099,7 @@ func makeTenantSQLServerArgs(
 		TestingKnobs:      dsKnobs,
 	}
 	ds := kvcoord.NewDistSender(dsCfg)
+	registry.AddMetricStruct(ds.Metrics())
 
 	var clientKnobs kvcoord.ClientTestingKnobs
 	if p, ok := baseCfg.TestingKnobs.KVClient.(*kvcoord.ClientTestingKnobs); ok {

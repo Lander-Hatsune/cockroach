@@ -65,20 +65,13 @@ var LeaseDuration = settings.RegisterDurationSetting(
 	"mean duration of sql descriptor leases, this actual duration is jitterred",
 	base.DefaultDescriptorLeaseDuration)
 
-func between0and1inclusive(f float64) error {
-	if f < 0 || f > 1 {
-		return errors.Errorf("value %f must be between 0 and 1", f)
-	}
-	return nil
-}
-
 // LeaseJitterFraction controls the percent jitter around sql lease durations
 var LeaseJitterFraction = settings.RegisterFloatSetting(
 	settings.TenantWritable,
 	"sql.catalog.descriptor_lease_jitter_fraction",
 	"mean duration of sql descriptor leases, this actual duration is jitterred",
 	base.DefaultDescriptorLeaseJitterFraction,
-	between0and1inclusive)
+	settings.Fraction)
 
 // WaitForNoVersion returns once there are no unexpired leases left
 // for any version of the descriptor.
@@ -933,7 +926,7 @@ func (m *Manager) AcquireByName(
 			// If the name we had doesn't match the newest descriptor in the DB, then
 			// we're trying to use an old name.
 			desc.Release(ctx)
-			return nil, catalog.ErrDescriptorNotFound
+			return nil, catalog.NewDescriptorNotFoundError(id)
 		}
 	}
 	return validateDescriptorForReturn(desc)
@@ -974,7 +967,10 @@ func (m *Manager) resolveName(
 		return id, err
 	}
 	if id == descpb.InvalidID {
-		return id, catalog.ErrDescriptorNotFound
+		return id, errors.Wrapf(catalog.ErrDescriptorNotFound,
+			"resolving name %s with parentID %d and parentSchemaID %d",
+			name, parentID, parentSchemaID,
+		)
 	}
 	return id, nil
 }

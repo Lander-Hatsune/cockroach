@@ -1001,7 +1001,7 @@ type logicTest struct {
 	clients map[string]map[int]*gosql.DB
 	// client currently in use. This can change during processing
 	// of a test input file when encountering the "user" directive.
-	// see setUser() for details.
+	// see setSessionUser() for details.
 	user string
 	db   *gosql.DB
 	// clusterCleanupFuncs contains the cleanup methods that are specific to a
@@ -1169,9 +1169,9 @@ func (t *logicTest) outf(format string, args ...interface{}) {
 	fmt.Printf("[%s] %s\n", now, msg)
 }
 
-// setUser sets the DB client to the specified user and connects
+// setSessionUser sets the DB client to the specified user and connects
 // to the node in the cluster at index nodeIdx.
-func (t *logicTest) setUser(user string, nodeIdx int) {
+func (t *logicTest) setSessionUser(user string, nodeIdx int) {
 	db := t.getOrOpenClient(user, nodeIdx)
 	t.db = db
 	t.user = user
@@ -1309,7 +1309,13 @@ func (t *logicTest) newTestServerCluster(bootstrapBinaryPath, upgradeBinaryPath 
 	t.testserverCluster = ts
 	t.clusterCleanupFuncs = append(t.clusterCleanupFuncs, ts.Stop, cleanupLogsDir)
 
-	t.setUser(username.RootUser, 0 /* nodeIdx */)
+	t.setSessionUser(username.RootUser, 0 /* nodeIdx */)
+
+	// These tests involve stopping and starting nodes, so to reduce flakiness,
+	// we increase the lease Transfer timeout.
+	if _, err := t.db.Exec("SET CLUSTER SETTING server.shutdown.lease_transfer_wait = '40s'"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // newCluster creates a new cluster. It should be called after the logic tests's
@@ -1361,9 +1367,7 @@ func (t *logicTest) newCluster(
 			DeterministicExplain:            true,
 			UseTransactionalDescIDGenerator: true,
 		}
-		knobs.SQLStatsKnobs = &sqlstats.TestingKnobs{
-			AOSTClause: "AS OF SYSTEM TIME '-1us'",
-		}
+		knobs.SQLStatsKnobs = sqlstats.CreateTestingKnobs()
 		if serverArgs.DeclarativeCorpusCollection && t.declarativeCorpusCollector != nil {
 			knobs.SQLDeclarativeSchemaChanger = &scexec.TestingKnobs{
 				BeforeStage: t.declarativeCorpusCollector.GetBeforeStage(t.rootT.Name(), t.t()),
@@ -1489,7 +1493,8 @@ func (t *logicTest) newCluster(
 	stats.DefaultAsOfTime = 10 * time.Millisecond
 	stats.DefaultRefreshInterval = time.Millisecond
 
-	t.cluster = serverutils.StartNewTestCluster(t.rootT, cfg.NumNodes, params)
+	t.cluster = serverutils.StartCluster(t.rootT, cfg.NumNodes, params)
+	t.purgeZoneConfig()
 	if cfg.UseFakeSpanResolver {
 		// We need to update the DistSQL span resolver with the fake resolver.
 		// Note that DistSQL was disabled in makeClusterSetting above, so we
@@ -1564,10 +1569,9 @@ func (t *logicTest) newCluster(
 	// implicitly) set any necessary cluster settings to override blocked
 	// behavior.
 	if cfg.UseSecondaryTenant == logictestbase.Always || t.cluster.StartedDefaultTestTenant() {
-
 		conn := t.cluster.SystemLayer(0).SQLConn(t.rootT, "")
 		clusterSettings := toa.clusterSettings
-		_, ok := clusterSettings[sql.SecondaryTenantZoneConfigsEnabled.Key()]
+		_, ok := clusterSettings[string(sql.SecondaryTenantZoneConfigsEnabled.Name())]
 		if ok {
 			// We reduce the closed timestamp duration on the host tenant so that the
 			// setting override can propagate to the tenant faster.
@@ -1584,8 +1588,8 @@ func (t *logicTest) newCluster(
 		}
 
 		tenantID := serverutils.TestTenantID()
-		for name, value := range clusterSettings {
-			query := fmt.Sprintf("ALTER TENANT [$1] SET CLUSTER SETTING %s = $2", name)
+		for settingName, value := range clusterSettings {
+			query := fmt.Sprintf("ALTER TENANT [$1] SET CLUSTER SETTING %s = $2", settingName)
 			if _, err := conn.Exec(query, tenantID.ToUint64(), value); err != nil {
 				t.Fatal(err)
 			}
@@ -1747,13 +1751,13 @@ func (t *logicTest) newCluster(
 		})
 	}
 
-	for name, value := range toa.clusterSettings {
+	for settingName, value := range toa.clusterSettings {
 		t.waitForTenantReadOnlyClusterSettingToTakeEffectOrFatal(
-			name, value, params.ServerArgs.Insecure,
+			settingName, value, params.ServerArgs.Insecure,
 		)
 	}
 
-	t.setUser(username.RootUser, 0 /* nodeIdx */)
+	t.setSessionUser(username.RootUser, 0 /* nodeIdx */)
 }
 
 // waitForTenantReadOnlyClusterSettingToTakeEffectOrFatal waits until all tenant
@@ -2245,7 +2249,7 @@ func (t *logicTest) maybeBackupRestore(
 	oldUser := t.user
 	oldNodeIdx := t.nodeIdx
 	defer func() {
-		t.setUser(oldUser, oldNodeIdx)
+		t.setSessionUser(oldUser, oldNodeIdx)
 	}()
 
 	log.Info(context.Background(), "Running cluster backup and restore")
@@ -2265,7 +2269,7 @@ func (t *logicTest) maybeBackupRestore(
 		userToSessionVars[user] = make(map[int]map[string]string)
 		for nodeIdx := range userClients {
 			users[user] = append(users[user], nodeIdx)
-			t.setUser(user, nodeIdx)
+			t.setSessionUser(user, nodeIdx)
 
 			// Serialize session variables.
 			var userSession string
@@ -2307,7 +2311,7 @@ func (t *logicTest) maybeBackupRestore(
 		bucket, strconv.FormatInt(timeutil.Now().UnixNano(), 10))
 
 	// Perform the backup and restore as root.
-	t.setUser(username.RootUser, 0 /* nodeIdx */)
+	t.setSessionUser(username.RootUser, 0 /* nodeIdx */)
 
 	if _, err := t.db.Exec(fmt.Sprintf("BACKUP INTO '%s'", backupLocation)); err != nil {
 		return errors.Wrap(err, "backing up cluster")
@@ -2318,7 +2322,7 @@ func (t *logicTest) maybeBackupRestore(
 	t.resetCluster()
 
 	// Run the restore as root.
-	t.setUser(username.RootUser, 0 /* nodeIdx */)
+	t.setSessionUser(username.RootUser, 0 /* nodeIdx */)
 	if _, err := t.db.Exec(fmt.Sprintf("RESTORE FROM LATEST IN '%s'", backupLocation)); err != nil {
 		return errors.Wrap(err, "restoring cluster")
 	}
@@ -2330,7 +2334,7 @@ func (t *logicTest) maybeBackupRestore(
 	for user, userNodeIdxs := range users {
 		for _, nodeIdx := range userNodeIdxs {
 			// Call setUser for every user to create the connection for that user.
-			t.setUser(user, nodeIdx)
+			t.setSessionUser(user, nodeIdx)
 
 			if userSession, ok := userToHexSession[user][nodeIdx]; ok {
 				if _, err := t.db.Exec(fmt.Sprintf(`SELECT crdb_internal.deserialize_session(decode('%s', 'hex'))`, userSession)); err != nil {
@@ -2977,7 +2981,7 @@ func (t *logicTest) processSubtest(
 					nodeIdx = int(idx)
 				}
 			}
-			t.setUser(fields[1], nodeIdx)
+			t.setSessionUser(fields[1], nodeIdx)
 			// In multi-tenant tests, we may need to also create database test when
 			// we switch to a different tenant.
 			//
@@ -3107,7 +3111,7 @@ func (t *logicTest) processSubtest(
 			// If we upgraded the node we are currently on, we need to open a new
 			// connection since the previous one might now be invalid.
 			if t.nodeIdx == nodeIdx {
-				t.setUser(t.user, nodeIdx)
+				t.setSessionUser(t.user, nodeIdx)
 			}
 		default:
 			return errors.Errorf("%s:%d: unknown command: %s",
@@ -3799,23 +3803,25 @@ func (t *logicTest) validateAfterTestCompletion() error {
 		if user == username.RootUser {
 			continue
 		}
-		for i, c := range userClients {
-			if err := c.Close(); err != nil {
-				t.Fatalf("failed to close connection to node %d for user %s: %v", i, user, err)
-			}
+		for _, c := range userClients {
+			// Ignore the error from closing the connection. This may not succeed if,
+			// for example, CANCEL SESSION was called on one of the sessions.
+			_ = c.Close()
 		}
 		delete(t.clients, user)
 	}
-	t.setUser(username.RootUser, 0 /* nodeIdx */)
+	t.setSessionUser(username.RootUser, 0 /* nodeIdx */)
 
 	// Some cleanup to make sure the following validation queries can run
 	// successfully. First we rollback in case the logic test had an uncommitted
 	// txn and second we reset vectorize mode in case it was switched to
 	// `experimental_always`.
 	_, _ = t.db.Exec("ROLLBACK")
-	_, err := t.db.Exec("RESET vectorize")
-	if err != nil {
+	if _, err := t.db.Exec("RESET vectorize"); err != nil {
 		t.Fatal(errors.Wrap(err, "could not reset vectorize mode"))
+	}
+	if _, err := t.db.Exec("RESET ROLE"); err != nil {
+		t.Fatal(errors.Wrap(err, "could not reset role"))
 	}
 
 	validate := func() (string, error) {

@@ -30,7 +30,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/raftutil"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -773,7 +772,7 @@ func TestLearnerRaftConfState(t *testing.T) {
 	defer log.Scope(t).Close(t)
 
 	verifyLearnerInRaftOnNodes := func(
-		key roachpb.Key, id roachpb.ReplicaID, servers []*server.TestServer,
+		key roachpb.Key, id roachpb.ReplicaID, servers []serverutils.TestServerInterface,
 	) {
 		t.Helper()
 		var repls []*kvserver.Replica
@@ -985,8 +984,7 @@ func testRaftSnapshotsToNonVoters(t *testing.T, drainReceivingNode bool) {
 		// effect on the outcome of this test.
 		const drainingServerIdx = 1
 		const drainingNodeID = drainingServerIdx + 1
-		client, err := tc.GetAdminClient(ctx, t, drainingServerIdx)
-		require.NoError(t, err)
+		client := tc.GetAdminClient(t, drainingServerIdx)
 		drain(ctx, t, client, drainingNodeID)
 	}
 
@@ -1091,13 +1089,12 @@ func TestSnapshotsToDrainingNodes(t *testing.T) {
 			},
 		)
 		defer tc.Stopper().Stop(ctx)
-		client, err := tc.GetAdminClient(ctx, t, drainingServerIdx)
-		require.NoError(t, err)
+		client := tc.GetAdminClient(t, drainingServerIdx)
 		drain(ctx, t, client, drainingNodeID)
 
 		// Now, we try to add a replica to it, we expect that to fail.
 		scratchKey := tc.ScratchRange(t)
-		_, err = tc.AddVoters(scratchKey, makeReplicationTargets(drainingNodeID)...)
+		_, err := tc.AddVoters(scratchKey, makeReplicationTargets(drainingNodeID)...)
 		require.Regexp(t, "store is draining", err)
 	})
 
@@ -1654,7 +1651,7 @@ func TestLearnerAndVoterOutgoingFollowerRead(t *testing.T) {
 	db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.target_duration = '%s'`,
 		testingTargetDuration))
 	db.Exec(t, fmt.Sprintf(`SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '%s'`, testingSideTransportInterval))
-	db.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.follower_reads_enabled = true`)
+	db.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.follower_reads.enabled = true`)
 
 	scratchStartKey := tc.ScratchRange(t)
 	var scratchDesc roachpb.RangeDescriptor
@@ -2042,7 +2039,7 @@ func TestMergeQueueDoesNotInterruptReplicationChange(t *testing.T) {
 
 	db := sqlutils.MakeSQLRunner(tc.ServerConn(0))
 	// TestCluster currently overrides this when used with ReplicationManual.
-	db.Exec(t, `SET CLUSTER SETTING kv.range_merge.queue_enabled = true`)
+	db.Exec(t, `SET CLUSTER SETTING kv.range_merge.queue.enabled = true`)
 
 	// While this replication change is stalled, we'll trigger a merge and
 	// ensure that the merge correctly notices that there is a snapshot in
@@ -2071,7 +2068,7 @@ func TestMergeQueueSeesLearnerOrJointConfig(t *testing.T) {
 	defer tc.Stopper().Stop(ctx)
 	db := sqlutils.MakeSQLRunner(tc.ServerConn(0))
 	// TestCluster currently overrides this when used with ReplicationManual.
-	db.Exec(t, `SET CLUSTER SETTING kv.range_merge.queue_enabled = true`)
+	db.Exec(t, `SET CLUSTER SETTING kv.range_merge.queue.enabled = true`)
 
 	scratchStartKey := tc.ScratchRange(t)
 	origDesc := tc.LookupRangeOrFatal(t, scratchStartKey)
@@ -2234,7 +2231,7 @@ func getExpectedSnapshotSizeBytes(
 	b := originStore.TODOEngine().NewWriteBatch()
 	defer b.Close()
 
-	err = rditer.IterateReplicaKeySpans(snap.State.Desc, snap.EngineSnap, true, /* replicatedOnly */
+	err = rditer.IterateReplicaKeySpans(snap.State.Desc, snap.EngineSnap, true /* replicatedOnly */, rditer.ReplicatedSpansAll,
 		func(iter storage.EngineIterator, _ roachpb.Span, keyType storage.IterKeyType) error {
 			var err error
 			for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {

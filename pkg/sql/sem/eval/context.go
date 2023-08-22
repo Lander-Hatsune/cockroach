@@ -227,6 +227,9 @@ type Context struct {
 	// GetTableMetrics is used in crdb_internal.sstable_metrics.
 	GetTableMetrics GetTableMetricsFunc
 
+	// ScanStorageInternalKeys is used in crdb_internal.scan_storage_internal_keys.
+	ScanStorageInternalKeys ScanStorageInternalKeysFunc
+
 	// SetCompactionConcurrency is used to change the compaction concurrency of
 	// a store.
 	SetCompactionConcurrency SetCompactionConcurrencyFunc
@@ -437,6 +440,11 @@ func (p *fakePlannerWithMonitor) EnforceHomeRegion() bool {
 func (p *fakePlannerWithMonitor) MaybeReallocateAnnotations(numAnnotations tree.AnnotationIdx) {
 }
 
+// Optimizer is part of the cat.Catalog interface.
+func (p *fakePlannerWithMonitor) Optimizer() interface{} {
+	return nil
+}
+
 type fakeStreamManagerFactory struct {
 	StreamManagerFactory
 }
@@ -549,7 +557,10 @@ func (ec *Context) GetClusterTimestamp() (*tree.DDecimal, error) {
 		return nil, pgerror.Newf(pgcode.FeatureNotSupported, "unsupported in %s isolation", treeIso.String())
 	}
 
-	ts := ec.Txn.CommitTimestamp()
+	ts, err := ec.Txn.CommitTimestamp()
+	if err != nil {
+		return nil, err
+	}
 	if ts.IsEmpty() {
 		return nil, errors.AssertionFailedf("zero cluster timestamp in txn")
 	}
@@ -806,6 +817,9 @@ type ReplicationStreamManager interface {
 	// StartReplicationStream starts a stream replication job for the specified
 	// tenant on the producer side.
 	StartReplicationStream(ctx context.Context, tenantName roachpb.TenantName) (streampb.ReplicationProducerSpec, error)
+
+	// SetupSpanConfigsStream creates and plans a replication stream to stream the span config updates for a specific tenant.
+	SetupSpanConfigsStream(ctx context.Context, tenantName roachpb.TenantName) (ValueGenerator, error)
 
 	// HeartbeatReplicationStream sends a heartbeat to the replication stream producer, indicating
 	// consumer has consumed until the given 'frontier' timestamp. This updates the producer job

@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/internal/rsg"
 	"github.com/cockroachdb/cockroach/pkg/internal/sqlsmith"
 	"github.com/cockroachdb/cockroach/pkg/sql"
@@ -31,7 +32,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/builtins/builtinsregistry"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/sql/tests"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/testutils/datapathutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
@@ -173,6 +173,7 @@ func (db *verifyFormatDB) execWithResettableTimeout(
 	}()
 	retry := true
 	targetDuration := duration
+	cancellationChannel := ctx.Done()
 	for retry {
 		retry = false
 		err := func() error {
@@ -199,6 +200,17 @@ func (db *verifyFormatDB) execWithResettableTimeout(
 					}
 					return &nonCrasher{sql: sql, err: err}
 				}
+				return nil
+			case <-cancellationChannel:
+				// Sanity: The context is cancelled when the test is about to
+				// timeout. We will log whatever statement we're waiting on for
+				// debugging purposes. Sometimes queries won't respect
+				// cancellation due to lib/pq limitations.
+				t.Logf("Context cancelled while executing: %q", sql)
+				// We will intentionally retry, which will us to wait for the
+				// go routine to complete above to avoid leaking it.
+				retry = true
+				cancellationChannel = nil
 				return nil
 			case <-time.After(targetDuration):
 				db.mu.Lock()
@@ -346,6 +358,14 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 				switch lower {
 				case "pg_sleep":
 					continue
+				case "crdb_internal.create_sql_schema_telemetry_job":
+					// We can create a crazy number of telemtry jobs accidentally,
+					// within the test. Leading to terrible contention.
+					continue
+				case "crdb_internal.gen_rand_ident":
+					// Generates random identifiers, so a large number are dangerous and
+					// can take a long time.
+					continue
 				case "st_frechetdistance", "st_buffer":
 					// Some spatial function are slow and testing them here
 					// is not worth it.
@@ -353,7 +373,9 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 				case "crdb_internal.reset_sql_stats",
 					"crdb_internal.check_consistency",
 					"crdb_internal.request_statement_bundle",
-					"crdb_internal.reset_activity_tables":
+					"crdb_internal.reset_activity_tables",
+					"crdb_internal.revalidate_unique_constraints_in_all_tables",
+					"crdb_internal.validate_ttl_scheduled_jobs":
 					// Skipped due to long execution time.
 					continue
 				}
@@ -419,6 +441,7 @@ func TestRandomSyntaxFunctions(t *testing.T) {
 		// involve schema changes like truncates. In general this should make
 		// this test more resilient as the timeouts are reset as long progress
 		// is made on *some* connection.
+		t.Logf("Running %q", s)
 		return db.execWithResettableTimeout(t, ctx, s, *flagRSGExecTimeout, *flagRSGGoRoutines)
 	})
 }
@@ -769,14 +792,16 @@ func testRandomSyntax(
 	}
 	ctx := context.Background()
 
-	params, _ := tests.CreateTestServerParams()
+	var params base.TestServerArgs
 	params.UseDatabase = databaseName
 	// Catch panics and return them as errors.
 	params.Knobs.PGWireTestingKnobs = &sql.PGWireTestingKnobs{
 		CatchPanics: true,
 	}
-	s, rawDB, _ := serverutils.StartServer(t, params)
-	defer s.Stopper().Stop(ctx)
+	srv, rawDB, _ := serverutils.StartServer(t, params)
+	defer srv.Stopper().Stop(ctx)
+	sql.SecondaryTenantSplitAtEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
+	sql.SecondaryTenantScatterEnabled.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, true)
 	db := &verifyFormatDB{db: rawDB}
 	err := db.exec(t, ctx, "SET CLUSTER SETTING schemachanger.job.max_retry_backoff='1s'")
 	require.NoError(t, err)

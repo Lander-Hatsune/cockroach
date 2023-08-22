@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/server"
+	"github.com/cockroachdb/cockroach/pkg/spanconfig"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/serverutils/regionlatency"
@@ -78,8 +79,7 @@ func TestColdStartLatency(t *testing.T) {
 	for i := 0; i < numNodes; i++ {
 		i := i
 		args := base.TestServerArgs{
-			DefaultTestTenant: base.TODOTestTenantDisabled,
-			Locality:          localities[i],
+			Locality: localities[i],
 		}
 		signalAfter[i] = make(chan struct{})
 		serverKnobs := &server.TestingKnobs{
@@ -119,6 +119,9 @@ func TestColdStartLatency(t *testing.T) {
 	tc := testcluster.NewTestCluster(t, numNodes, base.TestClusterArgs{
 		ParallelStart:     true,
 		ServerArgsPerNode: perServerArgs,
+		ServerArgs: base.TestServerArgs{
+			DefaultTestTenant: base.TODOTestTenantDisabled,
+		},
 	})
 	go func() {
 		for _, c := range signalAfter {
@@ -161,8 +164,8 @@ func TestColdStartLatency(t *testing.T) {
 		var stmts []string
 		if !isTenant {
 			stmts = []string{
-				"ALTER TENANT ALL SET CLUSTER SETTING sql.zone_configs.allow_for_secondary_tenant.enabled = true",
-				"ALTER TENANT ALL SET CLUSTER SETTING sql.multi_region.allow_abstractions_for_secondary_tenants.enabled = true",
+				"ALTER TENANT ALL SET CLUSTER SETTING sql.virtual_cluster.feature_access.zone_configs.enabled = true",
+				"ALTER TENANT ALL SET CLUSTER SETTING sql.virtual_cluster.feature_access.multiregion.enabled = true",
 				`alter range meta configure zone using constraints = '{"+region=us-east1": 1, "+region=us-west1": 1, "+region=europe-west1": 1}';`,
 			}
 		} else {
@@ -288,7 +291,7 @@ SELECT checkpoint > extract(epoch from after)
 	// Wait for the configs to be applied.
 	testutils.SucceedsWithin(t, func() error {
 		for _, server := range tc.Servers {
-			reporter := server.Server.SpanConfigReporter()
+			reporter := server.SpanConfigReporter().(spanconfig.Reporter)
 			report, err := reporter.SpanConfigConformance(ctx, []roachpb.Span{
 				{Key: keys.TableDataMin, EndKey: keys.TenantTableDataMax},
 			})
