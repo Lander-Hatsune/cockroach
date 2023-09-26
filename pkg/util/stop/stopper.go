@@ -481,9 +481,12 @@ func (s *Stopper) RunAsyncTaskEx(ctx context.Context, opt TaskOpts, f func(conte
 		if alloc != nil {
 			defer alloc.Release()
 		}
-
+		if runtime.TraceTasks {
+			fmt.Println("RunAsyncTaskEx")
+		}
 		sp.UpdateGoroutineIDToCurrent()
 		runtime.SetInnerId(uint64(uintptr(unsafe.Pointer(&f))))
+		runtime.Gosched()
 		f(ctx)
 	}()
 	return nil
